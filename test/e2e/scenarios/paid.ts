@@ -10,6 +10,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { resolveOmpBin, stripNodeModulesBins } from "../../../scripts/omp-bin.ts";
 import { MockLlm } from "../mock-llm/server.ts";
 import { PROVIDER, REPO } from "../scenario.ts";
 
@@ -292,7 +293,7 @@ export async function runPaid(ids: string[], list: PaidScenario[]): Promise<numb
 		const mockPort = mock?.start();
 		const proc = Bun.spawn(
 			[
-				"omp",
+				resolveOmpBin(),
 				"-p",
 				s.prompt,
 				"--model",
@@ -312,6 +313,7 @@ export async function runPaid(ids: string[], list: PaidScenario[]): Promise<numb
 				cwd: repo,
 				env: {
 					...process.env,
+					PATH: stripNodeModulesBins(process.env.PATH),
 					OMP_SWARM_DIR: swarm,
 					OMP_SWARM_MAX_WORKERS: "8",
 					OMP_SWARM_MAX_COST_USD: remaining.toFixed(2),

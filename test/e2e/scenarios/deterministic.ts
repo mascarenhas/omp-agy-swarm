@@ -3,6 +3,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveOmpBin, stripNodeModulesBins } from "../../../scripts/omp-bin.ts";
 import { board, type Ctx, metrics, requests, roster } from "../check.ts";
 import type { Rule, Script } from "../mock-llm/server.ts";
 import { REPO, type Scenario, tool } from "../scenario.ts";
@@ -72,7 +73,10 @@ const D0b: Scenario = {
 	id: "D0b",
 	title: "launch via `omp plugin link`",
 	setup: c => {
-		execFileSync("omp", ["plugin", "link", REPO], { env: { ...process.env, PI_CODING_AGENT_DIR: c.agent }, stdio: "ignore" });
+		execFileSync(resolveOmpBin(), ["plugin", "link", REPO], {
+			env: { ...process.env, PATH: stripNodeModulesBins(process.env.PATH), PI_CODING_AGENT_DIR: c.agent },
+			stdio: "ignore",
+		});
 	},
 	script: D0a.script,
 	runs: [{ prompt: "start", pluginArgs: [] }],

@@ -1,6 +1,6 @@
 # omp-agy-swarm
 
-An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.0.1**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
+An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.1.0**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
 
 - **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances in a per-swarm private `AgentRegistry` (`~/.omp/agent/agents/` is never touched; worker transcripts stay under `<swarm_dir>/sessions/`).
 - **Full per-worker model and exact reasoning effort control:** inherit the coordinator's model and effort by default, or pin any runnable `provider/id` and exact effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — never `auto`) with live boundary model switching, immediate effort-only switching, and no silent fallback downgrades.
@@ -12,7 +12,7 @@ An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.
 
 ## Installation & Loading
 
-Requires **omp `19.0.1`** (`@oh-my-pi/pi-coding-agent: 19.0.1`), **Bun**, and **git** (for `share`/`branch` workspaces).
+Requires **omp `19.1.0`** (`@oh-my-pi/pi-coding-agent: 19.1.0`), **Bun**, and **git** (for `share`/`branch` workspaces).
 
 ```sh
 # 1. Link a local checkout for persistent use in omp
@@ -239,6 +239,13 @@ bun run test:e2e
 # Filter to specific scenario IDs or keep temp dirs for inspection:
 bun test/e2e/run.ts D0a D1 --keep
 
+# Run the full deterministic verification suite (typecheck + test + test:pty + test:e2e)
+bun run test:all
+
+# Bump @oh-my-pi/* pins + SUPPORTED_HOST + README to the installed omp version, reinstall, and run test:all
+bun run bump-omp
+# Optional flags: bun run bump-omp 19.2.0 --dry-run | --no-test
+
 # Channel-semantics oracle parity test vs upstream channels.mjs (500 generated boards)
 AGY_SWARM_REF=/path/to/agy-swarm/plugins/swarm/sidecars/swarm_board \
   bun test test/unit/channels.test.ts
@@ -252,7 +259,7 @@ OMP_SWARM_PAID=1 bun run test:paid
 
 ## Known Limits & Platform Notes
 
-- **omp `19.0.1` target:** pinned and tested against `@oh-my-pi/pi-coding-agent` `19.0.1`; loading under another host version logs a warning on stderr.
+- **omp `19.1.0` target:** pinned and tested against `@oh-my-pi/pi-coding-agent` `19.1.0`; loading under another host version logs a warning on stderr.
 - **Linux `/proc/self/fd` file containment:** `safeRead` (`src/ui/view-files.ts`) verifies opened regular-file descriptors via `/proc/self/fd/<fd>` after `O_NOFOLLOW` open so symlink swaps cannot escape `<swarm_dir>` or `OMP_SWARM_UI_ROOTS`. On non-Linux platforms this check fails closed (`unverifiable`), so `plan.json`, `view.json`, `view.html`, `/api/frame`, and `/api/file` reads are refused.
 - **Explicit revival after restart:** after a process restart, non-killed members attach in `stopped` state. Board posts never auto-revive unattended agents; the coordinator must invoke `swarm{action:"revive"}` (exec-tier) to restart them and replay owed posts.
 - **Headless native-async exclusion:** do not mix native omp background jobs or `task` subagents with a headless swarm run. The swarm stop-gate cannot coordinate with native async work and records `native_async_mix: true` in `metrics.json`.

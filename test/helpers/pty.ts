@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveOmpBin, stripNodeModulesBins } from "../../scripts/omp-bin.ts";
 import { listeningSockets } from "../e2e/check.ts";
 import { MockLlm, type Script } from "../e2e/mock-llm/server.ts";
 import { REPO } from "./harness.ts";
@@ -37,10 +38,18 @@ export class PtyOmp {
 		this.mock = new MockLlm(script, join(this.root, "mock.jsonl"));
 		const port = this.mock.start();
 		this.proc = Bun.spawn(
-			["omp", "--model", "mock/coord", "--thinking", "low", "--no-session", "--no-extensions", "--no-title", "-e", REPO, "-e", PROVIDER],
+			[resolveOmpBin(), "--model", "mock/coord", "--thinking", "low", "--no-session", "--no-extensions", "--no-title", "-e", REPO, "-e", PROVIDER],
 			{
 				cwd: work,
-				env: { ...process.env, TERM: "xterm-256color", MOCK_PORT: String(port), PI_CODING_AGENT_DIR: agent, OMP_SWARM_DIR: this.swarm, ...env },
+				env: {
+					...process.env,
+					PATH: stripNodeModulesBins(process.env.PATH),
+					TERM: "xterm-256color",
+					MOCK_PORT: String(port),
+					PI_CODING_AGENT_DIR: agent,
+					OMP_SWARM_DIR: this.swarm,
+					...env,
+				},
 				terminal: {
 					cols,
 					rows,

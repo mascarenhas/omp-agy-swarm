@@ -6,12 +6,12 @@
   "description": "Antigravity-style agent swarm for omp: parallel worker sessions sharing one message board, with a native TUI board and an opt-in web board.",
   "omp": { "extensions": ["./src/index.ts"] },
   "pi": { "extensions": ["./src/index.ts"] },
-  "peerDependencies": { "@oh-my-pi/pi-coding-agent": "19.0.1" },
+  "peerDependencies": { "@oh-my-pi/pi-coding-agent": "19.1.0" },
   "devDependencies": {
-    "@oh-my-pi/pi-catalog": "19.0.1",
-    "@oh-my-pi/pi-coding-agent": "19.0.1",
-    "@oh-my-pi/pi-tui": "19.0.1",
-    "@oh-my-pi/pi-utils": "19.0.1",
+    "@oh-my-pi/pi-catalog": "19.1.0",
+    "@oh-my-pi/pi-coding-agent": "19.1.0",
+    "@oh-my-pi/pi-tui": "19.1.0",
+    "@oh-my-pi/pi-utils": "19.1.0",
     "@types/bun": "1.4.5",
     "playwright-core": "1.65.1",
     "typescript": "5.9.3"
@@ -21,6 +21,8 @@
     "test": "bun test test/unit test/integration",
     "test:pty": "bun test test/pty",
     "test:e2e": "bun test/e2e/run.ts",
-    "test:paid": "bun test/e2e/run.ts --paid"
+    "test:all": "bun run typecheck && bun run test && bun run test:pty && bun run test:e2e",
+    "test:paid": "bun test/e2e/run.ts --paid",
+    "bump-omp": "bun scripts/bump-omp.ts"
   }
 }

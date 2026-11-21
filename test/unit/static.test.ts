@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { Board } from "../../src/board/board.ts";
+import { SUPPORTED_HOST } from "../../src/env.ts";
 import { firstMessage, roleBlock, skillBody, wakeText, workerContract } from "../../src/runtime/prompts.ts";
 import { REPO } from "../helpers/harness.ts";
 
@@ -107,6 +108,19 @@ describe("vendored files", () => {
 		if (existsSync(vendor)) expect(pkg.private).toBe(true);
 		expect(pkg.omp.extensions).toEqual(["./src/index.ts"]);
 		expect(pkg.pi.extensions).toEqual(["./src/index.ts"]);
+	});
+
+	test("package.json @oh-my-pi/* pins agree with each other and src/env.ts SUPPORTED_HOST", () => {
+		const pkg = JSON.parse(readFileSync(join(REPO, "package.json"), "utf8")) as Record<string, Record<string, string> | undefined>;
+		const pinned = new Set<string>();
+		for (const section of ["peerDependencies", "devDependencies", "dependencies"] as const) {
+			for (const [name, version] of Object.entries(pkg[section] ?? {})) {
+				if (name.startsWith("@oh-my-pi/")) pinned.add(version);
+			}
+		}
+		expect([...pinned].length).toBe(1);
+		const [version] = [...pinned];
+		expect(SUPPORTED_HOST).toContain(version!);
 	});
 
 	test("index.html loads preload first, bridge last, and no remote URL", () => {

@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveOmpBin } from "../../scripts/omp-bin.ts";
 import { Checks, type Ctx, treeHash } from "./check.ts";
 import { MockLlm } from "./mock-llm/server.ts";
 import { runOmp, type Scenario } from "./scenario.ts";
@@ -84,6 +85,9 @@ if (args.includes("--paid")) {
 	process.exit(await runPaid(args.filter(a => !a.startsWith("--")), PAID));
 }
 const only = args.filter(a => !a.startsWith("--"));
+const ompBin = resolveOmpBin();
+const ompVersion = execFileSync(ompBin, ["--version"], { encoding: "utf8" }).trim();
+console.log(`Host omp: ${ompVersion} (${ompBin})`);
 const list = only.length ? DETERMINISTIC.filter(s => only.includes(s.id)) : DETERMINISTIC;
 let failed = 0;
 const started = performance.now();

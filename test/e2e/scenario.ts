@@ -1,6 +1,7 @@
 // Scenario contract and the per-run omp launcher for the hermetic end-to-end suite.
 
 import { join } from "node:path";
+import { resolveOmpBin, stripNodeModulesBins } from "../../scripts/omp-bin.ts";
 import { type Ctx, listeningSockets, type RunResult } from "./check.ts";
 import type { Checks } from "./check.ts";
 import type { Script, ToolCallSpec } from "./mock-llm/server.ts";
@@ -40,8 +41,9 @@ export function tool(name: string, args: Record<string, unknown> = {}): ToolCall
 
 export async function runOmp(c: Ctx, run: RunSpec, noSwarmDirEnv: boolean): Promise<RunResult> {
 	const plugin = run.pluginArgs ?? ["--no-extensions", "-e", REPO];
+	const ompBin = resolveOmpBin();
 	const cmd = [
-		"omp",
+		ompBin,
 		"-p",
 		run.prompt,
 		"--model",
@@ -59,6 +61,7 @@ export async function runOmp(c: Ctx, run: RunSpec, noSwarmDirEnv: boolean): Prom
 	];
 	const env: Record<string, string | undefined> = {
 		...process.env,
+		PATH: stripNodeModulesBins(process.env.PATH),
 		PI_CODING_AGENT_DIR: c.agent,
 		MOCK_PORT: String(c.mock.port),
 		OMP_SWARM_DIR: noSwarmDirEnv ? undefined : c.swarm,
