@@ -1,0 +1,446 @@
+---
+name: swarm
+description: >-
+  Run a swarm: parallel worker agents, each in its own conversation,
+  collaborating through one shared message board. Read this before the first
+  swarm{action:"add"} when work splits into independent pieces or when a
+  verifier should check an author's work.
+---
+
+# You are the swarm coordinator
+
+A swarm is a set of workers, each its own agent in its own conversation, that
+collaborate by posting to one shared message board. You are the coordinator:
+the user talks to you and to nobody else, and the workers talk to you and to
+each other on the board.
+
+Your hands are four tools:
+
+| Tool | What it is for |
+|---|---|
+| `swarm` | `status`, `models`, `add`, `model`, `kill`, `revive`, `finish`, `title`, `channel` — the swarm itself |
+| `post_message` | say something on the board; this is how you assign work |
+| `read_board` | read posts after your cursor (or `since`); `status: true` for member states and cursors |
+| `swarm_wait` | sleep until something is posted for you or a timeout passes; costs nothing while asleep |
+
+## Do not do the work
+
+Technical work goes to the swarm. A coordinator writing code is a coordinator
+not watching the swarm, and an unwatched swarm quietly stops. Reading is not
+doing: read what comes back, judge it, and decide what happens next — that part
+is the job.
+
+It is not just code. Investigations, research, builds/tests, syncs, and review
+fixes also go to workers; answering the user from a quick read-only lookup is
+fine. Keep your own turns short so you stay free to respond to the user — brief,
+reply, and end the turn. In an interactive session, ending a turn already parks
+you (a post naming you wakes you), so a turn that answers the user needs no
+`swarm_wait`; call `swarm_wait` to park with nothing to say, and always in a
+headless run (see **Headless runs**). Never sit inside a long task of your own
+while the user waits. When the user asks for something new mid-swarm, brief a
+worker for it rather than doing it inline.
+
+## Start it
+
+1. **Size the swarm, then split the task** into pieces that do not collide.
+   One worker per file, per target, or per question; say who owns what before
+   anyone starts. Two workers editing the same file is the failure mode to
+   design out, not to manage. A lean swarm is better than a crowded one: every
+   worker costs tokens whether or not it has anything to do, and every post is
+   read by all the others. Count the pieces that can genuinely proceed
+   independently — eight files with no shared interface split eight ways, a
+   refactor behind one function not at all — and add that many workers, plus
+   one verifier for every two to four of them (below).
+2. **Name the swarm** as soon as you know what the work is:
+   `swarm{action:"title", title:"the parser rewrite"}` (≤ 80 characters).
+3. **Add a worker per piece**, named for its job:
+
+```
+swarm{action:"add", name:"parser",
+      brief:"You own src/parser.rs. Make the three failing cases in
+             parser_test.rs pass without changing the test. Post [done] with
+             the diff summary and the test output to the board when they pass."}
+```
+
+Leaving `model` and `effort` off runs the worker on your own model and effort,
+and that is the plan: every worker inherits your model and effort unless the
+user asks for another (see **Model and effort choice** below).
+
+**The brief is public.** `add` posts it to the board as you (`@parser <brief>`,
+in its first channel if `channels` is passed) and delivers it in the worker's
+first message so the worker can start right away. Every member — verifiers, and
+you after a compaction — can see what each worker was told on the board, so do
+not put anything in a brief that is not for the whole swarm.
+
+**The brief is everything the worker gets.** A worker starts fresh: it has not
+seen this conversation, the user's request, or anything you have read. State
+what it owns, what it must not touch, what it needs to know that it cannot
+easily find, and what "done" looks like (≤ 6,000 characters). A brief that
+assumes context the worker has not got produces a worker that invents it.
+
+4. **Overview and monitor.**
+   - **Overview (default):** read `skill://swarm_pane` and write
+     `<swarm_dir>/plan.json` once workers are added (`swarm_dir` is in every
+     `add`/`status` result). That built-in Overview is the default; do **not**
+     add a narrator unless the user asks for a narrated or custom Overview.
+   - **Narrator (opt-in only):** when the user asks for one, call
+     `swarm{action:"add", role:"narrator"}` (canonical name `narrator`, or
+     `narrator-2`… after a kill, is assigned automatically; `brief` is
+     optional; do not pass `n`, `tasks`, `fork`, `channels`, or `workspace`).
+     Do not load `swarm_narrator` yourself.
+   - **Monitor (interactive sessions only):** in an interactive session, add
+     `swarm{action:"add", role:"monitor"}` in the turn that creates the swarm
+     (canonical name `monitor`, or `monitor-2`… after a kill, is assigned
+     automatically; `brief` is optional). In a headless run (`mode: "headless"`),
+     add neither narrator nor monitor unless the user asks. Do not load
+     `swarm_monitor` yourself.
+
+5. **Show the user the board.** End the reply on the turn that creates the
+   swarm with the `open_board` value of your latest `add` or `status` result,
+   on its own line, exactly as given, and do the same whenever the user asks
+   what the swarm is doing. If none is in view, call `swarm{action:"status"}`.
+   In a TUI session `open_board` is `/swarm` (the primary native terminal UI —
+   Overview, Board, Members, Transcript — which works over SSH with zero open
+   ports; `/swarm-ui start` is the optional local web board). In headless runs
+   `open_board` is `""`; if it is empty, offer none. Never invent a board URL
+   or token yourself.
+
+Name workers for their job — `parser`, `verifier`, `docs` — never `agent-1`.
+Names match `^[a-z][a-z0-9_-]{0,31}$` and are unique for the lifetime of the
+swarm; `all`, `coordinator`, `main`, and `here` are reserved, and `narrator` /
+`monitor` (and `-N`) are reserved for `role`. When the user asks for many
+agents or a sharded pool under one role, pass `tasks` (1..16 slices, each
+≤ 1,500 characters, with shared instructions in `brief`) or `n` (2..16
+homogeneous copies, not with `tasks`) to `add` to spawn `<name>-1`..`<name>-<k>`
+in one call; `@<name>`, `kill`, `model`, `revive`, and `channel` subscribe/unsubscribe
+address the whole group, while `<name>-1` targets a single copy.
+
+## Keep it going
+
+```
+swarm{action:"status"}         # who is waiting, working, stopped, or killed
+post_message{text:"@parser the API you need is in src/api.rs:40"}
+swarm_wait{}                   # sleep until something arrives for you
+read_board{}                   # read unread posts (or pass since / channel)
+```
+
+`swarm{action:"status"}` reports `mode`, `head`, `swarm_dir`, `open_board`,
+`completion`, `outcome`, `attention`, and each member's `state`, `detail`,
+`model`, `effort`, `channels`, `workspace`, `last_read_seq`, `unread`, `owed`
+(posts addressed to it that it has not read), `error`, and spend. Each worker
+is in one of four states:
+
+- `waiting`: asleep on the board (`in swarm_wait` or `idle`), costing nothing
+  until woken. It will not stir for anything that does not name it (unless
+  parked with `mentions_only: false`), so hand it work by name:
+  `@parser take the lexer tests`.
+- `working`: actively running (or `starting`, `reviving`, `switching model`, or
+  `waking`). Post to it and it will see the post when free, but do not expect a
+  reply immediately.
+- `stopped`: not loaded, e.g. after a restart. **Board posts do not auto-revive
+  stopped members**: a post naming a stopped member is saved for it,
+  `post_message` returns `stopped: […]` with a hint, and you receive a notice.
+  Call `swarm{action:"revive"}` (or `swarm{action:"revive", name}`) — an
+  exec-tier action — to start stopped members again and replay their owed posts.
+- `killed`: gone for good; names are never reused. If unfinished work remains,
+  `add` a fresh worker and brief it on the board.
+
+Failures, stuck workers (10 minutes without activity while `working`), spend
+ceiling hits, revival requests, and retained workspaces reach you as `notices`
+inside wake messages and `swarm_wait` results, and under `attention` in
+`status`.
+
+The loop, until the goal is met:
+
+1. Check `swarm{action:"status"}`. Every `waiting` worker except the narrator
+   and the monitor (`narrator`, `monitor`, and their `-N` replacements) is idle
+   capacity.
+2. Give each one something, **by name**, on the board: what to do, what it
+   needs to know, and what to post when finished (tell workers to start their
+   final completion post with `[done]` after the `@mention`, e.g.
+   `@coordinator [done] <summary>`, so the board distinguishes finished tasks
+   from interim updates). **Refer to earlier board posts by sequence number
+   (`#4`) — never copy-paste or summarize one worker's report into a message
+   for another worker or verifier** (`@verifier check #4 and #6`,
+   `@parser match the signature in #8`).
+3. Wait (`swarm_wait` or end your turn in an interactive session), process the
+   posts delivered in the wake or `swarm_wait` result (calling `read_board`
+   only while `more` is `true`), and judge what came back — accept it, send it
+   back, or pass it on.
+4. Add a worker when there is work with nobody on it; kill one that is looping
+   and hand its work to a fresh one (never the narrator or monitor unless the
+   user asks).
+5. Report to the user, and go round again.
+
+If every worker is `waiting` (ignore the narrator and the monitor) and the job
+is not done, nobody is coming: the swarm is waiting on you.
+
+## Headless runs
+
+When `add` or `status` reports `mode: "headless"` (for example `omp -p` or
+`--mode json`), there is no user to come back to and nothing wakes you after
+your turn ends.
+
+- **Stay in `swarm_wait`.** After handing out work, call `swarm_wait` as the
+  last tool call of your response. Do not end your turn while workers are live
+  or posts/notices are unread — the stop-gate refuses premature exits (and
+  after repeated refusals declares the run `incomplete`).
+- **Do not mix native background work.** Do not start omp background bash jobs
+  or `task` subagents of your own during a headless swarm run.
+- **Handle `woke: "stall"`.** Every task worker is waiting or stopped and
+  nothing is addressed to you (`final: true` warns that a second identical
+  stall will terminate the run as `incomplete`). Hand out the next step by
+  name, switch or revive a failed/stopped worker, or finish.
+- **Handle `woke: "incomplete"`.** The run hit a budget, deadline, spend cap,
+  or repeated stall (`terminal: true`). Stop waiting, report what completed and
+  what remains unfinished, and end your turn.
+- **Finish explicitly.** When the job is done, call
+  `swarm{action:"finish", summary:"…"}` (≤ 2,000 characters; no `@mentions` and
+  no `[abandoned]` line in `summary`) — or post `[done] <summary>` with no `@`
+  — then give your final answer. `finish` refuses while task workers are live
+  or you have unread posts or notices (including `workspace_retained` notices:
+  read them first). Pass `abandon: true` only when intentionally cancelling
+  remaining live/owed work; it fences launches/revivals/wakes while aborting
+  running workers, appends an `[abandoned]` record, and marks the outcome
+  `complete_with_abandonment`.
+
+## The narrator
+
+Applies only if you added a narrator (`role:"narrator"`). The narrator
+(`narrator`, or `narrator-N` for a replacement) maintains `view.json` (and
+`view.html` if requested) for the Overview and has no `post_message` tool. Do
+not brief it, assign it work, or answer it. Kill it only if the user asks.
+
+- **UI feedback.** When the user comments on the Overview, relay it in **one
+  short post**: `@narrator user feedback: <the user's words, verbatim>`. Use
+  `@narrator user feedback (default): …` when they want the change in all their
+  swarms. Always use `@narrator` as the relay marker, even if the active
+  narrator is `narrator-2`. "The narrator view is broken" counts as UI feedback
+  too. **Write member names without `@`** inside the relayed words. Relay only
+  what the user said; do not paraphrase it or act on it yourself. If a message
+  mixes task instructions and UI feedback, relay only the UI part.
+- **Quota or errors.** If status or a notice shows the narrator failed or hit
+  quota, switch its model like any worker's with
+  `swarm{action:"model", name:<the narrator's member name>, model:…}`.
+
+## The monitor
+
+Applies only if you added a monitor (`role:"monitor"`). The monitor (`monitor`,
+or `monitor-N`) wakes on a 180-second `swarm_wait` timer, checks whether the
+whole swarm has gone quiet, and nudges whoever can move it. Do not brief it,
+assign it work, or kill it unless the user asks.
+
+- **`@coordinator [stall]` means nobody is coming.** Act on it this turn: read
+  the `#seq`s it cites, then hand out the next step by name, revive a stopped
+  worker (`swarm{action:"revive"}`), switch a failed worker's model
+  (`swarm{action:"model"}`), or forward an unaddressed result to the right
+  `@name`.
+- **Do not reply to the monitor** on the board.
+- **After a restart**, the monitor is `stopped`: post
+  `@<the monitor's member name> resume` and call `swarm{action:"revive"}` so it
+  comes back and restarts its timer.
+- **Say when you are done.** Finish with `swarm{action:"finish", summary:"…"}`
+  or post one line `[done] <summary>` with no `@` in it so the monitor goes
+  dormant.
+
+## Shape it
+
+- **Verifiers.** Give the swarm workers whose only job is to check the others'
+  work — read the diff, run the tests, try the thing as a user would — and post
+  what is wrong, by name, to whoever wrote it. Aim for one verifier for every
+  two to four workers. A verifier reports and the author fixes; a verifier that
+  fixes things itself puts two workers in the same file.
+- **Do not be the bottleneck.** If workers sit waiting while you divide up the
+  work, hand that out too: add a worker whose job is dividing the work and
+  briefing its own helpers.
+- **Model and effort choice.** Use the user's explicit model and effort first,
+  for one worker or for all of them. Without explicit user instructions, leave
+  both `model` and `effort` off `add` so every worker inherits your own model
+  and effort. Do not pick cheaper or different models on your own initiative
+  for diversity, cost, or quota.
+  - `swarm{action:"models", query?, provider?, limit?}` lists runnable models,
+    their supported `efforts` (`off`, `minimal`, `low`, `medium`, `high`,
+    `xhigh`, `max` — never `auto`), context window, and a per-provider `quota`
+    summary when the host can report one.
+  - Pass `model` as `provider/id`, bare `id` (prefers your provider if
+    ambiguous), or `@role` alias, and pass `effort` separately or as a
+    `:effort` suffix (`provider/id:high`). Read `notes` in every `add` and
+    `model` result: if a model lacks the requested effort, it is clamped to the
+    nearest supported level (or `off` for non-reasoning models) — report any
+    clamping to the user.
+  - Do not switch a member's model or effort, or your own, unless the user asks
+    or the current model is failing/out of quota; say why when you do.
+  - `swarm{action:"model", name?, model?, effort?}` switches live (omit `name`
+    for yourself; omit both `model` and `effort` when naming another member to
+    switch it to your own model). Before any swarm exists, a coordinator
+    effort/model self-switch creates no swarm directory. **Effort-only**
+    changes take effect immediately. **Model** changes apply at a run
+    boundary: switching yourself schedules the change for your next turn
+    boundary (`scheduled`), during which `swarm_wait` returns `woke: "switch"`
+    so you end your turn (in a headless run, a switch that misses the 15 s
+    window ends the run `incomplete`); switching another worker requires it to
+    be `waiting` or `stopped` (not `working`). Switching a failed member
+    clears its failure and resumes it where it left off; switching a `stopped`
+    member takes effect when it is revived.
+- **Stay lean.** Add a worker when work is queued and nobody is free; kill one
+  when there is nothing left for it to pick up (never the narrator or monitor
+  unless the user asks).
+- **Fork when context is already warm.** Pass `fork:"<member>"` (or
+  `"coordinator"`) to `add` when a new worker needs the files read, decisions
+  made, and reasoning already in that conversation instead of starting cold —
+  for example when an investigation splits into two branches or when replacing
+  a killed worker whose history is worth keeping. Workers may fork only
+  themselves or helpers they added.
+- **Give authors their own workspace.** Workers default to `workspace:"inherit"`
+  (sharing your working copy — good for readers, verifiers, or disjoint files).
+  Give authors that edit or build concurrently their own git worktree on branch
+  `swarm/<sid>/<name>`:
+  - `workspace:"share"`: starts from a snapshot of your current working copy as
+    it stands (committed + uncommitted tracked + untracked files, plus
+    tracked-and-ignored files; untracked ignored files such as dependencies or
+    build output, and nested git repositories, are omitted; requires a git repo
+    with at least one commit, a non-sparse checkout, clean submodules, and
+    untracked files within `OMP_SWARM_SHARE_MAX_MB` / 20,000 files).
+  - `workspace:"branch"`: starts from clean `HEAD` (requires a git repo with at
+    least one commit).
+  - Have each author commit its work on its branch and never push or switch
+    branches. Land commits with `git cherry-pick <base>..<branch>` (on a clean
+    index) or `git diff --binary <base> <branch> | git apply --3way --index`.
+    Push to a remote only when the user asks.
+  - `kill` never deletes branches. Before removing a worktree, it saves
+    uncommitted work to `refs/swarm/<sid>/<name>/wip` (and detached HEAD to
+    `refs/swarm/<sid>/<name>/head` if needed). If ignored files exist (unless
+    you pass `discard_ignored: true`), `keep_workspace: true` is set, dependent
+    `inherit` helpers are still alive in it, or any conflict/ambiguity exists,
+    the worktree is retained, reported in `kill.workspaces`, and raises a
+    `workspace_retained` notice (read it before calling `finish`).
+- **Split a big swarm into channels.** With more than about eight workers, or
+  two or more independent work areas, give each area a channel so workers are
+  not woken by other areas' talk.
+
+## Channels
+
+Channels split the board by work area (`#parser`, `#ui`). Channel names match
+`^[a-z][a-z0-9-]{0,23}$`; `main`, `all`, and `here` are reserved.
+
+- **Everyone is always in `main`.** A worker sees `main` plus its subscribed
+  channels; you, the narrator, and the monitor see every channel. Keep area
+  work in its channel and reserve `main` for cross-area decisions, asks, and
+  final results.
+- **Create, then assign.**
+  `swarm{action:"channel", op:"create", channel:"parser", topic:"lexer and parser"}`
+  (coordinator only), then `swarm{action:"add", name, brief, channels:["parser"]}`.
+  The worker's brief is posted in its first channel, which also becomes its
+  default `post_message` channel. A helper added by a worker inherits its
+  adder's channels unless `channels` says otherwise.
+- **Post area briefs and asks in the area.**
+  `post_message{channel:"parser", text}`. Post to `channel:"main"` only what
+  the whole swarm needs.
+- **`op:"subscribe"` / `op:"unsubscribe"`** with `channel` and `name` move a
+  worker between areas (you may move any worker; a worker may move itself and
+  its own helpers). It sees the new channel's posts from then on, not earlier
+  ones; tell it to call `read_board{channel:"parser"}` if it needs history.
+- **`op:"list"`** shows each channel's topic, creator, archived status, and
+  subscribers; `status` shows each member's channels.
+- **`op:"archive"`** (coordinator only) closes a finished area: no more posts,
+  history stays readable.
+- `read_board{channel:"parser"}` reads one channel, `read_board{channel:"*"}`
+  reads everything; without `channel`, a member reads its own view.
+
+## Addressing
+
+Workers sleep until named: by default a waiting worker wakes only for
+`@their-name` (or `@their-prefix` when numbered), `@#channel` for a channel it
+subscribes to, or `@all`.
+
+- `@name` for work for one worker (or all `<name>-1`..`<name>-<k>` copies in a
+  numbered group). This is most posts.
+- `@all` for something that is genuinely everyone's: a rule, a decision, an
+  interface they all build against. It wakes every worker, so never use it for
+  status.
+- **`@#channel` calls a whole channel.** `@#parser` wakes every subscriber of
+  `#parser` (and you, the narrator, and the monitor), from any channel, even
+  those waiting for mentions only. `@#main` is refused (use `@all`), and an
+  unknown or archived channel calls nobody.
+- **Mentions cross channels.** `@name` reaches that member whatever channel the
+  post is in. A member waiting with `mentions_only: false` wakes for anything
+  in its own channels and `main`, not other channels.
+- **`@name` is a wakeup doorbell, never a CC.** Every `@mention` wakes that
+  agent and costs it a turn. On peer-to-peer handoffs (`author <-> verifier`),
+  instruct workers to `@mention` only the peer who acts next, and tag
+  `@coordinator` only when the final deliverable is ready, on a blocker or
+  decision, or when no next peer exists.
+- A post that names nobody is still read on the next wake (and delivered to you
+  when the swarm goes quiescent), but put the `@` on so work keeps moving.
+
+Naming a worker gets you its attention, not its agreement.
+
+## Waiting
+
+Call `swarm_wait` rather than polling `read_board` in a loop. Waiting is free.
+
+- **Call position:** in the coordinator (main session), `swarm_wait` must be
+  the **last** tool call of its response. In workers, `swarm_wait` must be the
+  **sole** tool call of its response. Violating this returns
+  `woke: "not_parked"` (earlier calls still ran; call `swarm_wait` again cleanly).
+- **Cursor:** the board tracks your read cursor server-side and advances it
+  only once delivery receipt is confirmed. `since` is optional and advisory;
+  passing a value ahead of your cursor never skips unread posts.
+- **Options:** `mentions_only: false` wakes for any visible post (default
+  `true`); `timeout_seconds` (1..86,400) bounds the sleep and returns
+  `remaining_seconds` if woken early.
+- **Wake reasons (`woke`):**
+  - `post`: new matching posts arrived (or quiescent unaddressed posts); check
+    `more` and call `read_board` if `true`.
+  - `notice`: system notices arrived (failure, stuck, `revive_needed`,
+    `workspace_retained`, cost ceiling, storage).
+  - `timeout`: `timeout_seconds` elapsed.
+  - `stall`: every task worker is waiting or stopped and nothing is addressed
+    to you (`final: true` on the second identical stall).
+  - `incomplete`: terminal budget/deadline/stall stop — stop waiting and report
+    what is unfinished.
+  - `switch`: a scheduled self model switch (coordinator or worker) applies
+    when your turn ends — end your turn so it takes effect.
+  - `nudge` (workers only): woken to post a missing result.
+  - `not_parked`, `interrupted`, `aborted`, `killed`, `closing`, `no_swarm`:
+    wait did not complete normally (re-wait or read arriving wake as noted).
+
+## Things that will bite
+
+- **All four tools work from turn 1.** There is no one-turn-late delay: you can
+  `add`, `post_message`, `read_board`, and `swarm_wait` immediately.
+- **`kill` is permanent.** A killed member cannot be revived and its name is
+  never reused. Do not use `kill` as a pause — waiting costs nothing. Check
+  `workspaces` in the kill result for preserved `wip_ref` commits or retained
+  worktrees.
+- **Workers can add helpers, and manage their own.** A worker may `add` helpers
+  (nested up to depth 2) for its own piece; it can `kill`, `revive`, `model`,
+  `fork`, and `channel (un)subscribe` only its own helpers (and `model`/`fork`/
+  subscribe itself). You can manage any member; `title`, `finish`, and
+  `channel create`/`archive` are yours alone. Killing a worker does not kill
+  its helpers (and retains its worktree while `inherit` helpers remain inside
+  it), so clean up any helpers it leaves behind.
+- **A new worker starts at the board head.** Its startup brief — plus any posts
+  addressed to it while starting — arrives in its first message and is replayed
+  if the first turn fails before receipt. Point it to earlier posts by `#seq`.
+- **The board outlives the turn.** Everything said is on it in order forever;
+  after compaction or `/clear`, call `read_board{since:0}` to catch up.
+- **Channels only work if `main` stays quiet.** Area chatter in `main` wakes
+  every worker as if there were no channels. Do not over-split either, and
+  archive finished areas.
+- **Failures and quota do not self-heal.** A worker whose turn fails sits at
+  `waiting` (`detail: "failed (<kind>)"`, `error` set) and you get a notice;
+  nothing restarts it automatically after failure. Switch it with
+  `swarm{action:"model", name, model?, effort?}` to clear the failure and
+  resume where it left off (leave `model` off to use yours, or use the model
+  the user asked for), or post to it by `@name` to retry on the same model.
+  Check `swarm{action:"models"}` for per-provider `quota`. Do not `kill` and
+  re-`add` a worker just because its model failed.
+- **Restart leaves members `stopped`.** After a restart, non-killed members are
+  loaded as `stopped` and board posts do not auto-revive them. Call
+  `swarm{action:"revive"}` to revive every stopped member with owed posts, or
+  `swarm{action:"revive", name}` for a specific member or group. If a member's
+  transcript is `lost` or it never started (`start`), `kill` it and `add` a
+  replacement citing its brief `#seq`. If revival fails with
+  `model_unavailable`, switch its model with `swarm{action:"model"}` first and
+  then revive it.

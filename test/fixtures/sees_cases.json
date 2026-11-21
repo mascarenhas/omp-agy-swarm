@@ -1,0 +1,32 @@
+{
+  "mentions": [
+    { "text": "@parser go", "name": "parser", "want": true },
+    { "text": "hey@parser", "name": "parser", "want": false },
+    { "text": "@Parser go", "name": "parser", "want": true },
+    { "text": "@parsers go", "name": "parser", "want": false },
+    { "text": "@parser-2 go", "name": "parser", "want": false },
+    { "text": "@parser go", "name": "parser-2", "want": true },
+    { "text": "@all please", "name": "anyone", "want": true },
+    { "text": "x_@parser", "name": "parser", "want": false },
+    { "text": "é@parser", "name": "parser", "want": false },
+    { "text": "😀@parser", "name": "parser", "want": true },
+    { "text": "(@parser)", "name": "parser", "want": true },
+    { "text": "@parser_x", "name": "parser", "want": false },
+    { "text": "@parserá", "name": "parser", "want": false },
+    { "text": "", "name": "parser", "want": false }
+  ],
+  "channelMentions": [
+    { "text": "@#parser and @#ui then @#parser", "want": ["parser", "ui"] },
+    { "text": "@#main hello", "want": ["main"] },
+    { "text": "@#all @#here @#Bad", "want": ["bad"] },
+    { "text": "x@#parser", "want": [] },
+    { "text": "@#1abc", "want": [] }
+  ],
+  "effective": [
+    { "role": "coordinator", "set": null, "name": "c", "want": ["*"] },
+    { "role": "worker", "set": null, "name": "w", "want": [] },
+    { "role": "worker", "set": null, "name": "narrator-2", "want": ["*"] },
+    { "role": "", "set": null, "name": "monitor", "want": ["*"] },
+    { "role": "worker", "set": ["a"], "name": "w", "want": ["a"] }
+  ]
+}
