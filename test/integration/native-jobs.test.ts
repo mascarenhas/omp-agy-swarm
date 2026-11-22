@@ -113,7 +113,7 @@ test("compiled print restores its lease when the active swarm exits without fini
 	expect(outcome).toBe("quiescent_no_done");
 }, 60_000);
 
-test.skipIf(!existsSync("/usr/bin/python3"))("compiled workers refuse eval child spawning but background eval and bash still deliver", async () => {
+test.skipIf(!existsSync("/usr/bin/python3"))("compiled workers without task refuse even scouts through eval; background eval and bash still deliver", async () => {
 	const code = `
 try {
   await agent("PHASEA_CHILD_AGENT_SENTINEL", { agent: "task", label: "phasea-agent" });
@@ -143,7 +143,7 @@ try {
 			{ when: "LATCH-RELEASED-WORKER-NONCE-f43d2b", reply: { tools: [tool("post_message", { text: "@coordinator WORKER-JOB-POST" })] } },
 			{ when: "^tool:", reply: { tools: [tool("swarm_wait")] } },
 		] },
-	}, {}, cwd => {
+	}, { env: { OMP_SWARM_WORKER_TOOLS: "read,write,bash,eval" } }, cwd => {
 		writeFileSync(join(cwd, "result.py"), `import pathlib, sys, time
 latch = pathlib.Path("release-job")
 end = time.monotonic() + 12

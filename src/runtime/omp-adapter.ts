@@ -25,9 +25,16 @@ import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentLifecycleManager, type AgentLifecycleApi } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { CostGate, type CostCapRefusal } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
+import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { TASK_SUBAGENT_EVENT_CHANNEL, type SubagentEventPayload } from "@oh-my-pi/pi-coding-agent/task/types";
 import { cfgAsyncMaxJobs, cfgAsyncPrintWake } from "@oh-my-pi/pi-coding-agent/tools/settings";
+import type { RemoteAgentSession } from "@oh-my-pi/pi-coding-agent/thread/remote-agent-session";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import { MAX_THINKING_SUFFIX_OPTIONS, splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
+import type { SubagentLifecyclePayload } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { raceTimeout, TIMING } from "../env.ts";
 import { HubBridge } from "./hub-bridge.ts";
 import { preferredAgentId } from "./member.ts";
@@ -40,6 +47,7 @@ import type {
 	HostMessage,
 	ModelInfo,
 	SessionFactory,
+	RequestBill,
 	ThinkingCaps,
 	TranscriptEntry,
 	WakeSources,
@@ -167,6 +175,305 @@ const loggedMissing = new Set<string>();
 
 type WorkerBus = ExtensionAPI["events"];
 
+type BillSink = (bill: RequestBill) => void;
+type Owner = { ref: AgentRef; bill: BillSink; children: Set<AgentRef>; costGate?: AgentSession["costGate"] };
+
+// The compiled host does not expose a runtime import for the mirror class.
+export function isRemoteScoutSession(session: AgentRef["session"] | undefined): session is RemoteAgentSession {
+	return !!session && "home" in session && typeof session.home === "string"
+		&& "applyEntries" in session && typeof session.applyEntries === "function"
+		&& "close" in session && typeof session.close === "function";
+}
+
+/** Use the host's request guard, including retries and auxiliary calls, in every worker tree. */
+class SwarmWorkerCostGate extends CostGate {
+	constructor(settings: Settings, initialSpend: number, readonly swarmCheck: () => CostCapRefusal | undefined, warn: (message: string) => void) {
+		super(settings, initialSpend, warn);
+	}
+
+	override get capped(): boolean {
+		return true;
+	}
+
+	override check(): CostCapRefusal | undefined {
+		return this.swarmCheck() ?? super.check();
+	}
+}
+
+const WORKER_SCOUT_HOOK = "<inline-0>";
+
+/** Keep durable entry identities across native park/reopen and mirror replacements. */
+class ScoutJournal {
+	constructor(readonly seen: Set<string>, readonly since: number, readonly bill: BillSink, readonly log: (line: string) => void) {}
+
+	record(id: string, entry: RequestBill): void {
+		if (this.seen.has(id)) return;
+		this.seen.add(id);
+		reportBill(this.bill, this.log, entry);
+	}
+
+	scan(entries: readonly SessionEntry[]): void {
+		for (const entry of entries) {
+			// A discarded assistant is already billed from its raw message_end.
+			if (entry.type !== "model_usage" || entry.purpose === "discarded-turn" || this.seen.has(entry.id)) continue;
+			if (Date.parse(entry.timestamp) >= this.since) this.record(entry.id, entry);
+		}
+	}
+}
+
+function reportBill(bill: BillSink, log: (line: string) => void, entry: RequestBill): void {
+	try { bill(entry); } catch (error) { log(`omp-agy-swarm: model usage accounting failed: ${String(error)}`); }
+}
+
+/** Stateless eval and other auxiliary calls are journaled, not assistant events. */
+function observeAuxiliaryUsage(
+	manager: SessionManager, bill: BillSink, log: (line: string) => void,
+	journal?: ScoutJournal,
+): () => void {
+	const append = manager.appendModelUsage;
+	const wrapped: typeof append = function (usage, owner) {
+		const entryId = append.call(manager, usage, owner);
+		if (entryId !== undefined) {
+			if (journal) journal.record(entryId, usage);
+			else reportBill(bill, log, usage);
+		}
+		return entryId;
+	};
+	manager.appendModelUsage = wrapped;
+	// Auto-prewalk can journal before the first started frame.
+	if (journal) journal.scan(manager.getEntriesView());
+	return () => { if (manager.appendModelUsage === wrapped) manager.appendModelUsage = append; };
+}
+
+/** One observer per swarm. Registry refs, not the spelling of ids, establish ownership. */
+class ScoutUsage {
+	readonly #registry = AgentRegistry.global();
+	readonly #roots = new Map<string, Owner>();
+	readonly #paths = new WeakMap<AgentRef, Owner>();
+	/** Host 19.1 publishes the same request object synchronously on the native bus. */
+	readonly #sources = new WeakMap<object, AgentRef>();
+	readonly #requests = new WeakSet<object>();
+	readonly #aux = new Map<AgentRef, () => void>();
+	readonly #journalEntries = new Map<string, Set<string>>();
+	readonly #scoutHomes = new WeakMap<AgentRef, RemoteAgentSession["home"]>();
+	readonly #retiring = new Map<string, AgentRef>();
+	readonly #off: (() => void)[];
+	#main: Owner | undefined;
+	#mainSid: string | undefined;
+
+	constructor(bus: WorkerBus, readonly log: (line: string) => void) {
+		this.#off = [
+			this.#registry.onChange(({ type, ref }) => {
+				if (type === "registered") {
+					this.#retiring.delete(ref.id);
+					this.#own(ref);
+					if (ref.status === "parked" || ref.status === "aborted") this.#fenceColdRevival(ref);
+				} else if (type === "status_changed") this.#fenceColdRevival(ref);
+				else if (type === "removed") {
+					this.#paths.get(ref)?.children.delete(ref);
+					// A worker unregisters before draining jobs; keep its journal hook
+					// through disposal rather than unhooking on loss of visibility.
+					if (this.#roots.get(ref.id)?.ref !== ref && !this.#scoutHomes.has(ref)) {
+						this.#aux.get(ref)?.();
+						this.#aux.delete(ref);
+					}
+				}
+			}),
+			bus.on("task:subagent:lifecycle", data => {
+				const frame = data as SubagentLifecyclePayload;
+				if (frame.status !== "started") {
+					this.#retiring.delete(frame.id);
+					return;
+				}
+				const ref = this.#registry.get(frame.id);
+				if (!ref || (frame.sessionFile && frame.sessionFile !== ref.sessionFile)) return;
+				let owner = this.#own(ref);
+				if (!owner && frame.agent === "scout" && this.#main && ref.parentId === this.#main.ref.id
+					&& this.#registry.get(ref.parentId) === this.#main.ref
+					&& this.#main.ref.session instanceof AgentSession
+					&& this.#main.ref.session.sessionManager.getSessionId() === this.#mainSid) {
+					owner = this.#main;
+					this.#paths.set(ref, owner);
+				}
+				if (!owner || this.#aux.has(ref)) return;
+				const session = ref.session;
+				if (!(session instanceof AgentSession) && !isRemoteScoutSession(session)) return;
+				this.#scoutHomes.set(ref, session instanceof AgentSession ? "main" : session.home);
+				const transcript = session.sessionManager.getSessionId();
+				let seen = this.#journalEntries.get(transcript);
+				if (!seen) this.#journalEntries.set(transcript, seen = new Set());
+				const journal = new ScoutJournal(seen, ref.createdAt, owner.bill, this.log);
+				if (!(session instanceof AgentSession)) {
+					// The bridge mirrors entries only under a watch. Usage-only deltas
+					// don't emit a session event, so account at the delta itself.
+					const apply = session.applyEntries;
+					const close = session.close;
+					const onEntries: typeof apply = delta => {
+						apply.call(session, delta);
+						if (!session.closed) journal.scan(delta.entries);
+					};
+					const onClose: typeof close = reason => {
+						close.call(session, reason);
+						off();
+						if (this.#aux.get(ref) === off) this.#aux.delete(ref);
+					};
+					session.applyEntries = onEntries;
+					session.close = onClose;
+					// Establish a watch; the usage entries arrive independently.
+					const off = () => {
+						if (session.applyEntries === onEntries) session.applyEntries = apply;
+						if (session.close === onClose) session.close = close;
+						unwatch();
+					};
+					const unwatch = session.subscribe(() => {});
+					this.#aux.set(ref, off);
+					journal.scan(session.sessionManager.getEntries());
+					return;
+				}
+				const offUsage = observeAuxiliaryUsage(session.sessionManager, owner.bill, this.log, journal);
+				// The native monitor attaches after its started frame. Pin the
+				// emitter's actual generation before the coordinator sees its bill.
+				const offSource = session.subscribe(event => {
+					if (event.type === "message_end" && event.message.role === "assistant")
+						this.#sources.set(event.message, ref);
+				});
+				const off = () => { offUsage(); offSource(); };
+				this.#aux.set(ref, off);
+				session.addDisposer(() => {
+					off();
+					if (this.#aux.get(ref) === off) this.#aux.delete(ref);
+				});
+			}),
+			bus.on(TASK_SUBAGENT_EVENT_CHANNEL, data => {
+				const frame = data as SubagentEventPayload;
+				const event = frame.event;
+				if (event?.type !== "message_end" || event.message.role !== "assistant" || !event.message.usage) return;
+				if (this.#requests.has(event.message)) return;
+				const ref = this.#sources.get(event.message) ?? this.#registry.get(frame.id) ?? this.#retiring.get(frame.id);
+				if (!ref || ref.id !== frame.id || event.message.timestamp < ref.createdAt) return;
+				const owner = this.#own(ref);
+				if (!owner) return;
+				this.#requests.add(event.message);
+				reportBill(owner.bill, this.log, event.message);
+			}),
+		];
+	}
+
+	#fenceColdRevival(ref: AgentRef): void {
+		const owner = this.#paths.get(ref);
+		if (!owner || owner === this.#main) return;
+		const session = ref.session;
+		const home = this.#scoutHomes.get(ref);
+		if (!session && (ref.status === "aborted" || (ref.status === "parked" && home === undefined))) {
+			// An aborted ref or a scout parked before its home was observed has
+			// no known warm reviver. Native cold revival would use Main's gate.
+			if (home !== undefined) this.#retiring.set(ref.id, ref);
+			this.#registry.unregister(ref.id, ref);
+		} else if (ref.status === "running" && session && owner.costGate) {
+			// Warm revival retains the worker's gate and the original home.
+			// After a thread loss the host can cold-revive the same parked ref;
+			// SDK publishes this attachment before ensureLive returns a handle.
+			const wrongGate = session instanceof AgentSession && session.costGate !== owner.costGate;
+			const wrongHome = isRemoteScoutSession(session) && home !== undefined && session.home !== home;
+			if (wrongGate || wrongHome) this.#registry.unregister(ref.id, ref);
+		}
+	}
+
+	#own(ref: AgentRef): Owner | undefined {
+		const prior = this.#paths.get(ref);
+		if (prior || !ref.parentId) return prior;
+		let id: string | undefined = ref.parentId;
+		let parent: AgentRef | undefined;
+		const visited = new Set([ref.id]);
+		while (id !== undefined && !visited.has(id)) {
+			visited.add(id);
+			parent = this.#registry.get(id);
+			const root = this.#roots.get(id);
+			// The worker reserves its id until disposal/reaping completes. A
+			// late child can register after we unpublish that exact root.
+			const owner = root && (!parent || parent === root.ref) ? root : parent && this.#paths.get(parent);
+			if (owner) {
+				this.#paths.set(ref, owner);
+				if (owner !== this.#main) owner.children.add(ref);
+				return owner;
+			}
+			id = parent?.parentId;
+		}
+		return undefined;
+	}
+
+	coordinator(sid: string, bill: BillSink): void {
+		const ref = this.#registry.get(MAIN_AGENT_ID);
+		if (!(ref?.session instanceof AgentSession) || ref.session.sessionManager.getSessionId() !== sid) {
+			this.log("omp-agy-swarm: Main usage observer could not bind to the coordinator's native session");
+			return;
+		}
+		this.#mainSid = sid;
+		this.#main = { ref, bill, children: new Set() };
+		const manager = ref.session.sessionManager;
+		this.#off.push(observeAuxiliaryUsage(manager, usage => {
+			if (manager.getSessionId() === sid) bill(usage);
+		}, this.log));
+	}
+
+	worker(ref: AgentRef, raw: AgentSession, bill: BillSink): Owner {
+		const owner: Owner = { ref, bill, children: new Set(), costGate: raw.costGate };
+		this.#roots.set(ref.id, owner);
+		const offUsage = observeAuxiliaryUsage(raw.sessionManager, bill, this.log);
+		const offDirect = raw.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "assistant") reportBill(bill, this.log, event.message);
+		});
+		this.#aux.set(ref, () => { offUsage(); offDirect(); });
+		return owner;
+	}
+
+	async release(owner: Owner, lifecycle: AgentLifecycleApi, jobs: AsyncJobManager | undefined, tombstone: boolean): Promise<void> {
+		const deadlineAt = Date.now() + TIMING.killStopMs;
+		try {
+			let failed: PromiseRejectedResult | undefined;
+			while (owner.children.size) {
+				const children = [...owner.children];
+				owner.children.clear();
+				const stopped = await Promise.allSettled(children.map(async child => {
+					if (this.#registry.get(child.id) !== child) return;
+					const session = child.session;
+					try {
+						jobs?.cancelAll({ ownerId: child.id });
+						await lifecycle.release(child.id, child, { tombstone });
+						if (session instanceof AgentSession) {
+							await session.waitForIdle();
+							if (!session.isDisposed) throw new Error(`Scout "${child.id}" did not dispose.`);
+						}
+						const current = this.#registry.get(child.id);
+						if (jobs && (!current || current === child)) {
+							const { completion } = await jobs.cancelAndReapOwnerJobs(child.id, deadlineAt);
+							await completion;
+						}
+					} finally {
+						this.#registry.unregister(child.id, child);
+					}
+				}));
+				failed ??= stopped.find(r => r.status === "rejected");
+			}
+			if (failed) throw failed.reason;
+		} finally {
+			if (this.#roots.get(owner.ref.id) === owner) this.#roots.delete(owner.ref.id);
+			this.#aux.get(owner.ref)?.();
+			this.#aux.delete(owner.ref);
+		}
+	}
+
+	close(): void {
+		for (const off of this.#off) off();
+		for (const off of this.#aux.values()) off();
+		this.#aux.clear();
+		this.#journalEntries.clear();
+		this.#retiring.clear();
+		this.#roots.clear();
+		this.#main = undefined;
+	}
+}
+
 /** Do not re-prompt Main from a terminal hook while the root is disposing or aborting. */
 export function mainCanResume(sid: string): boolean {
 	const main = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
@@ -199,6 +506,8 @@ class WorkerRegistration {
 	#hostDone: { promise: Promise<void>; resolve: () => void } | undefined;
 	#externalReleaseHook = false;
 	#releaseNotified = false;
+	#usageOwner: Owner | undefined;
+	#localKill = false;
 
 	constructor(registry: AgentRegistryApi, lifecycle: AgentLifecycleApi, options: CreateWorkerOptions, identity: WorkerIdentity, coordinatorId: string, jobs: AsyncJobManager | undefined) {
 		this.#registry = registry;
@@ -263,11 +572,13 @@ class WorkerRegistration {
 			throw new Error(`Agent "${this.id}" was stopped or replaced during session initialization.`);
 	}
 
-	attach(raw: AgentSession, events: WorkerBus): void {
+	attach(raw: AgentSession, events: WorkerBus, usage: ScoutUsage | undefined): void {
 		this.#raw = raw;
 		this.check();
 		const ref = this.#ref;
 		if (!ref) throw new Error(`Agent "${this.id}" did not register.`);
+		const bill = this.#options.onOwnedUsage;
+		if (bill) this.#usageOwner = usage?.worker(ref, raw, bill);
 		const bridge = this.#bridge = new HubBridge({
 			id: ref.id, name: this.#options.name, role: this.#options.role,
 			brief: this.#options.brief, sessionFile: raw.sessionFile, bus: events,
@@ -319,6 +630,7 @@ class WorkerRegistration {
 					const { completion } = await this.#jobs.cancelAndReapOwnerJobs(ref.id, Date.now() + TIMING.killStopMs);
 					await completion;
 				}
+				if (this.#usageOwner) await usage?.release(this.#usageOwner, this.#lifecycle, this.#jobs, this.#localKill || this.#owner === "hostKill");
 			}).then(done.resolve, done.reject);
 			return done.promise;
 		};
@@ -408,6 +720,7 @@ class WorkerRegistration {
 		if (this.#hostDone) return this.#hostDone.promise.then(() => this.#raw?.waitForIdle());
 		if (this.#hostClose) return this.#hostClose;
 		this.#owner = "local";
+		this.#localKill = kill;
 		const settled = Promise.withResolvers<void>();
 		this.#disposal = settled.promise;
 		this.#quiesce(kill);
@@ -446,6 +759,8 @@ class WorkerRegistration {
 /** Host registration is identical in TUI, RPC, print and JSON. */
 export function createSessionFactory(binding: CoordinatorBinding, events: WorkerBus, log: (line: string) => void): SessionFactory {
 	let manager: AsyncJobManager | undefined;
+	let usage: ScoutUsage | undefined;
+	const sid = binding.sessionId;
 	let factoryDisposal: Promise<void> | undefined;
 	let leasedSettings: Settings | undefined;
 	let releasePrintWake: (() => void) | undefined;
@@ -457,13 +772,16 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 			leasedSettings = settings;
 			releasePrintWake = settings ? leasePrintWake(settings, cfgAsyncPrintWake) : undefined;
 		},
+		observeCoordinatorUsage(onUsage) {
+			(usage ??= new ScoutUsage(events, log)).coordinator(sid, onUsage);
+		},
 		dispose(deadlineAt) {
 			if (!factoryDisposal) {
 				releasePrintWake?.();
 				releasePrintWake = undefined;
 				leasedSettings = undefined;
 				factoryDisposal = (manager?.dispose({ timeoutMs: Math.max(0, deadlineAt - Date.now()) }) ?? Promise.resolve())
-					.then(() => {});
+					.then(() => {}).finally(() => usage?.close());
 			}
 			return factoryDisposal;
 		},
@@ -479,6 +797,9 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 			const scoped = sameRealPath(o.cwd, base.getCwd()) ? base : await base.cloneForCwd(o.cwd);
 			const settings = createSubagentSettings(scoped, {
 				...subagentLspWritethroughSettings(scoped),
+				// Remote journals can arrive after another request in the same eval cell.
+				// Keep capped worker trees on the billing thread without changing concurrency.
+				...(jobs && o.checkSwarmSpend ? { "task.workerThreads": 0 } : {}),
 				...(jobs ? { "async.enabled": true } : {
 					"async.enabled": false,
 					"bash.autoBackground.enabled": false,
@@ -545,6 +866,20 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 				let sdkReturned = false;
 				try {
 					let checkedSlot = false;
+					const requestedScout = o.role === "worker" && o.toolNames.includes("task");
+					const override = requestedScout ? o.scoutOverride : undefined;
+					let scoutToolActive = requestedScout;
+					let sessionForWarning: AgentSession | undefined;
+					const costGate = o.checkSwarmSpend
+						? new SwarmWorkerCostGate(settings, sessionManager.getUsageStatistics().cost, o.checkSwarmSpend,
+							message => sessionForWarning?.emitNotice("warning", message, "cost-gate"))
+						: undefined;
+					if (override?.model) {
+						const native = cfgTaskAgentModelOverrides.get(scoped);
+						const scout = override.effort ? `${override.model}:${override.effort}` : override.model;
+						cfgTaskAgentModelOverrides.override(settings, { ...native, scout });
+					}
+					const effort = override?.model ? undefined : override?.effort;
 					const { session } = await createAgentSession({
 						cwd: o.cwd,
 						authStorage: binding.ctx.modelRegistry.authStorage,
@@ -552,6 +887,7 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						settings,
 						asyncJobManager: jobs,
 						sessionManager,
+						costGate,
 						model,
 						thinkingLevel: o.effort as ThinkingLevel | undefined,
 						restrictToolNames: true,
@@ -567,7 +903,24 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						hasUI: false,
 						// The eval agent/workpool bridges consult this policy even
 						// when the native task tool is absent.
-						spawns: "",
+						get spawns(): string {
+							return scoutToolActive && !o.checkSwarmSpend?.() ? "scout" : "";
+						},
+						preloadedPreparedExtensions: effort ? [{
+							path: WORKER_SCOUT_HOOK, resolvedPath: WORKER_SCOUT_HOOK, error: null,
+							factory: pi => pi.on("before_subagent_spawn", (event, ctx) => {
+								if (ctx.agent.id !== id || event.agent !== "scout" || !event.patterns.length) return;
+								// The core hook leaves modelRole intact. Using its live
+								// patterns preserves aliases and the current parent model.
+								let models: Model[] | undefined;
+								return { model: event.patterns.map(pattern => {
+									const split = splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
+									const literal = split.level && (models ??= ctx.models.list()).some(m => m.id === pattern || `${m.provider}/${m.id}` === pattern);
+									const base = literal ? pattern : split.base;
+									return `${base}:${effort}`;
+								}) };
+							}),
+						}] : undefined,
 						parentTaskPrefix: id,
 						agentId: id,
 						agentDisplayName: o.name,
@@ -589,7 +942,10 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						appendSystemPrompt: o.appendSystemPrompt,
 					});
 					sdkReturned = true;
-					registration.attach(session, events);
+					sessionForWarning = session;
+					scoutToolActive &&= session.getActiveToolNames().includes("task");
+					if (o.onOwnedUsage && !usage) usage = new ScoutUsage(events, log);
+					registration.attach(session, events, usage);
 					await initializeExtensions(session, {
 						mode: "print",
 						reportSendError: (_action, err) => log(`omp-agy-swarm: ${o.name}: send failed: ${err.message}`),

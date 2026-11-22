@@ -15,6 +15,8 @@ export interface Reply {
 	tools?: ToolCallSpec[];
 	status?: number;
 	delay?: number;
+	/** Optional test latch, held after the initial SSE frame. */
+	wait?: Promise<void>;
 	/** Thinking text streamed as reasoning_content. */
 	thinking?: string;
 }
@@ -164,6 +166,7 @@ export class MockLlm {
 		const stream = new ReadableStream({
 			async start(c) {
 				c.enqueue(enc.encode(chunk({ role: "assistant", content: "" })));
+				if (reply.wait) await reply.wait;
 				if (reply.delay) await Bun.sleep(reply.delay);
 				if (reply.thinking) c.enqueue(enc.encode(chunk({ reasoning_content: reply.thinking })));
 				if (reply.text) c.enqueue(enc.encode(chunk({ content: reply.text })));

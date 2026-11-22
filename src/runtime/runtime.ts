@@ -13,6 +13,7 @@ import type {
 	FinishMeta,
 	Role,
 	RosterFile,
+	ScoutOverride,
 	StoredSet,
 	WorkspaceMode,
 	WorkspaceRecord,
@@ -30,6 +31,8 @@ import {
 	modelKey,
 	type ModelInfo,
 	type PendingSwitch,
+	type RequestUsage,
+	type SpendRefusal,
 	type SessionFactory,
 	type ThinkingCaps,
 	type WorkerSession,
@@ -109,6 +112,10 @@ const MEMBER_TOOLS_BY_ROLE: Record<Role, readonly string[]> = {
 
 class OpCancelled extends Error {}
 
+function tokenCount(n: number | undefined): number {
+	return n !== undefined && Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 export class SwarmRuntime {
 	readonly sid: string;
 	readonly dir: string;
@@ -124,6 +131,7 @@ export class SwarmRuntime {
 	/** Ready URL from the UI's live board, if one is running. */
 	webBoardLink?: () => string | undefined;
 	title = "";
+	scoutOverride: ScoutOverride | undefined;
 	createdAt = new Date().toISOString();
 	version = 0;
 	/** Bumped when the coordinator's conversation is cleared; part of its transcript cursor epoch. */
@@ -153,6 +161,7 @@ export class SwarmRuntime {
 	#printWakeReleased = false;
 	#noticeSeq = 0;
 	#spendNotified = false;
+	#lateUsage = false;
 	/** Why the spend is unknown under a ceiling (a priced-less message used tokens); fails closed. */
 	spendUnknown: string | undefined;
 	#rosterText = "";
@@ -191,6 +200,7 @@ export class SwarmRuntime {
 		}
 		rt.#printWakeReleased = binding.headless && completionCurrent(rt);
 		rt.factory.setPrintWake(binding.headless && !rt.#printWakeReleased);
+		rt.factory.observeCoordinatorUsage?.(bill => rt.#recordMeasuredUsage(rt.coordinator, bill.usage, bill.provider, bill.model));
 		return rt;
 	}
 
@@ -209,6 +219,8 @@ export class SwarmRuntime {
 			return;
 		}
 		this.title = roster.title;
+		this.scoutOverride = roster.scout;
+		this.spendUnknown = roster.spend_unknown;
 		this.createdAt = roster.created_at;
 		for (const [name, rec] of Object.entries(roster.members)) {
 			if (!rec || typeof rec !== "object") continue;
@@ -216,6 +228,9 @@ export class SwarmRuntime {
 				this.coordinator.lastReadSeq = Number(rec.last_read_seq) || 0;
 				this.coordinator.lastNudgedSeq = Number(rec.last_nudged_seq) || 0;
 				this.coordinator.wakeFloor = Number(rec.wake_floor) || 0;
+				this.coordinator.stats.steps = Number(rec.stats?.steps) || 0;
+				this.coordinator.stats.tokens = Number(rec.stats?.tokens) || 0;
+				this.coordinator.stats.cost = Number(rec.stats?.cost) || 0;
 				continue;
 			}
 			const m = memberFromRecord(name, rec);
@@ -343,6 +358,8 @@ export class SwarmRuntime {
 			created_at: this.createdAt,
 			board_head: this.board.head,
 			channels: [...this.board.channels()],
+			...(this.scoutOverride ? { scout: this.scoutOverride } : {}),
+			...(this.spendUnknown ? { spend_unknown: this.spendUnknown } : {}),
 			members,
 		};
 	}
@@ -363,9 +380,9 @@ export class SwarmRuntime {
 		}, TIMING.flushDebounceMs);
 	}
 
-	#writeRoster(structural: boolean): void {
+	#writeRoster(structural: boolean, snapshot?: RosterFile): void {
 		try {
-			const snap = this.rosterSnapshot();
+			const snap = snapshot ?? this.rosterSnapshot();
 			this.store.writeRoster(snap, structural);
 			this.#rosterText = JSON.stringify(snap, null, 1);
 		} catch (err) {
@@ -404,21 +421,40 @@ export class SwarmRuntime {
 		return this.spendUnknown !== undefined || this.totalSpend().cost >= this.env.maxCostUsd;
 	}
 
+	/** Main can still report; this limits worker requests and native subagent admission. */
+	spendRefusal(): SpendRefusal | undefined {
+		const cap = this.env.maxCostUsd;
+		if (cap <= 0) return;
+		const spent = this.totalSpend().cost;
+		if (!this.spendUnknown && spent < cap) return;
+		const why = this.spendUnknown ? `unknown spend (${this.spendUnknown})` : `measured spend $${spent.toFixed(6)}`;
+		return { spent, cap, message: `Swarm spend ceiling $${cap}: ${why}; no new worker model requests or subagents are admitted.` };
+	}
+
 	/**
 	 * Live spend accounting on every completed assistant message (SW-13). Under a ceiling, a
 	 * message that used tokens without a usable price makes the spend unknown, which fails closed
 	 * exactly like reaching the ceiling.
 	 */
 	recordUsage(m: Member, msg: HostMessage): void {
-		const u = msg.usage;
-		if (!u) return;
-		const tokens = Number(u.totalTokens) || (Number(u.input) || 0) + (Number(u.output) || 0);
-		const price = u.cost?.total;
+		if (msg.usage) this.#recordMeasuredUsage(m, msg.usage, msg.provider, msg.model);
+	}
+
+	#recordMeasuredUsage(m: Member, usage: RequestUsage, provider?: string, model?: string): void {
+		const tokens = tokenCount(usage.totalTokens)
+			|| tokenCount(usage.input) + tokenCount(usage.output) + tokenCount(usage.cacheRead) + tokenCount(usage.cacheWrite);
+		const price = usage.cost?.total;
 		const priced = typeof price === "number" && Number.isFinite(price) && price > 0;
+		if (!tokens && !priced) return;
 		m.stats.tokens += tokens;
 		if (priced) m.stats.cost += price;
 		if (this.env.maxCostUsd > 0 && tokens > 0 && !priced && this.spendUnknown === undefined)
-			this.spendUnknown = `${m.name}'s ${msg.provider ?? "?"}/${msg.model ?? "?"} reported ${tokens} tokens without a price`;
+			this.spendUnknown = `${m.name}'s ${provider ?? "?"}/${model ?? "?"} reported ${tokens} tokens without a price`;
+		if (this.closing) {
+			this.#lateUsage = true;
+			return;
+		}
+		this.scheduleFlush();
 		this.writeMetricsSoon();
 		if (this.spendExceeded() && !this.#spendNotified) {
 			this.#spendNotified = true;
@@ -830,6 +866,7 @@ export class SwarmRuntime {
 			}
 			m.workspace = ws;
 			const model = group.model;
+			const toolNames = this.toolNamesFor(m.role);
 			const contract = this.#appendPrompt(m, ws);
 			session = await this.factory.create({
 				name: m.name,
@@ -842,7 +879,11 @@ export class SwarmRuntime {
 				sessionsDir: join(this.dir, "sessions"),
 				model,
 				effort: group.effort,
-				toolNames: this.toolNamesFor(m.role),
+				// Scout settings are snapshotted for this generation, not hot-switched.
+				scoutOverride: this.scoutOverride,
+				checkSwarmSpend: this.env.maxCostUsd > 0 ? () => this.spendRefusal() : undefined,
+				onOwnedUsage: bill => this.#recordMeasuredUsage(m, bill.usage, bill.provider, bill.model),
+				toolNames,
 				customTools: this.deps.makeMemberTools(this, m, op.gen),
 				appendSystemPrompt: contract,
 				mode: group.fork ? { kind: "fork", sourceFile: group.fork.file } : { kind: "new" },
@@ -1136,6 +1177,7 @@ export class SwarmRuntime {
 		if (m.model && !model) return fail("model_unavailable", `${m.model} is not available; set another with swarm{action:"model", name:"${m.name}", model:"…"}`);
 		let session: WorkerSession;
 		try {
+			const toolNames = this.toolNamesFor(m.role);
 			session = await this.factory.create({
 				name: m.name,
 				role: m.role === "narrator" || m.role === "monitor" ? m.role : "worker",
@@ -1147,7 +1189,10 @@ export class SwarmRuntime {
 				sessionsDir: join(this.dir, "sessions"),
 				model,
 				effort: m.effort || undefined,
-				toolNames: this.toolNamesFor(m.role),
+				scoutOverride: this.scoutOverride,
+				checkSwarmSpend: this.env.maxCostUsd > 0 ? () => this.spendRefusal() : undefined,
+				onOwnedUsage: bill => this.#recordMeasuredUsage(m, bill.usage, bill.provider, bill.model),
+				toolNames,
 				customTools: this.deps.makeMemberTools(this, m, op.gen),
 				appendSystemPrompt: this.#appendPrompt(m, m.workspace),
 				mode: { kind: "revive", file, conversationId: m.conversationId },
@@ -1176,7 +1221,7 @@ export class SwarmRuntime {
 		m.redeliveryAttempts = 0;
 		m.notBefore = 0;
 		if (m.role === "worker") {
-			m.reminders.resume = "You are live again. Background jobs from the previous session are not resumed; check their outputs before restarting work. For standby, call untimed swarm_wait{}.";
+			m.reminders.resume = "You are live again. Background jobs from the previous session are not resumed (including native scouts); check their outputs before restarting work. For standby, call untimed swarm_wait{}.";
 		} else if (m.briefPresented) {
 			m.reminders.resume = "You are live again. Unless the posts below need action, call swarm_wait again.";
 		}
@@ -1329,6 +1374,12 @@ export class SwarmRuntime {
 
 	setTitle(title: string): void {
 		this.title = title;
+		this.flushStructural();
+		this.changed();
+	}
+
+	setScoutOverride(override: ScoutOverride | undefined): void {
+		this.scoutOverride = override;
 		this.flushStructural();
 		this.changed();
 	}
@@ -1519,7 +1570,8 @@ export class SwarmRuntime {
 		clearInterval(this.#keepAlive);
 		this.#keepAlive = undefined;
 		// Checkpoint first, so parks and states are recorded as they were (last_park on reload).
-		this.#writeRoster(true);
+		const roster = this.rosterSnapshot();
+		this.#writeRoster(true, roster);
 		this.writeMetrics();
 		const disposals: Promise<void>[] = [];
 		for (const m of this.members.values()) {
@@ -1542,10 +1594,27 @@ export class SwarmRuntime {
 			if (kept.length)
 				this.log(`omp-agy-swarm: worktrees kept in ${this.dir}/workspaces (${kept.map(m => m.name).join(", ")}); git worktree remove <path> cleans them up`);
 		}
-		this.store.close();
 		this.#listeners.clear();
-		await raceTimeout(Promise.allSettled(disposals), Math.max(0, deadlineAt - Date.now()), undefined, { unref: true });
-		await this.factory.dispose(deadlineAt);
+		try {
+			await raceTimeout(Promise.allSettled(disposals), Math.max(0, deadlineAt - Date.now()), undefined, { unref: true });
+			await this.factory.dispose(deadlineAt);
+		} finally {
+			if (this.#lateUsage) {
+				// Drain can finish a real request. Update only totals in the
+				// pre-fence checkpoint, not the intentionally claimed waits/cursors.
+				for (const [name, m] of this.members) {
+					const saved = roster.members[name]?.stats;
+					if (saved) {
+						saved.tokens = m.stats.tokens;
+						saved.cost = m.stats.cost;
+					}
+				}
+				roster.spend_unknown = this.spendUnknown;
+				this.#writeRoster(true, roster);
+				this.writeMetrics();
+			}
+			this.store.close();
+		}
 	}
 }
 

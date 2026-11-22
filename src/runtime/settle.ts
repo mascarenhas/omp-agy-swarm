@@ -61,7 +61,6 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 			if (!msg) return;
 			if (msg.role === "assistant") {
 				m.tracker.onAssistant(msg);
-				rt.recordUsage(m, msg);
 				rt.changedActivity();
 				return;
 			}

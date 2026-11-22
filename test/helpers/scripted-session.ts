@@ -97,6 +97,8 @@ export class ScriptedSession implements WorkerSession {
 	}
 
 	emit(e: WorkerEvent): void {
+		if (!this.disposed && e.type === "message_end" && "message" in e && e.message.role === "assistant" && e.message.usage)
+			this.opts.onOwnedUsage?.({ usage: e.message.usage, model: e.message.model, provider: e.message.provider });
 		for (const l of [...this.#listeners]) l(e);
 	}
 

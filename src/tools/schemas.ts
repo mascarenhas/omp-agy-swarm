@@ -12,7 +12,7 @@ const OMIT_UNUSED = " Omit unused optional arguments; use null if your tool-call
 
 export const DESCRIPTIONS = {
 	swarm:
-		"Manage the swarm: parallel worker agents, each in its own conversation, sharing one message board. Actions: status | models | add | model | kill | revive | finish | title | channel. add{name, brief, model?, effort?, tasks?|n?, fork?, workspace?, channels?, role?} starts a worker and posts its brief as `@name brief`; without model/effort it runs on yours. model{name?, model?, effort?} changes a waiting member's (or your own) model or effort; it keeps its conversation. kill{name} is permanent. workspace: inherit = your working copy; share = its own git worktree starting from your working copy as it stands (uncommitted changes included, ignored files not); branch = its own worktree from your last commit. models{query?, provider?} lists runnable models with their effort levels. Coordinators: read skill://swarm before the first add." +
+		"Manage the swarm: parallel worker agents sharing one message board. Actions: status | models | add | model | scout | kill | revive | finish | title | channel. add{name, brief, model?, effort?, tasks?|n?, fork?, workspace?, channels?, role?} starts a worker and posts its brief as `@name brief`; without model/effort it runs on yours. model{name?, model?, effort?} changes a waiting member's (or your own) model or effort; it keeps its conversation. scout{model?, effort?} configures scouts for newly added or revived workers. Effort alone retains native model selection; neither argument resets to native policy. kill{name} is permanent. workspace: inherit = your working copy; share = its own git worktree starting from your working copy as it stands (uncommitted changes included, ignored files not); branch = its own worktree from your last commit. models{query?, provider?} lists runnable models with their effort levels. Coordinators: read skill://swarm before the first add." +
 		' Omit unused parameters; use "" for unused enum fields, [] for arrays, or null for other optional fields.',
 	post_message:
 		"Post to the swarm's message board. Start with the @name of whoever must act on it (@all for everyone, @#channel for a channel's members); a mention wakes that member. Refer to earlier posts as #seq." +
@@ -50,12 +50,12 @@ export function buildSchemas(z: Zod): Schemas {
 	return {
 		swarm: z.object({
 			action: z
-				.enum(["status", "models", "add", "model", "kill", "revive", "finish", "title", "channel"])
+				.enum(["status", "models", "add", "model", "scout", "kill", "revive", "finish", "title", "channel"])
 				.describe("What to do"),
 			name: text.describe("add: worker name or group prefix; model/kill/revive: member or group prefix; channel (un)subscribe: member"),
 			brief: text.describe("add: what the worker owns (≤ 6000 characters); optional for role narrator|monitor"),
-			model: text.describe('add, model: "provider/id" | bare id | "@role", optional ":effort" suffix'),
-			effort: choice(EFFORTS).describe('add, model: "" uses the model suffix or inherited/current effort; "off" explicitly disables reasoning'),
+			model: text.describe('add, model, scout: "provider/id" | bare id | "@role", optional ":effort" suffix'),
+			effort: choice(EFFORTS).describe('"" uses the model suffix or, for add/model, inherited/current effort; "off" explicitly disables reasoning'),
 			tasks: array.describe("add: 1..16 slices, each ≤ 1500 characters → <name>-1..<name>-k; [] omits"),
 			n: count(integer).describe("add: 2..16 homogeneous copies (not with tasks); 0 or null omits"),
 			fork: text.describe('add: member name or "coordinator" whose conversation the worker starts from'),

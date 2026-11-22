@@ -134,6 +134,12 @@ export interface MemberRecord {
 	killed_seq?: number;
 }
 
+/** Absent fields keep the native scout model selection or effort. */
+export interface ScoutOverride {
+	model?: string;
+	effort?: string;
+}
+
 export interface RosterFile {
 	version: 1;
 	id: string;
@@ -141,6 +147,8 @@ export interface RosterFile {
 	created_at: string;
 	board_head: number;
 	channels: ChannelRecord[];
+	scout?: ScoutOverride;
+	spend_unknown?: string;
 	members: Record<string, MemberRecord>;
 }
 

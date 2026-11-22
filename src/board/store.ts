@@ -24,7 +24,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LIMITS } from "../env.ts";
+import { isEffort, LIMITS } from "../env.ts";
 import { acquireLease, type Lease, LeaseError } from "./lock.ts";
 import type { BoardRecord, RosterFile } from "./types.ts";
 
@@ -107,6 +107,8 @@ function parseRoster(text: string): RosterFile {
 	const v = JSON.parse(text) as Partial<RosterFile>;
 	if (!v || typeof v !== "object" || v.version !== 1 || typeof v.id !== "string" || !v.members || typeof v.members !== "object")
 		throw new CorruptBoardError("members.json is not a version 1 roster");
+	const model = typeof v.scout?.model === "string" ? v.scout.model.trim() : "";
+	const effort = typeof v.scout?.effort === "string" && isEffort(v.scout.effort) ? v.scout.effort : undefined;
 	return {
 		version: 1,
 		id: v.id,
@@ -114,6 +116,8 @@ function parseRoster(text: string): RosterFile {
 		created_at: typeof v.created_at === "string" ? v.created_at : new Date().toISOString(),
 		board_head: Number(v.board_head) || 0,
 		channels: Array.isArray(v.channels) ? v.channels : [],
+		...(model || effort ? { scout: { model: model || undefined, effort } } : {}),
+		...(typeof v.spend_unknown === "string" && v.spend_unknown ? { spend_unknown: v.spend_unknown } : {}),
 		members: v.members,
 	};
 }

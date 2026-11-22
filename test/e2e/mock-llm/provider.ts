@@ -26,6 +26,9 @@ export default function mockProvider(pi: ExtensionAPI): void {
 			m("worker-limited", ["low", "high"]),
 			m("plain", null),
 			m("always-429", ["low"]),
+			...(process.env.SWARM_SCOUT_HIGH_COST === "1"
+				? [{ ...m("expensive", null), cost: { input: 1_000_000, output: 1_000_000, cacheRead: 0, cacheWrite: 0 } }]
+				: []),
 		],
 	} as unknown as Parameters<ExtensionAPI["registerProvider"]>[1]);
 }

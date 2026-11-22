@@ -2,6 +2,8 @@
 // omp-adapter.ts (worker sessions, thinking caps) and coordinator.ts (the main binding); the
 // integration tests supply scripted ones.
 
+import type { ScoutOverride } from "../board/types.ts";
+
 /** A host model, identified by `provider/id`. The runtime never relies on object identity. */
 export interface ModelInfo {
 	provider: string;
@@ -44,8 +46,30 @@ export interface HostMessage {
 	isError?: boolean;
 	provider?: string;
 	model?: string;
-	usage?: { totalTokens?: number; input?: number; output?: number; cost?: { total?: number } };
+	usage?: RequestUsage;
 	timestamp?: number;
+}
+
+/** Direct bill for one model request (not the total inherited from a tool result). */
+export interface RequestUsage {
+	totalTokens?: number;
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	cost?: { total?: number };
+}
+
+export interface RequestBill {
+	readonly provider?: string;
+	readonly model?: string;
+	readonly usage: RequestUsage;
+}
+
+export interface SpendRefusal {
+	readonly spent: number;
+	readonly cap: number;
+	readonly message: string;
 }
 
 /** Worker session events the runtime consumes (a subset of the host's AgentSessionEvent). */
@@ -169,6 +193,11 @@ export interface CreateWorkerOptions {
 	sessionsDir: string;
 	model: ModelInfo | undefined;
 	effort: string | undefined;
+	scoutOverride?: ScoutOverride;
+	/** A shared, live limit, checked at native spawn and provider dispatch. */
+	checkSwarmSpend?: () => SpendRefusal | undefined;
+	/** Applies to this owned generation even while its turn or owner is being torn down. */
+	onOwnedUsage?(bill: RequestBill): void;
 	toolNames: string[];
 	customTools: unknown[];
 	appendSystemPrompt: string;
@@ -179,6 +208,7 @@ export interface CreateWorkerOptions {
 export interface SessionFactory {
 	create(options: CreateWorkerOptions): Promise<WorkerSession>;
 	setPrintWake(active: boolean): void;
+	observeCoordinatorUsage?(onUsage: (bill: RequestBill) => void): void;
 	dispose(deadlineAt: number): Promise<void>;
 }
 

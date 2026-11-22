@@ -40,6 +40,8 @@ const cases: [string, Tool, Record<string, unknown>, Record<string, unknown>][] 
 	["status", "swarm", { ...swarmEmpty, action: "status" }, { action: "status" }],
 	["models", "swarm", { ...swarmEmpty, action: "models" }, { action: "models" }],
 	["model", "swarm", { ...swarmEmpty, action: "model", effort: " \t", model: "mock/coord" }, { action: "model", model: "mock/coord" }],
+	["scout set", "swarm", { ...swarmEmpty, action: "scout", effort: " \t", model: "mock/worker-b:low" }, { action: "scout", model: "mock/worker-b:low" }],
+	["scout reset", "swarm", { ...swarmEmpty, action: "scout" }, { action: "scout" }],
 	["kill", "swarm", { ...swarmEmpty, action: "kill", name: "probe" }, { action: "kill", name: "probe" }],
 	["revive", "swarm", { ...swarmEmpty, action: "revive" }, { action: "revive" }],
 	["channel", "swarm", { ...swarmEmpty, action: "channel", op: "create", channel: "build" }, { action: "channel", op: "create", channel: "build" }],
@@ -110,7 +112,7 @@ test("Codex advertises the empty enum choice first and strict mode adds null", (
 });
 
 const enums = {
-	action: ["status", "models", "add", "model", "kill", "revive", "finish", "title", "channel"],
+	action: ["status", "models", "add", "model", "scout", "kill", "revive", "finish", "title", "channel"],
 	effort: ["", ...EFFORTS],
 	workspace: ["", "inherit", "share", "branch"],
 	role: ["", "worker", "narrator", "monitor"],
@@ -169,6 +171,7 @@ test("main and member schemas survive Claude CCA, Cursor and Antigravity CLI con
 			for (const [name, payload] of [
 				["swarm", paddedAdd],
 				["swarm", legacyAdd],
+				["swarm", { ...paddedAdd, action: "scout", model: "mock/worker-b:low" }],
 				["swarm", { action: "add", name: null, brief: null, model: null, n: null, fork: null, discard_ignored: null, keep_workspace: null, summary: null, abandon: null, title: null, channel: null, topic: null, query: null, provider: null, limit: null }],
 				["post_message", { text: "padding probe", channel: "" }],
 				["post_message", { text: "padding probe", channel: null }],

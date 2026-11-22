@@ -201,6 +201,8 @@ export async function swarmOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResu
 			return addOp(ctx, p);
 		case "model":
 			return modelOp(ctx, p);
+		case "scout":
+			return scoutOp(ctx, p);
 		case "kill":
 			return killOp(ctx, p);
 		case "revive":
@@ -220,7 +222,7 @@ export async function swarmOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResu
 		case "channel":
 			return channelOp(ctx, p);
 		default:
-			return fail(`unknown action ${JSON.stringify(p.action)}`, "status | models | add | model | kill | revive | finish | title | channel");
+			return fail(`unknown action ${JSON.stringify(p.action)}`, "status | models | add | model | scout | kill | revive | finish | title | channel");
 	}
 }
 
@@ -239,6 +241,7 @@ function statusOp(ctx: OpsContext): ToolResult {
 		completion: completionLabel(rt),
 		outcome: rt.outcome ? rt.outcome.value : null,
 		spend: rt.spendView(),
+		scout: rt.scoutOverride ?? null,
 		members: [...rt.members.values()].filter(m => m.role !== "coordinator").map(m => rt.memberStatus(m)),
 		attention: rt.attention(),
 		reminder: reminders.length ? reminders.join(" ") : undefined,
@@ -315,6 +318,27 @@ function resolveModelAndEffort(
 	const e = resolveEffort(ctx.caps, model, requested);
 	if (e.note) notes.push(e.note);
 	return { model, effort: e.effort, notes };
+}
+
+function scoutOp(ctx: OpsContext, p: SwarmParams): ToolResult {
+	if (ctx.caller) {
+		const denied = permitted("scout", ctx.caller);
+		if (denied) return fail(denied);
+	}
+	const spec = p.model?.trim() || undefined;
+	const effort = p.effort || undefined;
+	const resolved = resolveModelAndEffort(ctx, spec, effort, undefined, undefined);
+	if ("error" in resolved) return fail(resolved.error);
+	const override = spec || effort ? { model: modelKey(resolved.model) || undefined, effort: resolved.effort } : undefined;
+	// Bare action resets without creating an otherwise absent swarm.
+	const rt = ctx.rt ?? (override ? ctx.ensure() : null);
+	if (rt && "error" in rt) return fail(rt.error);
+	rt?.setScoutOverride(override);
+	return ok({
+		scout: override ?? null,
+		scope: "newly added or revived workers",
+		notes: resolved.notes.length ? resolved.notes : undefined,
+	});
 }
 
 async function addOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResult> {

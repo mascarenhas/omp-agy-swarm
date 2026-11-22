@@ -61,15 +61,16 @@ describe("dependency rules (§2)", () => {
 		}
 	});
 
-	test("host values stay in adapter; TUI values stay in UI or the exact observer bridge", () => {
+	test("host values and native selector parsing stay in the adapter; TUI rendering stays in UI or the observer bridge", () => {
 		for (const f of all) {
 			for (const i of imports(f)) {
 				if (i.typeOnly) continue;
-				if (i.spec.startsWith("@oh-my-pi/pi-coding-agent") || i.spec.startsWith("@oh-my-pi/pi-catalog"))
+				if (i.spec.startsWith("@oh-my-pi/pi-coding-agent") || i.spec.startsWith("@oh-my-pi/pi-catalog")
+					|| i.spec === "@oh-my-pi/pi-tui/overlays/model-selector")
 					expect(rel(f)).toBe("runtime/omp-adapter.ts");
 				if (i.spec === "@oh-my-pi/pi-tui/overlays/session-observer-registry") {
 					expect(rel(f)).toBe("runtime/hub-bridge.ts");
-				} else if (i.spec.startsWith("@oh-my-pi/pi-tui")) {
+				} else if (i.spec.startsWith("@oh-my-pi/pi-tui") && i.spec !== "@oh-my-pi/pi-tui/overlays/model-selector") {
 					expect(rel(f).startsWith("ui/tui/") || rel(f) === "ui/sanitize.ts").toBe(true);
 				}
 			}

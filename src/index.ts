@@ -89,6 +89,14 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 		if (refusal) b.notify(`omp-agy-swarm: ${refusal}`, "warning");
 	});
 
+	if (env.maxCostUsd > 0) pi.on("before_subagent_spawn", (_event, ctx) => {
+		const refusal = current(ctx)?.spendRefusal();
+		if (refusal) return {
+			block: true,
+			reason: `${refusal.message} To resume native delegation, restart without OMP_SWARM_MAX_COST_USD or switch to a session without this swarm.`,
+		};
+	});
+
 	pi.on("agent_start", (_e, ctx) => {
 		const rt = current(ctx);
 		if (!rt) return;

@@ -10,7 +10,7 @@ import type { Rule, Script } from "../mock-llm/server.ts";
 import { REPO, type Scenario, tool } from "../scenario.ts";
 
 const SWARM_TOOLS = ["swarm", "post_message", "read_board", "swarm_wait"];
-const NEVER = ["task", "wait", "manage_skill", "new_context"];
+const NEVER = ["wait", "manage_skill", "new_context"];
 
 const all = (...markers: string[]) => `^${markers.map(m => `(?=.*${m})`).join("")}`;
 const finish = (summary: string): Rule["reply"] => ({ tools: [tool("swarm", { action: "finish", summary })] });
@@ -128,7 +128,11 @@ const D1: Scenario = {
 				model,
 				{
 					rules: [
-						{ when: `You are \`${name}\``, reply: { tools: [tool("bash", { command: `printf ${name} > ${name}.txt && echo WROTE-${name}` })] } },
+						{ when: `You are \`${name}\``, reply: { tools: [tool("task", {
+							context: "Check native scaffold permissions.",
+							tasks: [{ name: "denied", agent: "task", task: "D1-UNAUTHORIZED-CHILD", solutionSpace: "No execution." }],
+						})] } },
+						{ when: "Cannot spawn 'task'. Allowed: scout", reply: { tools: [tool("bash", { command: `printf ${name} > ${name}.txt && echo WROTE-${name}` })] } },
 						{ when: `^tool: .*WROTE-${name}`, reply: { tools: [tool("post_message", { text: `@coordinator [done] DONE-${name} wrote ${name}.txt` })] } },
 						{ when: '^tool: \\{"seq":', reply: { tools: [tool("swarm_wait", {})] } },
 					],
@@ -153,8 +157,9 @@ const D1: Scenario = {
 		for (const model of ["worker-a", "worker-b", "plain"]) {
 			const tools = requests(c, model)[0]?.tools ?? [];
 			for (const t of SWARM_TOOLS) k.ok(tools.includes(t), `${model} worker has ${t}`);
-			for (const t of ["read", "bash", "edit", "write"]) k.ok(tools.includes(t), `${model} worker has ${t}`);
+			for (const t of ["read", "bash", "edit", "write", "task"]) k.ok(tools.includes(t), `${model} worker has ${t}`);
 			for (const t of NEVER) k.ok(!tools.includes(t), `${model} worker lacks ${t}`);
+			k.ok(requests(c, model).some(q => q.last.includes("Cannot spawn 'task'. Allowed: scout")), `${model} worker cannot spawn a native task agent`);
 		}
 	},
 };

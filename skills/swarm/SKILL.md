@@ -18,7 +18,7 @@ Your hands are four tools:
 
 | Tool | What it is for |
 |---|---|
-| `swarm` | `status`, `models`, `add`, `model`, `kill`, `revive`, `finish`, `title`, `channel` — the swarm itself |
+| `swarm` | `status`, `models`, `add`, `model`, `scout`, `kill`, `revive`, `finish`, `title`, `channel` — the swarm itself |
 | `post_message` | say something on the board; this is how you assign work |
 | `read_board` | read posts after your cursor (or `since`); `status: true` for member states and cursors |
 | `swarm_wait` | sleep until something is posted for you or a timeout passes; costs nothing while asleep |
@@ -125,8 +125,8 @@ read_board{}                   # read unread posts (or pass since / channel)
 ```
 
 `swarm{action:"status"}` reports `mode`, `head`, `swarm_dir`, `open_board`,
-`completion`, `outcome`, `attention`, and each member's `agent_id` (also
-returned by `add`), `state`, `detail`, `model`, `effort`, `channels`,
+`completion`, `outcome`, `scout`, `attention`, and each member's `agent_id`
+(also returned by `add`), `state`, `detail`, `model`, `effort`, `channels`,
 `workspace`, `last_read_seq`, `unread`, `owed` (posts addressed to it that it
 has not read), `error`, and spend. Each worker is in one of four states:
 
@@ -303,6 +303,33 @@ assign it work, or kill it unless the user asks.
     be `waiting` or `stopped` (not `working`). Switching a failed member
     clears its failure and resumes it where it left off; switching a `stopped`
     member takes effect when it is revived.
+- **Scouts.** Ordinary workers may run native `task` restricted to
+  `agent:"scout"` (also enforced for eval `agent()`/`workpool()`): bundled
+  native `task` scouts run in the background by default as the worker's own
+  jobs and wake the worker with results (a custom shadow `scout` profile can
+  declare `blocking: true`); scouts are not board members. Bundled `scout`
+  defaults to `@smol` at `medium` (native precedence `project` > `user` >
+  `extension` > `bundled`; operator `task.agentModelOverrides.scout` applies).
+  - Use `swarm{action:"scout", model?, effort?}` (coordinator-only) when the
+    user asks to override scout model/effort: each call replaces the override,
+    `effort` alone keeps native model selection, and omitting both resets it.
+    Changes persist in `members.json` and apply only to newly added or revived
+    workers (running workers stay unchanged; your own native scouts keep Main's
+    native settings; per-call effort can still take precedence).
+  - Scout usage (by exact registry ancestry) and journaled eval
+    `completion()`/`judge()` calls count once toward `OMP_SWARM_MAX_COST_USD`
+    (unpriced token-bearing requests fail closed and persist across reopen; at
+    the ceiling, worker chat and other gated inference plus native spawn
+    admission are blocked, while omp's automatic compaction summaries, in-flight
+    requests, and your reporting turns can still add cost). Under a ceiling,
+    worker-owned scouts run on the main thread (`task.workerThreads=0`) so each
+    request checks a current ledger (otherwise omp's thread defaults apply);
+    Main keeps the operator's thread settings, so an already-running Main scout
+    on a worker thread can issue another auxiliary request before its prior bill
+    reaches the ledger. Your own native delegation (`task` / eval `agent()`)
+    stays blocked while the capped swarm is registered, including after `finish`
+    and reopen (resuming delegation requires restarting without
+    `OMP_SWARM_MAX_COST_USD` or switching to a session without that swarm).
 - **Stay lean.** Add a worker when work is queued and nobody is free; kill one
   when there is nothing left for it to pick up (never the narrator or monitor
   unless the user asks).

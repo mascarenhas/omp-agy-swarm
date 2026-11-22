@@ -284,8 +284,8 @@ export class Member {
 			r.last_park = this.lastPark;
 			r.killed_at = this.killedAt;
 			r.failure = this.failure;
-			r.stats = { steps: this.stats.steps, tokens: this.stats.tokens, cost: this.stats.cost };
 		}
+		r.stats = { steps: this.stats.steps, tokens: this.stats.tokens, cost: this.stats.cost };
 		if (this.wakeFloor > 0) r.wake_floor = this.wakeFloor;
 		if (this.addedSeq > 0) r.added_seq = this.addedSeq;
 		if (this.killedSeq !== undefined) r.killed_seq = this.killedSeq;
