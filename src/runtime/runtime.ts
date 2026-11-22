@@ -119,6 +119,8 @@ export class SwarmRuntime {
 	readonly deps: RuntimeDeps;
 	readonly factory: SessionFactory;
 	binding: CoordinatorPort;
+	/** Ready URL from the UI's live board, if one is running. */
+	webBoardLink?: () => string | undefined;
 	title = "";
 	createdAt = new Date().toISOString();
 	version = 0;

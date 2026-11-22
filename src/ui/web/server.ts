@@ -1,12 +1,9 @@
-// The opt-in web board (§10.4): loopback only, constructed only by /swarm-ui start (or the first
-// add in a tui/rpc session with OMP_SWARM_UI=1). No cookies: a one-time #token= fragment is
-// exchanged for an in-memory per-tab bearer sent as an Authorization header. No credential ever
-// appears in a URL, a tool result, the board, metrics, a file or stderr.
+// The opt-in, read-only web board: loopback listener, with Host and Origin checks for
+// direct access, SSH port forwarding, and a Tailscale Serve HTTPS reverse proxy.
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { LIMITS, TIMING } from "../../env.ts";
+import { LIMITS } from "../../env.ts";
 import type { SwarmReadModel } from "../model.ts";
 import { canonicalRoots, safeRead } from "../view-files.ts";
 import { SnapshotBuilder } from "./snapshot.ts";
@@ -30,14 +27,35 @@ const HTML_CSP =
 
 const REFUSED = "request refused";
 
-function token(): string {
-	return randomBytes(32).toString("base64url");
+// DNS labels only, with an optional valid TCP port. Bound the full DNS name as well.
+const MAGIC_DNS = /^((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+ts\.net)(?::([1-9][0-9]{0,4}))?$/i;
+
+type Scheme = "http" | "https";
+const DEFAULT_PORT = { http: 80, https: 443 } as const;
+
+export function isLoopbackAuthority(authority: string, port: number, scheme: Scheme): boolean {
+	const host = authority.toLowerCase();
+	const suffix = `:${port}`;
+	const name = host.endsWith(suffix) ? host.slice(0, -suffix.length) : port === DEFAULT_PORT[scheme] ? host : "";
+	return name === "127.0.0.1" || name === "localhost" || name === "[::1]";
 }
 
-function sameToken(a: string, b: string): boolean {
-	const x = Buffer.from(a);
-	const y = Buffer.from(b);
-	return x.length === y.length && timingSafeEqual(x, y);
+function isMagicDns(host: string): boolean {
+	if (host.length > 259) return false; // DNS name + colon + five-digit port
+	const match = MAGIC_DNS.exec(host);
+	return !!match && match[1]!.length <= 253 && (match[2] === undefined || Number(match[2]) <= 65535);
+}
+
+function matchesOrigin(origin: string, scheme: Scheme, host: string): boolean {
+	if (/[^\x21-\x7e]/.test(origin)) return false;
+	const value = origin.toLowerCase();
+	const expected = `${scheme}://${host.toLowerCase()}`;
+	if (value === expected) return true;
+	// Compare only against legal forms of the validated authority, never trim the input.
+	const suffix = `:${DEFAULT_PORT[scheme]}`;
+	if (host.endsWith(suffix)) return value === expected.slice(0, -suffix.length);
+	const hasPort = host.lastIndexOf(":") > host.lastIndexOf("]");
+	return !hasPort && value === `${expected}${suffix}`;
 }
 
 export interface WebBoardOptions {
@@ -52,9 +70,6 @@ export class WebBoard {
 	readonly #roots: string[];
 	readonly #snap: SnapshotBuilder;
 	#server: ReturnType<typeof Bun.serve> | undefined;
-	#port = 0;
-	#bootstrap = new Map<string, number>();
-	#tabs: string[] = [];
 
 	constructor(model: SwarmReadModel, opts: WebBoardOptions) {
 		this.#model = model;
@@ -69,31 +84,23 @@ export class WebBoard {
 		return !!this.#server;
 	}
 
-	get port(): number {
-		return this.#port;
+	get port(): number | undefined {
+		return this.#server?.port;
 	}
 
 	start(port = 0): number {
-		if (this.#server) return this.#port;
-		this.#server = Bun.serve({ hostname: "127.0.0.1", port, fetch: req => this.#handle(req) });
-		this.#port = this.#server.port ?? 0;
-		return this.#port;
+		this.#server ??= Bun.serve({ hostname: "127.0.0.1", port, fetch: req => this.#handle(req) });
+		return this.#server.port!; // An IP listener always has a bound port.
 	}
 
 	stop(): void {
 		this.#server?.stop(true);
 		this.#server = undefined;
-		this.#bootstrap.clear();
-		this.#tabs = [];
 	}
 
-	/** A fresh single-use bootstrap link (5 minutes). Shown only to the user. */
-	link(): string {
-		const t = token();
-		const now = Date.now();
-		for (const [k, exp] of this.#bootstrap) if (exp <= now) this.#bootstrap.delete(k);
-		this.#bootstrap.set(t, now + TIMING.bootstrapTokenMs);
-		return `http://127.0.0.1:${this.#port}/#token=${t}`;
+	link(): string | undefined {
+		const port = this.port;
+		return port === undefined ? undefined : `http://127.0.0.1:${port}/`;
 	}
 
 	#headers(type: string, api: boolean): Headers {
@@ -109,36 +116,33 @@ export class WebBoard {
 	}
 
 	#refuse(status: number): Response {
-		return new Response(REFUSED, { status, headers: this.#headers("text/plain; charset=utf-8", true) });
+		const headers = this.#headers("text/plain; charset=utf-8", true);
+		if (status === 405) headers.set("Allow", "GET");
+		return new Response(REFUSED, { status, headers });
 	}
 
 	#json(body: unknown): Response {
 		return new Response(JSON.stringify(body), { headers: this.#headers("application/json; charset=utf-8", true) });
 	}
 
-	#bearer(req: Request): string {
-		const a = req.headers.get("authorization") ?? "";
-		return a.startsWith("Bearer ") ? a.slice(7).trim() : "";
-	}
-
-	#tabAuthorized(req: Request): boolean {
-		const t = this.#bearer(req);
-		return !!t && this.#tabs.some(x => sameToken(x, t));
-	}
-
 	#handle(req: Request): Response {
-		const url = new URL(req.url);
-		const host = `127.0.0.1:${this.#port}`;
-		if (req.headers.get("host") !== host) return this.#refuse(421);
-		const origin = req.headers.get("origin");
-		if (origin !== null && origin !== `http://${host}`) return this.#refuse(403);
-		const path = url.pathname;
-		if (req.method === "POST" && path === "/api/session") return this.#session(req);
 		if (req.method !== "GET") return this.#refuse(405);
+		// Tailscale's proxy sets this header for public Funnel traffic, not tailnet Serve.
+		if (req.headers.has("tailscale-funnel-request")) return this.#refuse(403);
+		const authority = req.headers.get("host") ?? "";
+		const port = this.port;
+		let scheme: Scheme = req.headers.get("x-forwarded-proto")?.toLowerCase() === "https" ? "https" : "http";
+		if (port === undefined || !isLoopbackAuthority(authority, port, scheme)) {
+			if (!isMagicDns(authority)) return this.#refuse(421);
+			scheme = "https";
+		}
+		const origin = req.headers.get("origin");
+		if (origin !== null && !matchesOrigin(origin, scheme, authority)) return this.#refuse(403);
+		const url = new URL(req.url);
+		const path = url.pathname;
 		const asset = this.#assets.get(path);
 		if (asset) return new Response(asset.body, { headers: this.#headers(asset.type, false) });
 		if (!path.startsWith("/api/")) return this.#refuse(404);
-		if (!this.#tabAuthorized(req)) return this.#refuse(401);
 		switch (path) {
 			case "/api/swarm":
 				return this.#swarm(url);
@@ -151,21 +155,6 @@ export class WebBoard {
 			default:
 				return this.#refuse(404);
 		}
-	}
-
-	#session(req: Request): Response {
-		const t = this.#bearer(req);
-		const now = Date.now();
-		let found: string | undefined;
-		for (const [k, exp] of this.#bootstrap) {
-			if (exp > now && sameToken(k, t)) found = k;
-		}
-		if (!found) return this.#refuse(401);
-		this.#bootstrap.delete(found);
-		const tab = token();
-		this.#tabs.push(tab);
-		while (this.#tabs.length > LIMITS.webTabTokens) this.#tabs.shift();
-		return this.#json({ token: tab });
 	}
 
 	#swarm(url: URL): Response {

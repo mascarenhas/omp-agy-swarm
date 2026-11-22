@@ -19,27 +19,26 @@ const CANDIDATES = [
 const CHROME = CANDIDATES.find(p => existsSync(p));
 if (!CHROME) console.warn("\n*** web-browser tests SKIPPED: no Chrome/Chromium found (set CHROME_PATH) ***\n");
 
-// A 1×1 PNG (two colours so the two frames differ).
-const png = (r: number) =>
-	Buffer.from(
-		`89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763${r.toString(16).padStart(2, "0")}f8ff3f0005fe02fe0dcbcf4b0000000049454e44ae426082`,
-		"hex",
-	);
+// Two valid 1×1 RGB PNGs, with different pixel colours.
+const PNGS = [
+	"89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c631060600000003400113f680e740000000049454e44ae426082",
+	"89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c49444154789c6378c0c0000002a400e1df929b4d0000000049454e44ae426082",
+] as const;
 
 describe.skipIf(!CHROME)("web board in a browser", () => {
 	let h: Harness;
 	let board: WebBoard;
 	let browser: Browser;
 	let page: Page;
-	const frameRequests: { auth: boolean; status: number }[] = [];
+	let url: string;
 
 	beforeAll(async () => {
 		fastTimers();
 		h = new Harness({ mode: "tui" });
 		const shots = join(h.dir, "shots");
 		mkdirSync(shots, { recursive: true });
-		writeFileSync(join(shots, "one.png"), png(0x10));
-		writeFileSync(join(shots, "two.png"), png(0xe0));
+		writeFileSync(join(shots, "one.png"), Buffer.from(PNGS[0], "hex"));
+		writeFileSync(join(shots, "two.png"), Buffer.from(PNGS[1], "hex"));
 		h.factory.brains.set("ui", async t => {
 			await t.call("post_message", { text: `@coordinator baseline\nScreenshot: ${join(shots, "one.png")} | before` });
 			await t.call("post_message", { text: `@coordinator [done] fixed\nScreenshot: ${join(shots, "two.png")} | after` });
@@ -49,19 +48,10 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		await h.swarm({ action: "add", name: "ui", brief: "make the change" });
 		await until(() => h.member("ui").phase === "parked", 2000, "parked");
 		board = new WebBoard(new RuntimeReadModel(h.rt), { webDir: join(REPO, "web"), swarmDir: h.dir, extraRoots: [] });
-		board.start(0);
+		url = `http://127.0.0.1:${board.start()}/`;
 		browser = await chromium.launch({ executablePath: CHROME, headless: true });
 		page = await browser.newPage();
-		page.on("response", r => {
-			if (new URL(r.url()).pathname === "/api/frame") frameRequests.push({ auth: !!r.request().headers().authorization, status: r.status() });
-		});
-		await page.route("**/app.js", async route => {
-			const res = await route.fetch();
-			const body = await res.text();
-			// Records what app.js sees as the URL fragment when it starts.
-			await route.fulfill({ response: res, body: `window.__hashAtApp = location.hash;\n${body}` });
-		});
-		await page.goto(board.link());
+		await page.goto(url);
 		await page.waitForSelector("#board:not(.hidden)", { timeout: 15_000 });
 	});
 
@@ -69,12 +59,6 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		await browser?.close();
 		board?.stop();
 		await h?.close();
-	});
-
-	test("the fragment is gone before app.js runs and never reaches the server", async () => {
-		expect(await page.evaluate(() => (window as unknown as { __hashAtApp: string }).__hashAtApp)).toBe("");
-		expect(await page.evaluate(() => location.hash)).toBe("");
-		expect(await page.evaluate(() => document.cookie)).toBe("");
 	});
 
 	test("all five tabs render from the runtime", async () => {
@@ -88,13 +72,12 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		await page.waitForFunction(() => (document.getElementById("members")?.textContent ?? "").includes("ui"));
 	});
 
-	test("reel images load through blob URLs, including after stepping the reel (src changes)", async () => {
+	test("both reel images decode from same-origin /api/frame as the reel is scrubbed", async () => {
 		await page.click('[data-tab="overview"]');
-		await page.waitForFunction(() => {
-			const img = document.querySelector<HTMLImageElement>(".o2-reel img.o2-rimg");
-			return !!img && img.getAttribute("src")?.startsWith("blob:");
-		}, undefined, { timeout: 10_000 });
-		const first = await page.evaluate(() => document.querySelector<HTMLImageElement>(".o2-reel img.o2-rimg")?.getAttribute("src"));
+		const image = page.locator(".o2-reel img.o2-rimg");
+		await image.evaluate(async img => (img as HTMLImageElement).decode());
+		const first = await image.getAttribute("src");
+		expect(first).toMatch(/^\/api\/frame\?/);
 		await page.evaluate(() => {
 			const s = document.querySelector<HTMLInputElement>(".o2-reel .o2-rscrub");
 			if (!s) throw new Error("no scrub control");
@@ -104,13 +87,12 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		await page.waitForFunction(
 			prev => {
 				const src = document.querySelector<HTMLImageElement>(".o2-reel img.o2-rimg")?.getAttribute("src") ?? "";
-				return src.startsWith("blob:") && src !== prev;
+				return src.startsWith("/api/frame?") && src !== prev;
 			},
 			first,
 			{ timeout: 10_000 },
 		);
-		expect(frameRequests.filter(r => r.status === 200).every(r => r.auth)).toBe(true);
-		expect(frameRequests.some(r => r.status === 200)).toBe(true);
+		await image.evaluate(async img => (img as HTMLImageElement).decode());
 	});
 
 	test("the transcript drawer pages through /api/transcript", async () => {
@@ -137,7 +119,7 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 				await Bun.sleep(300);
 				await route.continue();
 			});
-			await late.goto(board.link());
+			await late.goto(url);
 			await late.waitForSelector("#board:not(.hidden)", { timeout: 15_000 });
 			await late.waitForFunction(() => document.getElementById("omp-theme-toggle")?.onclick != null, undefined, { timeout: 10_000 });
 			const conv = h.member("ui").conversationId;
@@ -163,20 +145,22 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		await page.waitForSelector(".omp-narrator-link", { state: "detached", timeout: 10_000 });
 	}, 20_000);
 
-	test("a reload shows the new-link notice; a stopped board serves nothing", async () => {
+	test("the plain URL survives reload; a stopped board serves nothing", async () => {
+		expect(page.url()).toBe(url);
 		await page.reload();
-		await page.waitForSelector("#omp-notice:not([hidden])");
-		expect(await page.textContent("#omp-notice")).toContain("Run /swarm-ui again");
-		const port = board.port;
+		await page.waitForSelector("#board:not(.hidden)", { timeout: 10_000 });
+		await page.click('[data-tab="feed"]');
+		await page.waitForFunction(() => (document.getElementById("feed")?.textContent ?? "").includes("fixed"));
+		expect(page.url()).toBe(url);
 		board.stop();
-		const ok = await page.evaluate(async p => {
+		const ok = await page.evaluate(async address => {
 			try {
-				await fetch(`http://127.0.0.1:${p}/`);
+				await fetch(address);
 				return true;
 			} catch {
 				return false;
 			}
-		}, port);
+		}, url);
 		expect(ok).toBe(false);
 	});
 });

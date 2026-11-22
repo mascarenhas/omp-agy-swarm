@@ -1,9 +1,10 @@
 // /swarm overlay rendering and keyboard paths over a real runtime's read model (§10.2, T5).
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { visibleWidth } from "@oh-my-pi/pi-tui";
+import { getThemeByName, visibleWidth } from "@oh-my-pi/pi-tui";
 import { RuntimeReadModel } from "../../src/runtime/read-model.ts";
 import { project } from "../../src/ui/model.ts";
+import { renderWebBoardMessage } from "../../src/ui/tui/custom-message.ts";
 import { SwarmOverlay } from "../../src/ui/tui/overlay.ts";
 import { widgetLine } from "../../src/ui/tui/widget.ts";
 import { fastTimers, Harness, until } from "../helpers/harness.ts";
@@ -111,6 +112,23 @@ describe("overlay", () => {
 		expect(v.threads[0]?.rows[0]?.owner).toBe("parser");
 		expect(v.reel[0]?.path).toBe("/tmp/x.png");
 		expect(widgetLine(model)).toMatch(/^swarm · parser {2}rewrite · ●0 ○1 · #\d+ · \d+ unread · \/swarm$/);
+		const url = "http://127.0.0.1:40593/";
+		const label = `swarm · ${url}`;
+		const status = widgetLine(model);
+		const compact = status.replace(/^swarm · parser {2}rewrite/, label);
+		expect(widgetLine(model, url)).toBe(status.replace(/^swarm/, label));
+		expect(widgetLine(model, url, visibleWidth(compact) + 10)).toBe(compact.replace(label, `${label} · parser…`));
+		expect(widgetLine(model, url, visibleWidth(compact))).toBe(compact);
+		expect(widgetLine(model, url, visibleWidth(label) + 4)).toBe(label);
+		expect(widgetLine(model, url, visibleWidth(url))).toBe(url);
+		const narrow = widgetLine(model, url, visibleWidth(url) - 1);
+		expect(narrow).toBe(`${url.slice(0, -2)}…`);
+		for (const value of ["complete", "complete_with_abandonment", "incomplete"] as const) {
+			h.rt.outcome = { value, reason: "", at: "", terminal: true };
+			const state = value === "incomplete" ? "incomplete" : "complete";
+			expect(widgetLine(model, url)).toBe(`${label} · ${state} · #${model.head} · /swarm`);
+		}
+		h.rt.outcome = null;
 		// The interactive coordinator was sent an aside for the worker's report; let it lapse.
 		await until(() => !h.rt.coordinator.delivery, 1000, "aside released");
 		await h.call("read_board", {});
@@ -118,7 +136,22 @@ describe("overlay", () => {
 		const w = h.call("swarm_wait", {});
 		await until(() => h.rt.coordinator.phase === "parked", 1000, "parked");
 		expect(widgetLine(model)).toBe("swarm · stalled — waiting for you · /swarm");
+		expect(widgetLine(model, url)).toBe(`${label} · stalled — waiting for you · /swarm`);
 		h.rt.onSessionClear();
 		await w;
+		h.member("parser").phase = "stopped";
+		h.rt.changed();
+		expect(widgetLine(model, url)).toMatch(/^swarm · http:\/\/127\.0\.0\.1:40593\/ · restored: 1 stopped, \d+ owed · \/swarm$/);
 	});
+});
+
+test("persistent web board renderer strips escapes from persisted content", async () => {
+	const dark = await getThemeByName("dark");
+	expect(dark).toBeDefined();
+	const message = { content: "http://127.0.0.1:40593/\x1b[2J\nssh -L\x1b]0;PWNED\x07 40593:127.0.0.1:40593 <host>\u202e" };
+	const output = renderWebBoardMessage(message, { expanded: false }, dark!).render(80).join("\n");
+	expect(output).toContain("Swarm web board");
+	expect(output).toContain("http://127.0.0.1:40593/");
+	expect(output).toContain("ssh -L 40593:127.0.0.1:40593 <host>");
+	expect(output).not.toMatch(/\x1b\[2J|\x1b\]0;|PWNED|\u202e/);
 });

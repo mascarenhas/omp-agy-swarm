@@ -1,9 +1,5 @@
 /*
  * omp-agy-swarm bridge (runs after the vendored app.js / hive.js):
- * - images: every <img> whose src points at /api/frame (inserted, or an existing <img> whose src
- *   changes, as the progress reel does when stepping) is fetched through window.sidecar.fetch and
- *   swapped for a blob: URL; a newer src discards a stale fetch; blobs are revoked when replaced
- *   or when the image leaves the DOM. No credential is ever placed in a URL.
  * - a read-only transcript drawer (window.sidecar.ui.toggleConversation) paging /api/transcript,
  *   and a file drawer for allowedFiles (toggleAuxPane). Everything is rendered with textContent.
  * - a theme toggle and a "Narrator's page" link when the vendored toggle is hidden.
@@ -13,79 +9,9 @@
 	const sidecar = window.sidecar;
 	if (!sidecar) return;
 	const $ = id => document.getElementById(id);
-	const PLACEHOLDER = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
-	const gens = new WeakMap();
-	const blobs = new WeakMap();
 	// A snapshot that arrived before this script loaded is only retained by the preload (its
 	// event fired with no listener, and later polls are `unchanged`).
 	let snap = typeof sidecar.snapshot === "function" ? sidecar.snapshot() : null;
-
-	// ---------- images ----------
-	function framePath(img) {
-		const raw = img.getAttribute("src") || "";
-		if (raw.startsWith("blob:") || raw.startsWith("data:")) return "";
-		try {
-			const u = new URL(raw, location.origin);
-			return u.origin === location.origin && u.pathname === "/api/frame" ? u.pathname + u.search : "";
-		} catch {
-			return "";
-		}
-	}
-	function revoke(img) {
-		const old = blobs.get(img);
-		if (old) {
-			URL.revokeObjectURL(old);
-			blobs.delete(img);
-		}
-	}
-	function swap(img) {
-		const path = framePath(img);
-		if (!path) return;
-		const gen = (gens.get(img) || 0) + 1;
-		gens.set(img, gen);
-		img.setAttribute("src", PLACEHOLDER);
-		sidecar
-			.fetch(path)
-			.then(r => (r.ok ? r.blob() : Promise.reject(new Error(String(r.status)))))
-			.then(b => {
-				const url = URL.createObjectURL(b);
-				if (gens.get(img) !== gen || !img.isConnected) {
-					URL.revokeObjectURL(url); // a newer src (or removal) won: discard the stale result
-					return;
-				}
-				revoke(img);
-				blobs.set(img, url);
-				img.setAttribute("src", url);
-			})
-			.catch(() => {
-				if (gens.get(img) === gen) img.setAttribute("alt", img.getAttribute("alt") || "image unavailable");
-			});
-	}
-	function scan(node) {
-		if (node.nodeType !== 1) return;
-		if (node.tagName === "IMG") swap(node);
-		for (const img of node.querySelectorAll ? node.querySelectorAll("img") : []) swap(img);
-	}
-	function dropped(node) {
-		if (node.nodeType !== 1) return;
-		const imgs = node.tagName === "IMG" ? [node] : node.querySelectorAll ? [...node.querySelectorAll("img")] : [];
-		for (const img of imgs) {
-			if (!img.isConnected) {
-				gens.set(img, (gens.get(img) || 0) + 1);
-				revoke(img);
-			}
-		}
-	}
-	new MutationObserver(records => {
-		for (const r of records) {
-			if (r.type === "attributes" && r.target.tagName === "IMG") swap(r.target);
-			else if (r.type === "childList") {
-				for (const n of r.addedNodes) scan(n);
-				for (const n of r.removedNodes) dropped(n);
-			}
-		}
-	}).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ["src"] });
-	scan(document.body);
 
 	// ---------- drawer ----------
 	const drawer = $("omp-drawer");

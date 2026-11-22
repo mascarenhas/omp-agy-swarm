@@ -99,11 +99,11 @@ assumes context the worker has not got produces a worker that invents it.
    swarm with the `open_board` value of your latest `add` or `status` result,
    on its own line, exactly as given, and do the same whenever the user asks
    what the swarm is doing. If none is in view, call `swarm{action:"status"}`.
-   In a TUI session `open_board` is `/swarm` (the primary native terminal UI —
-   Overview, Board, Members, Transcript — which works over SSH with zero open
-   ports; `/swarm-ui start` is the optional local web board). In headless runs
-   `open_board` is `""`; if it is empty, offer none. Never invent a board URL
-   or token yourself.
+   `open_board` is the loopback URL (`http://127.0.0.1:<port>/`) while the
+   optional web board (`/swarm-ui start`) is running; otherwise `/swarm` in
+   TUI (the primary native terminal UI, zero open ports) and `""` in
+   RPC/headless. If `open_board` is empty, offer none. Never invent a board
+   URL yourself.
 
 Name workers for their job — `parser`, `verifier`, `docs` — never `agent-1`.
 Names match `^[a-z][a-z0-9_-]{0,31}$` and are unique for the lifetime of the

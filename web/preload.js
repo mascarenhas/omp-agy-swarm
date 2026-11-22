@@ -1,66 +1,23 @@
 /*
  * omp-agy-swarm web board preload: the first script on the page.
- *
- * 1. Reads the one-time `#token=` fragment and removes it from the URL before any vendored script
- *    runs, then exchanges it (POST /api/session, Authorization header) for a per-tab bearer that
- *    lives only in this closure. Nothing is ever stored in a cookie, storage or a URL.
- * 2. window.sidecar.fetch(path) only reaches same-origin allowlisted paths, sends the bearer as an
- *    Authorization header, omits credentials and refuses redirects.
- * 3. Writes the host theme tokens onto :root (the vendored code derives data-theme from them).
+ * window.sidecar.fetch only reaches same-origin allowlisted paths, omits credentials and
+ * refuses redirects. The preload also writes the host theme tokens onto :root.
  */
 (() => {
 	"use strict";
 	const ALLOWED = new Set(["/api/swarm", "/api/frame", "/api/transcript", "/api/file", "/narrator_bootstrap.js"]);
-	const m = /(?:^#|&)token=([A-Za-z0-9_-]{20,128})(?:&|$)/.exec(location.hash || "");
-	const bootstrap = m ? m[1] : "";
-	if (location.hash) history.replaceState(null, "", location.pathname + location.search);
-
-	let tabToken = "";
-	let expired = false;
-	const showNotice = () => {
-		if (expired) return;
-		expired = true;
-		const put = () => {
-			const n = document.getElementById("omp-notice");
-			if (!n) return setTimeout(put, 50);
-			n.textContent = "This link has expired or was already used. Run /swarm-ui again for a new link.";
-			n.hidden = false;
-		};
-		put();
-	};
-
-	const exchange = bootstrap
-		? fetch("/api/session", {
-				method: "POST",
-				headers: { Authorization: `Bearer ${bootstrap}` },
-				credentials: "omit",
-				cache: "no-store",
-				redirect: "error",
-			})
-				.then(r => (r.ok ? r.json() : Promise.reject(new Error("refused"))))
-				.then(j => {
-					tabToken = typeof j.token === "string" ? j.token : "";
-					if (!tabToken) showNotice();
-				})
-				.catch(() => showNotice())
-		: Promise.resolve().then(showNotice);
-
 	let lastSnapshot = null;
 	async function sidecarFetch(path, init) {
 		const url = new URL(String(path), location.origin);
 		if (url.origin !== location.origin || !ALLOWED.has(url.pathname)) throw new TypeError("sidecar.fetch: path not allowed");
 		const method = (init && init.method) || "GET";
 		if (method !== "GET") throw new TypeError("sidecar.fetch: only GET");
-		await exchange;
-		if (!tabToken) throw new Error("not authorized: run /swarm-ui again for a new link");
 		const res = await fetch(url.pathname + url.search, {
 			method: "GET",
-			headers: { Authorization: `Bearer ${tabToken}` },
 			credentials: "omit",
 			cache: "no-store",
 			redirect: "error",
 		});
-		if (res.status === 401) showNotice();
 		if (url.pathname === "/api/swarm" && res.ok) {
 			res
 				.clone()

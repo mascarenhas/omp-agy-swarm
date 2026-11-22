@@ -47,7 +47,7 @@ function basicCoordinator(add: Record<string, unknown>, markers: string[]): Scri
 
 const D0a: Scenario = {
 	id: "D0a",
-	title: "launch with --no-extensions -e <dir>: tools on turn 1, skills resolve, mock provider survives workers",
+	title: "launch with --no-extensions -e <dir>: tools on turn 1, skills resolve, no web listener in print mode",
 	script: () => ({
 		coord: {
 			rules: [
@@ -60,7 +60,7 @@ const D0a: Scenario = {
 		},
 		"worker-a": { rules: reporter("w", "@coordinator [done] DONE-w") },
 	}),
-	runs: [{ prompt: "start" }],
+	runs: [{ prompt: "start", env: { OMP_SWARM_UI: "1" } }],
 	check: (c, k) => {
 		const first = requests(c, "coord")[0];
 		for (const t of SWARM_TOOLS) k.ok(first?.tools.includes(t), `turn 1 offers ${t}`);
@@ -89,10 +89,10 @@ const D0b: Scenario = {
 
 const D0c: Scenario = {
 	id: "D0c",
-	title: "--no-session: private ephemeral swarm dir",
+	title: "--no-session: private ephemeral swarm dir, no web listener in JSON mode",
 	noSwarmDirEnv: true,
 	script: () => ({ coord: basicCoordinator({ name: "w", brief: "report", model: "mock/worker-a" }, ["DONE-w"]), "worker-a": { rules: reporter("w", "@coordinator [done] DONE-w") } }),
-	runs: [{ prompt: "start", args: ["--no-session"] }],
+	runs: [{ prompt: "start", args: ["--no-session", "--mode", "json"], env: { OMP_SWARM_UI: "1" } }],
 	check: (c, k) => {
 		const m = /omp-agy-swarm: swarm directory (\S+)/.exec(c.runs[0]?.stderr ?? "");
 		k.ok(m, "the ephemeral swarm dir is printed once on stderr");

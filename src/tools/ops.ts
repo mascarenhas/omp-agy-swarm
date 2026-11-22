@@ -170,8 +170,8 @@ function modeOf(binding: CoordinatorPort): "headless" | "interactive" {
 	return binding.headless ? "headless" : "interactive";
 }
 
-function openBoard(binding: CoordinatorPort): string {
-	return binding.mode === "tui" ? "/swarm" : "";
+function openBoard(rt: SwarmRuntime): string {
+	return rt.webBoardLink?.() ?? (rt.binding.mode === "tui" ? "/swarm" : "");
 }
 
 function callerModel(ctx: OpsContext, caller: Member): ModelInfo | undefined {
@@ -233,7 +233,7 @@ function statusOp(ctx: OpsContext): ToolResult {
 		mode: modeOf(rt.binding),
 		head: rt.board.head,
 		swarm_dir: rt.dir,
-		open_board: openBoard(rt.binding),
+		open_board: openBoard(rt),
 		completion: completionLabel(rt),
 		outcome: rt.outcome ? rt.outcome.value : null,
 		spend: rt.spendView(),
@@ -437,7 +437,7 @@ async function addOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResult> {
 		mode: modeOf(rt.binding),
 		hint: rt.binding.headless ? HEADLESS_HINT : undefined,
 		swarm_dir: rt.dir,
-		open_board: openBoard(rt.binding),
+		open_board: openBoard(rt),
 	});
 }
 

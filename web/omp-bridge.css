@@ -1,15 +1,4 @@
-/* omp-agy-swarm bridge: drawer, notice, theme toggle and narrator link. Uses the vendored tokens. */
-.omp-notice {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  z-index: 1000;
-  padding: 10px 16px;
-  background: var(--sw-error, #cb3d3d);
-  color: #fff;
-  font: 13px var(--sw-font, system-ui, sans-serif);
-}
+/* omp-agy-swarm bridge: drawer, theme toggle and narrator link. Uses the vendored tokens. */
 .omp-theme-toggle {
   position: fixed;
   right: 12px;

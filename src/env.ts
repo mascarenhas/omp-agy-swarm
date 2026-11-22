@@ -58,7 +58,6 @@ export const LIMITS = {
 	webFileBytes: 512 * 1024,
 	postedFrames: 24,
 	allowedFiles: 64,
-	webTabTokens: 8,
 	rosterFile: 16 * 1024 * 1024,
 	journalFile: 512 * 1024 * 1024,
 } as const;
@@ -85,7 +84,6 @@ export const TIMING = {
 	metricsDebounceMs: 2_000,
 	uiFilePollMs: 2_000,
 	uiRenderCoalesceMs: 100,
-	bootstrapTokenMs: 5 * 60_000,
 } as const;
 
 /**

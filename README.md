@@ -44,7 +44,7 @@ Read skill://swarm and split the parser rewrite across two authors (lexer and pa
 
 - A single-line status widget appears below the editor (`swarm · <title> · ●2 ○1 · #12 · /swarm`).
 - Run `/swarm` at any time to open the full-screen terminal board (or `/swarm board`, `/swarm members`, `/swarm transcript <name>`).
-- Optionally run `/swarm-ui start` to spin up the loopback web board and get a one-time private link.
+- Optionally run `/swarm-ui start` to start the read-only loopback web board: in TUI the status widget immediately shows `http://127.0.0.1:<port>/` (even mid-turn, clipping the URL only if it alone exceeds the terminal width), and a copyable transcript notice appears immediately when idle or when the active run ends (a brief toast is also sent, though it may not appear when idle—notably in Tern—and neither display depends on it).
 
 ### Headless (`omp -p`)
 
@@ -133,31 +133,33 @@ In `rpc` mode, `/swarm` prints a compact text summary notification.
 
 ### Optional Web Board (`/swarm-ui`)
 
-No HTTP server is created or port bound until you opt in via `/swarm-ui start` (or `OMP_SWARM_UI=1` in an interactive `tui`/`rpc` session).
+Opt-in, read-only (`GET`-only; non-`GET` returns `405` with `Allow: GET`), and bound strictly to `127.0.0.1`. No HTTP server is created or port bound at load; start it with `/swarm-ui start` or `/swarm-ui open` (or `OMP_SWARM_UI=1`, which auto-starts once when a new or restored swarm attaches in interactive `tui`/`rpc` sessions, never in headless `print`/`json`).
 
 ```text
 /swarm-ui [status | start [port] | open | stop]
 ```
 
-- `status` (default): reports whether the server is running and on which port.
-- `start [port]`: starts the read-only server on `127.0.0.1` (`port` defaults to `OMP_SWARM_UI_PORT`, or an ephemeral port if `0`) and displays a one-time private link.
-- `open`: starts if needed, prints a fresh private link, and launches the local browser (`xdg-open` / `open`).
-- `stop`: closes the server immediately and invalidates all active tokens and links.
+- `status` (default): if running, triggers a brief toast (which may not show when idle) and re-posts the copyable transcript notice (immediately when idle, or when the active run ends); otherwise notifies that the web board is off.
+- `start [port]`: starts the server on `127.0.0.1` (`port` defaults to `OMP_SWARM_UI_PORT`, or an ephemeral port if `0`), updates the TUI status widget below the editor immediately with the live `http://127.0.0.1:<port>/` URL (even mid-turn, clipping the URL only if it alone cannot fit; RPC has no widget), sends a brief toast (which may not appear when idle), and posts a persistent, copyable transcript notice (`customType: "swarm-ui"`, excluded from model context, no turn triggered; appears immediately when idle or when the active run ends) with the URL and remote-access commands. Auto-start via `OMP_SWARM_UI=1` announces the same way.
+- `open`: starts if needed, announces the URL the same way, and makes a best-effort attempt to launch the host browser (`xdg-open` / `open`).
+- `stop`: closes the listener and removes the URL from the status widget immediately (earlier transcript notices remain in history).
+
+Because the URL is plain (`http://127.0.0.1:<port>/`, with no credentials), page reloads and bookmarks work while that address is listening. While running, the TUI status widget shows the full live URL (`swarm · http://127.0.0.1:<port>/ · <title> · ●2 ○1 · #12 · /swarm`, dropping other segments before clipping the URL; RPC has no widget), and `open_board` in `swarm{action:"add"}` and `swarm{action:"status"}` returns `http://127.0.0.1:<port>/` (otherwise `/swarm` in TUI and `""` in RPC/headless; `/swarm` remains available independently).
 
 **Security model:**
-- Binds strictly to `127.0.0.1` (never `0.0.0.0`).
-- Rejects mismatched `Host` (`421`) and cross-origin `Origin` (`403`) headers; sends strict CSP (`frame-ancestors 'none'; connect-src 'self'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on API routes.
-- **No cookies and no URL-query tokens:** the one-time 5-minute `#token=` fragment is stripped immediately by `web/preload.js` (`history.replaceState`) and exchanged via `POST /api/session` for an in-memory per-tab `Authorization: Bearer` token (up to 8 concurrent tabs). Frame images are fetched with the bearer header and rendered via revoked `blob:` URLs.
-- **Confined file serving:** `/api/frame` and `/api/file` serve only allowlisted paths verified against `<swarm_dir>` (plus up to 4 optional `OMP_SWARM_UI_ROOTS`).
+There is no authentication: anyone who can reach the loopback port or a Tailscale Serve proxy exposing it can read the board, transcripts, and allowlisted files under `<swarm_dir>` (plus up to 4 optional `OMP_SWARM_UI_ROOTS`); use tailnet-only `tailscale serve`, never `tailscale funnel` (marked `Tailscale-Funnel-Request` `GET` requests return `403`, while non-`GET` requests return `405` first). To block DNS rebinding and cross-site reads, the server accepts only `GET` requests with a `Host` of `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` (a bare loopback `Host` is accepted only when listening on `http` port `80` or forwarded `https` port `443`), or `*.ts.net` (optional `:<port>`) (`421` otherwise) and, when `Origin` is present, a matching origin using `http` for direct loopback and `https` for MagicDNS hosts or `X-Forwarded-Proto: https` (`403` otherwise), serves no CORS headers, and sets strict CSP (`frame-ancestors 'none'; connect-src 'self'`), `Cross-Origin-Resource-Policy: same-origin`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on `/api/*`.
 
-**Remote SSH / Tailscale access:**
-Because the server binds `127.0.0.1` and enforces `Host: 127.0.0.1:<port>`, forward the **same** port locally over SSH (or over a Tailscale SSH tunnel):
-
-```sh
-ssh -L <port>:127.0.0.1:<port> <host>
-```
-
-Pinning `OMP_SWARM_UI_PORT=43123` makes the local port-forward reusable across sessions. Then open the printed `http://127.0.0.1:<port>/#token=…` link in your local browser.
+**Remote access (Tailscale Serve or SSH):**
+- **Tailscale Serve** (tailnet-only — never `tailscale funnel`, whose marked `Tailscale-Funnel-Request` `GET` requests return `403` and non-`GET` requests `405`; requires HTTPS enabled in your tailnet; `*.ts.net` hosts are accepted):
+  ```sh
+  tailscale serve <port>
+  ```
+  Runs in the foreground (`Ctrl+C` stops serving) and proxies `http://127.0.0.1:<port>` on default HTTPS port `443` at `https://<machine>.<tailnet>.ts.net`. Add `--bg` to persist in the background (`tailscale serve --bg <port>`) and optional `--https=<https-port>` to serve on another HTTPS port; to stop only that background serve without resetting other Serve entries, run `tailscale serve --https=443 off` (or `tailscale serve --https=<https-port> off`).
+- **SSH port forwarding:**
+  ```sh
+  ssh -L <port>:127.0.0.1:<port> <host>
+  ```
+  Forward the **same** port locally (pinning `OMP_SWARM_UI_PORT=43123` makes the forward reusable across sessions), then open `http://127.0.0.1:<port>/` in your local browser.
 
 ---
 
@@ -206,8 +208,8 @@ All plugin tunables are read from `src/env.ts` at runtime startup:
 | Variable | Default | Range / Format | Behavior |
 |---|---|---|---|
 | `OMP_SWARM_DIR` | `<session artifacts>/swarm` (or private temp dir with `--no-session`) | Absolute/relative directory path | Overrides where `board.jsonl`, `members.json`, `metrics.json`, `plan.json`, `view.json`, `sessions/`, `workspaces/`, `shots/`, and `owner.lock` live |
-| `OMP_SWARM_UI` | unset (`off`) | `1` to enable | Auto-starts the loopback web board on swarm creation in `tui`/`rpc` sessions (never in headless `print`/`json`) |
-| `OMP_SWARM_UI_PORT` | `0` (ephemeral) | Integer `0..65535` | Default port on `127.0.0.1` for `/swarm-ui start` and `OMP_SWARM_UI=1` |
+| `OMP_SWARM_UI` | unset (`off`) | `1` to enable | Auto-starts the loopback web board when a new or restored swarm attaches in `tui`/`rpc` sessions (never in headless `print`/`json`) |
+| `OMP_SWARM_UI_PORT` | `0` (ephemeral) | Integer `0..65535` | Default port on `127.0.0.1` when `/swarm-ui start`, `/swarm-ui open`, or `OMP_SWARM_UI=1` starts the listener |
 | `OMP_SWARM_UI_ROOTS` | unset | Colon-separated absolute paths (up to 4) | Extra canonical root directories permitted for web `/api/frame` and `/api/file` reads in addition to `<swarm_dir>` |
 | `OMP_SWARM_MAX_WORKERS` | `24` | Integer `1..256` | Maximum concurrent non-killed members (excluding coordinator) |
 | `OMP_SWARM_WORKER_TOOLS` | `read,bash,edit,write,glob,grep,eval,todo,web_search,lsp,ast_grep,ast_edit` | Comma-separated tool names | Built-in tool allowlist for task workers (intersected with main session's active tools; hard-excluded tools are always stripped) |
