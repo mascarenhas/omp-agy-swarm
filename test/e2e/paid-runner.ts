@@ -55,6 +55,14 @@ function fixture(c: PaidCtx, s: PaidScenario): void {
 }
 
 interface MeasuredSpend { cost?: number; unknown?: string }
+/** Only a fully observed R9 startup, before the harness sends any input. */
+export function untouchedHubStartup({ T, swarm }: PaidCtx, rows: Trace[]): boolean {
+	const startup = rows.find(row => row.kind === "root");
+	const sessionFile = startup?.sessionFile;
+	return !!sessionFile && dirname(sessionFile) === join(T, "sessions") && startup.swarm === swarm &&
+		!existsSync(sessionFile) && !existsSync(swarm) && rows.some(row => row.kind === "ref" && row.id === "Main" && row.attached) &&
+		rows.every(row => row.kind === "root" || (row.kind === "ref" || row.kind === "jobs") && row.id === "Main");
+}
 
 function spend(c: PaidCtx, rows: Trace[], final = false): MeasuredSpend {
 	const metricsSpend = metrics(c);
@@ -71,7 +79,8 @@ function spend(c: PaidCtx, rows: Trace[], final = false): MeasuredSpend {
 		else others += row.cost ?? 0;
 	}
 	if (final) {
-		if (!main?.sessionFile || !metricsSpend || !Number.isFinite(metricsSpend.spend.cost)) return { unknown: "missing final observer session or swarm spend metrics" };
+		if (!main?.sessionFile) return { unknown: "missing observer Main session file path" };
+		if (!metricsSpend || !Number.isFinite(metricsSpend.spend.cost)) return { unknown: "missing or invalid final swarm spend metrics" };
 		const entries = jsonl<Entry>(main.sessionFile);
 		if (!entries.some(entry => entry.message?.role === "assistant")) return { unknown: "missing final Main assistant usage transcript" };
 		const bill = directBill(entries, rows.filter((row): row is Frame<"usage"> => row.kind === "usage" && row.id === "Main" && row.source === "session"));
@@ -86,11 +95,11 @@ function spend(c: PaidCtx, rows: Trace[], final = false): MeasuredSpend {
 
 export interface CaseResult { c: PaidCtx; k: Checks; cost?: number; unsound?: string }
 interface ProfileSnapshot { kind: typeof PROFILE_TREES[number]; before: string; after?: string }
-interface CaseOptions { omp: string; cap: number; deadline: number; scoutOverride?: string; loopback?: Script }
+interface CaseOptions { omp: string; cap: number; deadline: number; scoutOverride?: string; loopback?: Script; loopbackSymbolPreset?: "nerd" }
 
 /** The loopback-only test seam takes a scripted provider and starts with no real auth/config. */
 export async function runPaidCase(s: PaidScenario, options: CaseOptions): Promise<CaseResult> {
-	const { omp, cap, deadline, scoutOverride, loopback } = options;
+	const { omp, cap, deadline, scoutOverride, loopback, loopbackSymbolPreset } = options;
 	const T = mkdtempSync(join(tmpdir(), `omp-swarm-${loopback ? "loopback" : "paid"}-${s.id}-`));
 	const c: PaidCtx = { T, swarm: join(T, "swarm"), repo: join(T, "repo"), trace: join(T, "evidence.jsonl"), stdout: "", stderr: "", code: null, scoutOverride };
 	const k = new Checks();
@@ -166,6 +175,7 @@ export async function runPaidCase(s: PaidScenario, options: CaseOptions): Promis
 			`enabledProviders: ${JSON.stringify(approved)}`,
 			`disabledProviders: ${JSON.stringify(disabled)}`,
 			...(s.pty ? ["statusLine:\n  preset: default\n  separator: ascii\n  segmentOptions:\n    pi:\n      showProfile: false"] : []),
+			...(loopback && loopbackSymbolPreset ? [`symbolPreset: ${loopbackSymbolPreset}`] : []),
 			// Explicit async:true still works; the coordinator's fixture barriers stay foreground.
 			...(s.id === "R10" || s.id === "R12" ? ["bash:\n  autoBackground:\n    enabled: false"] : []),
 			...(s.id === "R10" ? ["async:\n  enabled: true\n  printWake: false"] : []),
@@ -224,6 +234,7 @@ export async function runPaidCase(s: PaidScenario, options: CaseOptions): Promis
 		try {
 			for (const tree of profileTrees) tree.after = treeHash(join(agentDir, tree.kind));
 			if (profileTrees.some(tree => tree.before !== tree.after)) profileProblem = "active profile agents/ or managed-skills/ changed; stop and check for concurrent maintenance";
+			if (s.pty) syncArtifactRoot(c, evidence(c));
 			const root = evidence(c).find(row => row.kind === "root");
 			if (s.pty && root?.terminalSessionsDir !== join(stateRoot, "terminal-sessions"))
 				profileProblem = "R9 did not resolve its terminal resume directory under scratch";
@@ -244,11 +255,14 @@ export async function runPaidCase(s: PaidScenario, options: CaseOptions): Promis
 	try {
 		const rows = evidence(c);
 		const actualRoutes = [...new Set(rows.flatMap(row => row.kind === "usage" && row.id === "Main" && row.source === "session" && row.tokens > 0 ? [row.model] : []))];
-		k.eq(actualRoutes, [model], "coordinator served every observed request on the configured model");
-		measured = spend(c, rows, true);
+		// If the PTY driver failed at startup, Main is still lazy: no input was
+		// sent, no transcript was created and startup has no paid predictions.
+		const preInputFailure = !!tty && k.failures.length > 0 && untouchedHubStartup(c, rows);
+		if (!preInputFailure) k.eq(actualRoutes, [model], "coordinator served every observed request on the configured model");
+		measured = preInputFailure ? { cost: 0 } : spend(c, rows, true);
 		if (measured.unknown) k.failures.push(measured.unknown);
 		if ((measured.cost ?? 0) > cap) k.failures.push(`settled usage $${measured.cost} exceeded cap $${cap} (in-flight bills can land after stop)`);
-		s.check(c, k);
+		if (!preInputFailure) s.check(c, k);
 	} catch (err) { k.failures.push(`checks: ${err}`); }
 	writeFileSync(join(T, "result.json"), `${JSON.stringify({ scenario: s.id, cap, model, effort: EFFORT, ...measured, swarm: c.swarm,
 		exitCode: c.code, profiles: { agentDir, trees: profileTrees }, failures: k.failures }, null, 2)}\n`);

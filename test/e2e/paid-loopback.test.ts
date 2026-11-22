@@ -1,12 +1,14 @@
 // The live host and paid checks on the loopback mock only. These are not paid receipts.
 // bun test test/e2e/paid-loopback.test.ts
 import { expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { resolveOmpBin } from "../../scripts/omp-bin.ts";
 import type { Rule, Script, ToolCallSpec } from "./mock-llm/server.ts";
-import { directBill, type Entry, evidence, jsonl } from "./paid-evidence.ts";
+import { directBill, type Entry, evidence, jsonl, type PaidCtx, type Trace } from "./paid-evidence.ts";
 import { HUB_DIRTY, HUB_MARKER } from "./paid-fixtures.ts";
-import { runPaidCase } from "./paid-runner.ts";
+import { runPaidCase, untouchedHubStartup } from "./paid-runner.ts";
 import { tool } from "./scenario.ts";
 import { NATIVE_PAID } from "./scenarios/paid-native.ts";
 
@@ -107,9 +109,32 @@ test("R11 direct bill excludes transcript mirrors, child aggregates and discarde
 	expect(directBill(journal, assistants)).toEqual({ cost: 7, unpriced: 1 });
 });
 
+test("R9 missing metrics prove zero spend only before any input and materialization", () => {
+	const T = mkdtempSync(join(tmpdir(), "swarm-r9-startup-"));
+	const sessionFile = join(T, "sessions", "main.jsonl");
+	const c: PaidCtx = { T, swarm: join(T, "sessions", "main", "swarm"), repo: join(T, "repo"),
+		trace: join(T, "evidence.jsonl"), stdout: "", stderr: "", code: 143 };
+	const rows: Trace[] = [
+		{ kind: "root", at: 1, swarm: c.swarm, sessionFile, agentDir: T, agentDb: join(T, "agent.db"), terminalSessionsDir: T },
+		{ kind: "ref", at: 1, id: "Main", generation: 1, status: "running", change: "initial", attached: true, sessionFile },
+	];
+	try {
+		expect(untouchedHubStartup(c, rows)).toBe(true);
+		expect(untouchedHubStartup(c, [])).toBe(false);
+		expect(untouchedHubStartup(c, [...rows, { kind: "harness", at: 2, action: "hub-launch-input" }])).toBe(false);
+		mkdirSync(join(T, "sessions"));
+		writeFileSync(sessionFile, "{}\n");
+		expect(untouchedHubStartup(c, rows)).toBe(false);
+	} finally {
+		rmSync(T, { recursive: true, force: true });
+	}
+});
+
 for (const scenario of NATIVE_PAID) {
 	test.skipIf(scenario.id === "R12" && process.platform !== "linux")(`${scenario.id} loopback smoke (no paid evidence)`, async () => {
 		const result = await runPaidCase(scenario, { omp: resolveOmpBin(), cap: 1, deadline: performance.now() + 55_000,
+			// Reproduce the paid profile's glyph, rather than relying on the loopback default.
+			loopbackSymbolPreset: scenario.id === "R9" ? "nerd" : undefined,
 			scoutOverride: scenario.id === "R11" ? "mock/worker-b:low" : undefined, loopback: scripts[scenario.id]! });
 		// The two model-route failures are intentional: loopback is not an authorized paid scout route.
 		const failures = result.k.failures.filter(f => !(scenario.id === "R11" && f.startsWith("actual priced usage on an approved route:")));

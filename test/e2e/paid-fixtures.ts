@@ -38,8 +38,9 @@ export function acceptedHubFinish(c: PaidCtx, trace: Trace[]): boolean {
 /** Real native Hub actions. No TSP hello, protocol input injection, or lifecycle calls. */
 export async function driveHub(p: PtyOmp, c: PaidCtx, prompt: string): Promise<void> {
 	const alive = () => p.proc.exitCode === null && p.proc.signalCode === null;
-	// The default status bar shows π in idle Main and the worker ID in a focused transcript.
-	const mainStatus = /(?:^|[\r\n])[ \t]*π\s*>\s*[^>\r\n]*(?:DeepSeek|Mock coord)/i;
+	// Idle Main shows the omp brand (Unicode, Nerd Font, or ASCII). A focused
+	// worker shows its native agent ID in that same slot, even on the same model.
+	const mainStatus = /(?:^|[\r\n])[ \t]*(?:π|\u{f0d57}|pi)\s*>\s*[^>\r\n]*(?:DeepSeek|Mock coord)/iu;
 	const submit = async (text: string): Promise<void> => {
 		if (text.startsWith("/")) await p.type(text);
 		else {
@@ -50,6 +51,9 @@ export async function driveHub(p: PtyOmp, c: PaidCtx, prompt: string): Promise<v
 	};
 	await until(() => evidence(c).some(row => row.kind === "root"), 20_000, "session startup", alive);
 	await p.waitFor(text => mainStatus.test(text), 15_000, "Main editor");
+	// Persist the dispatch boundary before sending input. A failed submit may
+	// still have reached omp, so all later failures need complete spend evidence.
+	mark(c, "hub-launch-input");
 	await submit(prompt);
 	await until(() => {
 		const trace = evidence(c);
