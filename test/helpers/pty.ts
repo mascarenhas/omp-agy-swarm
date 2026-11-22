@@ -21,31 +21,46 @@ interface ResumedNativeSession {
 	id: string;
 }
 
+/** An opt-in real launch uses the caller's paths/args/env and never starts a mock. */
+interface ExplicitLaunch {
+	root: string;
+	cwd: string;
+	argv: string[];
+	env: NodeJS.ProcessEnv;
+}
+
 export class PtyOmp {
 	readonly root: string;
 	readonly swarm: string;
-	readonly mock: MockLlm;
+	readonly #mock: MockLlm | undefined;
 	readonly resumeFile: string | undefined;
 	readonly debugSocket: string | undefined;
 	readonly proc: ReturnType<typeof Bun.spawn>;
 	#raw = Buffer.alloc(0);
 	#mark = 0;
 
-	constructor(script: Script, cols = 80, rows = 24, env: Record<string, string> = {}, persist: boolean | ResumedNativeSession = false) {
-		this.root = mkdtempSync(join(tmpdir(), "omp-swarm-pty-"));
-		const work = join(this.root, "work");
-		mkdirSync(work);
-		execFileSync("git", ["-C", work, "init", "-q"]);
+	constructor(script: Script, cols?: number, rows?: number, env?: Record<string, string>, persist?: boolean | ResumedNativeSession);
+	constructor(launch: ExplicitLaunch, cols?: number, rows?: number);
+	constructor(script: Script | ExplicitLaunch, cols = 80, rows = 24, env: Record<string, string> = {}, persist: boolean | ResumedNativeSession = false) {
+		const launch = "argv" in script && Array.isArray(script.argv) ? script as ExplicitLaunch : undefined;
+		this.root = launch?.root ?? mkdtempSync(join(tmpdir(), "omp-swarm-pty-"));
+		const work = launch?.cwd ?? join(this.root, "work");
+		if (!launch) {
+			mkdirSync(work);
+			execFileSync("git", ["-C", work, "init", "-q"]);
+		}
 		const agent = join(this.root, "agent");
-		mkdirSync(agent);
-		// No first-run wizard, splash or update check in the isolated agent dir; fast retries.
-		writeFileSync(
-			join(agent, "config.yml"),
-			"startup:\n  setupWizard: false\n  showSplash: false\n  checkUpdate: false\nretry:\n  maxRetries: 1\n  baseDelayMs: 20\n",
-		);
+		if (!launch) {
+			mkdirSync(agent);
+			// No first-run wizard, splash or update check in the isolated agent dir; fast retries.
+			writeFileSync(
+				join(agent, "config.yml"),
+				"startup:\n  setupWizard: false\n  showSplash: false\n  checkUpdate: false\nretry:\n  maxRetries: 1\n  baseDelayMs: 20\n",
+			);
+		}
 		this.swarm = join(this.root, "swarm");
 		const home = join(this.root, "home");
-		mkdirSync(home);
+		if (!launch) mkdirSync(home);
 		const native = typeof persist === "object";
 		const cliArgs: string[] = persist ? [] : ["--no-session"];
 		if (native) {
@@ -62,7 +77,7 @@ export class PtyOmp {
 			].map(entry => JSON.stringify(entry)).join("\n") + "\n");
 			cliArgs.push("--session", this.resumeFile, "--session-dir", alias);
 		}
-		const childEnv: Record<string, string | undefined> = {
+		const childEnv: Record<string, string | undefined> = launch ? { ...launch.env, TERM: "xterm-256color", TERM_PROGRAM: "" } : {
 			...process.env,
 			PATH: stripNodeModulesBins(process.env.PATH),
 			TERM: "xterm-256color",
@@ -84,13 +99,14 @@ export class PtyOmp {
 			childEnv.TERM_PROGRAM = "tern";
 			childEnv.OMP_TUI_DEBUG = this.debugSocket;
 		}
-		this.mock = new MockLlm(script, join(this.root, "mock.jsonl"));
-		const port = this.mock.start();
-		childEnv.MOCK_PORT = String(port);
+		if (!launch) {
+			this.#mock = new MockLlm(script as Script, join(this.root, "mock.jsonl"));
+			childEnv.MOCK_PORT = String(this.#mock.start());
+		}
 		let tspCarry = "";
 		const hello = encodeTspJson("r", { r: "hello", v: TSP_VERSION, term: "tern", kinds: TSP_KINDS, features: ["tray"], cols, dark: true, credits: 64 });
 		this.proc = Bun.spawn(
-			[resolveOmpBin(), "--model", "mock/coord", "--thinking", "low", ...cliArgs, "--no-extensions", "--no-title", "-e", REPO, "-e", PROVIDER],
+			launch?.argv ?? [resolveOmpBin(), "--model", "mock/coord", "--thinking", "low", ...cliArgs, "--no-extensions", "--no-title", "-e", REPO, "-e", PROVIDER],
 			{
 				cwd: work,
 				env: childEnv,
@@ -170,6 +186,11 @@ export class PtyOmp {
 		throw new Error(`timed out waiting for ${what}; document tail: ${JSON.stringify(doc)?.slice(-3000)}`);
 	}
 
+	get mock(): MockLlm {
+		if (!this.#mock) throw new Error("explicit PTY launches do not have a mock provider");
+		return this.#mock;
+	}
+
 	get raw(): string {
 		return this.#raw.toString("utf8");
 	}
@@ -225,8 +246,10 @@ export class PtyOmp {
 			this.proc.kill("SIGKILL");
 		} catch {}
 		this.proc.terminal?.close();
-		this.mock.stop();
-		if (process.env.PTY_KEEP) writeFileSync(join(this.root, "raw.txt"), this.#raw);
-		else rmSync(this.root, { recursive: true, force: true });
+		if (this.#mock) {
+			this.#mock.stop();
+			if (process.env.PTY_KEEP) writeFileSync(join(this.root, "raw.txt"), this.#raw);
+			else rmSync(this.root, { recursive: true, force: true });
+		}
 	}
 }

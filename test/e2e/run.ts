@@ -8,9 +8,10 @@ import { join } from "node:path";
 import { resolveOmpBin } from "../../scripts/omp-bin.ts";
 import { Checks, type Ctx, treeHash } from "./check.ts";
 import { MockLlm } from "./mock-llm/server.ts";
+import { planPaid, runPaid } from "./paid-runner.ts";
 import { runOmp, type Scenario } from "./scenario.ts";
 import { DETERMINISTIC } from "./scenarios/deterministic.ts";
-import { PAID, runPaid } from "./scenarios/paid.ts";
+import { PAID } from "./scenarios/paid.ts";
 
 function fixtureRepo(repo: string): void {
 	mkdirSync(repo, { recursive: true });
@@ -81,6 +82,9 @@ async function runScenario(s: Scenario, keep: boolean): Promise<{ ok: boolean; m
 
 const args = process.argv.slice(2);
 const keep = args.includes("--keep");
+if (args.includes("--paid-plan")) {
+	process.exit(planPaid(args.filter(a => !a.startsWith("--")), PAID));
+}
 if (args.includes("--paid")) {
 	process.exit(await runPaid(args.filter(a => !a.startsWith("--")), PAID));
 }
