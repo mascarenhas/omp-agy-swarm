@@ -155,7 +155,15 @@ const R11: PaidScenario = {
 		const reported = m?.members.finder?.cost;
 		k.ok(direct.cost > 0 && !direct.unpriced && reported !== undefined && reported > direct.cost, "positive descendant billing above worker's own direct spend");
 		k.ok(near(reported, direct.cost + childCost), `worker direct + each scout direct exactly once: ${direct.cost} + ${childCost}; metrics ${reported}`);
-		k.ok(near(m?.spend.cost, direct.cost + childCost + (m?.coordinator?.cost ?? NaN), 0.000001 + 1e-10), "swarm total includes subtree without altering coordinator's bill");
+		// The first successful swarm operation creates accounting; its own preceding
+		// assistant request runs before the runtime exists and is not a swarm charge.
+		const admission = trace.findIndex(r => r.kind === "event" && r.id === "Main" && r.tool === "swarm" &&
+			r.event === "tool_execution_end" && !r.isError);
+		const mainCost = trace.slice(admission + 1).reduce((sum, r) => sum +
+			(r.kind === "usage" && r.id === "Main" && r.source === "session" ? r.cost ?? 0 : 0), 0);
+		k.ok(admission >= 0 && mainCost > 0 && near(m?.coordinator?.cost, mainCost),
+			`Main received none of the scout charge: observed direct ${mainCost}; metrics ${m?.coordinator?.cost}`);
+		k.ok(near(m?.spend.cost, direct.cost + childCost + mainCost), "swarm total includes each direct bill exactly once");
 		k.eq(m?.spend.unknown, undefined, "no unknown price on this priced route");
 	},
 };
