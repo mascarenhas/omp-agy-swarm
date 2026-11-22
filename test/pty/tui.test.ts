@@ -1,6 +1,9 @@
 // PTY tests (§12.4): a real omp TUI with the plugin and the scripted mock provider.
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import type { RosterFile } from "../../src/board/types.ts";
 import type { Script } from "../e2e/mock-llm/server.ts";
 import { PtyOmp } from "../helpers/pty.ts";
 
@@ -74,6 +77,83 @@ async function verifyOpenBoard(p: PtyOmp, url: string): Promise<void> {
 }
 
 describe("omp TUI with the swarm plugin", () => {
+	test("persisted Main's Agent Hub focuses the worker's native transcript without agent profiles", async () => {
+		const privateResponse = "LENS-PRIVATE-TRANSCRIPT-5d91";
+		t = new PtyOmp({
+			coord: {
+				rules: [
+					{ when: "^user:.*focus-worker$", reply: { tools: [{ name: "swarm", args: { action: "add", name: "lens", brief: "Return your observations privately.", model: "mock/worker-a" } }] } },
+					{ when: '"added"', reply: { text: "LENS-STARTED" } },
+				],
+			},
+			"worker-a": { rules: [{ when: "You are `lens`", reply: { text: privateResponse } }] },
+		}, 128, 36, {}, true);
+		const agents = join(t.root, "agent", "agents");
+		expect(existsSync(agents)).toBe(false);
+		await t.waitFor(text => text.includes("coord"), 20_000, "coordinator editor");
+		await submit(t, "focus-worker");
+		await t.waitFor(text => text.includes("LENS-STARTED"), 20_000, "swarm add returned to Main");
+		expect(existsSync(agents)).toBe(false);
+		expect(t.since()).not.toContain(privateResponse);
+
+		t.mark();
+		await submit(t, "/clear");
+		await t.waitFor(text => text.includes("Context reset") && text.includes("session continues"), 10_000, "in-place clear");
+
+		t.mark();
+		await submit(t, "/hub");
+		await t.waitFor(text => text.includes("Activity") && text.includes("Agents"), 10_000, "Agent Hub tabs");
+		t.mark();
+		t.write("1");
+		await t.waitFor(text => text.includes("swarm~lens"), 10_000, "live worker in the in-session Agents roster");
+		t.mark();
+		t.write("\r");
+		await t.waitFor(text => text.includes(privateResponse) && text.includes("swarm~lens"), 15_000, "focused worker transcript and status line");
+		expect(existsSync(agents)).toBe(false);
+
+		t.mark();
+		t.write("\x1b");
+		await t.waitFor(text => text.includes("Mock coord"), 5_000, "return to Main");
+		await submit(t, "/quit");
+		await t.waitFor(() => t?.proc.exitCode !== null, 10_000, "graceful shutdown");
+		expect(t.proc.exitCode).toBe(0);
+		expect(existsSync(agents)).toBe(false);
+	}, 90_000);
+
+	test("resumed symlinked Main lists its live worker in the native Tern Hub", async () => {
+		const id = "01a2046a-8e38-7599-87c0-a60158933f7b";
+		t = new PtyOmp({
+			coord: {
+				rules: [
+					{ when: "^user:.*start-native-hub$", reply: { tools: [{ name: "swarm", args: { action: "add", name: "lens", brief: "Wait on the board.", model: "mock/worker-a" } }] } },
+					{ when: '"added"', reply: { text: "NATIVE-HUB-STARTED" } },
+				],
+			},
+			"worker-a": { rules: [], default: { tools: [{ name: "swarm_wait" }] } },
+		}, 128, 36, {}, { id });
+		const resumeFile = t.resumeFile!;
+		const root = resumeFile.slice(0, -".jsonl".length);
+		expect(realpathSync(resumeFile)).not.toBe(resumeFile);
+		await t.waitForNative(doc => JSON.stringify(doc ?? "").includes("Seeded resumed Main transcript"), "resumed Main");
+		await submit(t, "start-native-hub");
+		await t.waitForNative(doc => {
+			const text = JSON.stringify(doc ?? "");
+			return text.includes("NATIVE-HUB-STARTED") && text.includes('"ref":"swarm~lens"') && text.includes("waiting on board");
+		}, "worker parked in the native Tray");
+		const roster = JSON.parse(readFileSync(join(root, "swarm", "members.json"), "utf8")) as RosterFile;
+		expect(roster.id).toBe(id);
+		expect(roster.members.lens?.agent_id).toBe("swarm~lens");
+		await submit(t, "/hub");
+		await t.waitForNative(doc => JSON.stringify(doc ?? "").includes('"tab":"activity"'), "native Agent Hub Activity tab");
+		t.write("1");
+		await t.waitForNative(doc => {
+			const text = JSON.stringify(doc ?? "");
+			return text.includes('"tab":"agents"') && text.includes('"id":"swarm~lens"');
+		}, "native Agent Hub Agents roster");
+		t.write("\r");
+		await t.waitForNative(doc => JSON.stringify(doc ?? "").includes("Message swarm~lens"), "native worker focus");
+	}, 60_000);
+
 	test("/swarm with no swarm, then an idle coordinator woken by a worker; widget; overlay at 80×24 → 40×12; escapes sanitized", async () => {
 		t = new PtyOmp(script());
 		await ready(t);

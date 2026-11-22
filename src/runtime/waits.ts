@@ -19,6 +19,7 @@ export function claim(rt: SwarmRuntime, m: Member, waitId: string, reason: Claim
 	if (m.phase === "parked") m.phase = "resuming";
 	m.wakeMode = "working";
 	m.waitUntil = null;
+	m.session?.setBoardWait(w.id, false);
 	w.resolve(reason);
 	rt.keepAlive();
 	rt.changed();
@@ -56,6 +57,7 @@ export function arm(rt: SwarmRuntime, m: Member, o: ArmOptions): { waiter: Waite
 	m.wakeMode = o.mode;
 	m.waitSince = m.lastReadSeq;
 	m.waitUntil = waiter.deadline ?? null;
+	m.session?.setBoardWait(waiter.id, true);
 	if (o.timeoutSeconds !== undefined) {
 		waiter.timer = setTimeout(() => claim(rt, m, waiter.id, "timeout"), o.timeoutSeconds * 1000);
 	}

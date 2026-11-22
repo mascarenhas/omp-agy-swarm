@@ -42,7 +42,7 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 	};
 
 	const deps = (b: CoordinatorBinding): RuntimeDeps => ({
-		makeFactory: () => createSessionFactory(b, log),
+		makeFactory: () => createSessionFactory(b, pi.events, log),
 		caps: thinkingCaps,
 		makeMemberTools: (rt, m, gen) => makeMemberTools(rt, m, gen, { schemas, caps: thinkingCaps, binding: () => rt.binding }),
 		packageDir: PACKAGE_DIR,

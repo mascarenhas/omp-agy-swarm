@@ -50,6 +50,7 @@ let callSeq = 0;
 let entrySeq = 0;
 
 export class ScriptedSession implements WorkerSession {
+	readonly agentId: string;
 	readonly sessionId: string;
 	readonly sessionFile: string | undefined;
 	readonly name: string;
@@ -57,6 +58,9 @@ export class ScriptedSession implements WorkerSession {
 	thinkingLevel: string | undefined;
 	readonly tools: Map<string, CustomToolLike>;
 	readonly #listeners = new Set<(e: WorkerEvent) => void>();
+	readonly #runListeners = new Set<(state: "running" | "idle") => void>();
+	readonly waitTransitions: { id: string; waiting: boolean }[] = [];
+	readonly teardown: string[] = [];
 	readonly #factory: ScriptedFactory;
 	readonly entries: TranscriptEntry[] = [];
 	#run: { ac: AbortController; done: Promise<void> } | undefined;
@@ -71,6 +75,7 @@ export class ScriptedSession implements WorkerSession {
 		this.#factory = factory;
 		this.opts = opts;
 		this.name = opts.name;
+		this.agentId = factory.resolvedIds.get(opts.name) ?? opts.agentId;
 		this.sessionId = id;
 		this.sessionFile = `${opts.sessionsDir}/${id}.jsonl`;
 		this.model = opts.model;
@@ -89,6 +94,15 @@ export class ScriptedSession implements WorkerSession {
 	subscribe(listener: (event: WorkerEvent) => void): () => void {
 		this.#listeners.add(listener);
 		return () => this.#listeners.delete(listener);
+	}
+
+	subscribeRunState(listener: (state: "running" | "idle") => void): () => void {
+		this.#runListeners.add(listener);
+		return () => this.#runListeners.delete(listener);
+	}
+
+	setBoardWait(id: string, waiting: boolean): void {
+		this.waitTransitions.push({ id, waiting });
 	}
 
 	#entry(message: HostMessage): void {
@@ -110,6 +124,7 @@ export class ScriptedSession implements WorkerSession {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#run = { ac, done: promise };
 		this.inputs.push(input);
+		for (const listener of this.#runListeners) listener("running");
 		this.emit({ type: "agent_start" });
 		this.emit({ type: "message_start", message: receipt });
 		this.emit({ type: "message_end", message: receipt });
@@ -181,6 +196,7 @@ export class ScriptedSession implements WorkerSession {
 		this.#entry(this.#last);
 		this.emit({ type: "turn_end" });
 		this.#run = undefined;
+		for (const listener of this.#runListeners) listener("idle");
 		this.emit({ type: "agent_end" });
 		resolve();
 	}
@@ -212,6 +228,7 @@ export class ScriptedSession implements WorkerSession {
 	}
 
 	async abort(): Promise<void> {
+		this.teardown.push("abort");
 		const r = this.#run;
 		if (!r) return;
 		r.ac.abort();
@@ -244,10 +261,29 @@ export class ScriptedSession implements WorkerSession {
 		return this.entries;
 	}
 
-	beginDispose(): void {}
+	async stop(): Promise<void> {
+		await this.abort();
+		await this.dispose();
+	}
+
+	hostKill(): void {
+		this.teardown.push("hostKill");
+		this.opts.onHostKill(this);
+	}
+
+	async hostRelease(killed: boolean): Promise<void> {
+		const disposed = Promise.resolve().then(() => this.dispose());
+		if (!killed) this.opts.onHostDispose(this, false, disposed.then(() => this.waitForIdle()));
+		await disposed;
+		this.teardown.push("hostRelease");
+		if (killed) this.opts.onHostRelease(() => this.waitForIdle());
+	}
 
 	async dispose(): Promise<void> {
+		this.teardown.push("dispose");
 		if (this.#factory.disposeHangs.has(this.name)) return new Promise(() => {});
+		const gate = this.#factory.disposeGates.get(this.name);
+		if (gate) await gate;
 		this.disposed = true;
 		this.#run?.ac.abort();
 	}
@@ -256,12 +292,14 @@ export class ScriptedSession implements WorkerSession {
 export class ScriptedFactory implements SessionFactory {
 	readonly brains = new Map<string, Brain>();
 	readonly sessions = new Map<string, ScriptedSession>();
+	readonly resolvedIds = new Map<string, string>();
 	readonly all: ScriptedSession[] = [];
 	readonly created: CreateWorkerOptions[] = [];
 	readonly sent: { name: string; message: CustomWakeMessage }[] = [];
 	readonly sendModes = new Map<string, SendMode[]>();
 	readonly switchModes = new Map<string, string>();
 	readonly disposeHangs = new Set<string>();
+	readonly disposeGates = new Map<string, Promise<void>>();
 	/** Gates construction per name (resolve to let it finish). */
 	readonly gates = new Map<string, Promise<void>>();
 	readonly failCreate = new Map<string, string>();

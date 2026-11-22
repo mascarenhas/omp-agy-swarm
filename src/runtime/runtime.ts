@@ -21,10 +21,11 @@ import { LIMITS, raceTimeout, type SwarmEnv, TIMING } from "../env.ts";
 import { messageText } from "./activity.ts";
 import { acknowledge, handoffPrompt, reconcile, release, wakePendingFor } from "./delivery.ts";
 import { completionLabel, declareIncomplete, evaluateQuiescence, liveTaskWork, owed } from "./gate.ts";
-import { type Member, memberFromRecord, Member as MemberClass, type Op, type OpKind, roleDefaultMode } from "./member.ts";
+import { type Member, memberFromRecord, Member as MemberClass, type Op, type OpKind, preferredAgentId, roleDefaultMode } from "./member.ts";
 import { applyCoordinatorSwitch, QuotaCache } from "./models.ts";
 import {
 	type CoordinatorPort,
+	type CreateWorkerOptions,
 	type HostMessage,
 	modelKey,
 	type ModelInfo,
@@ -32,6 +33,7 @@ import {
 	type SessionFactory,
 	type ThinkingCaps,
 	type WorkerSession,
+	WorkerStartupUnstopped,
 } from "./ports.ts";
 import { compactedReminder, deliveryIdOf, onWorkerEvent } from "./settle.ts";
 import { claim } from "./waits.ts";
@@ -146,6 +148,7 @@ export class SwarmRuntime {
 	#activityTimer: Timer | undefined;
 	#keepAlive: Timer | undefined;
 	#quiescenceQueued = false;
+	#rootShutdownHadLiveWork = false;
 	#noticeSeq = 0;
 	#spendNotified = false;
 	/** Why the spend is unknown under a ceiling (a priced-less message used tokens); fails closed. */
@@ -561,14 +564,11 @@ export class SwarmRuntime {
 	 * background, and the member is left stopped (revivable from its transcript).
 	 */
 	#fenceUnstopped(m: Member, session: WorkerSession): void {
-		m.gen++;
-		m.unsubscribe?.();
-		m.unsubscribe = undefined;
-		if (m.session === session) m.session = undefined;
-		if (m.waiter) claim(this, m, m.waiter.id, "aborted");
+		if (m.session !== session) return;
+		this.#detachMember(m, "aborted");
 		m.phase = "stopped";
 		m.failure = { kind: "error", text: "did not stop when finish abandoned its work", at: new Date().toISOString(), at_seq: this.board.head, count: (m.failure?.count ?? 0) + 1 };
-		void session.dispose().catch(() => {});
+		this.#trackDrain(m, session.dispose());
 		this.flushStructural();
 		this.changed();
 	}
@@ -736,7 +736,7 @@ export class SwarmRuntime {
 			m.channels = group.channels ?? null;
 			m.model = modelKey(group.model);
 			m.effort = group.effort ?? "";
-			m.agentId = `swarm-${this.sid}-${spec.name}`;
+			m.agentId = preferredAgentId(spec.name);
 			m.authorized = true;
 			this.members.set(spec.name, m);
 			this.board.seedStoredSet(spec.name, m.channels);
@@ -820,6 +820,9 @@ export class SwarmRuntime {
 				name: m.name,
 				role: m.role === "narrator" || m.role === "monitor" ? m.role : "worker",
 				agentId: m.agentId,
+				brief: m.task || m.brief,
+				signal: op.abort.signal,
+				...this.#hostHooks(m, op.gen),
 				cwd: ws.path,
 				sessionsDir: join(this.dir, "sessions"),
 				model,
@@ -842,12 +845,15 @@ export class SwarmRuntime {
 			return true;
 		} catch (err) {
 			const cancelled = err instanceof OpCancelled || !this.opValid(m, op);
-			if (session && !m.session) void session.dispose().catch(() => {});
+			if (err instanceof WorkerStartupUnstopped) op.disposal = err.disposal;
+			if (session && !m.session) {
+				op.disposal = session.dispose();
+				await settleWithin(op.disposal, TIMING.killStopMs);
+			}
 			if (cancelled) {
-				if (m.session === session && session && (m.killed || this.closing)) {
-					/* kill/shutdown own the session now */
-				}
-				if (!m.killed && !this.closing && op.cancelled && m.phase !== "killed") {
+				if (m.killed || this.closing || m.gen !== op.gen) return null;
+				if (op.cancelled && m.phase !== "killed") {
+					if (op.disposal) this.#trackDrain(m, op.disposal);
 					m.phase = "stopped";
 					m.failure = { kind: "start", text: "abandoned before its session started", at: new Date().toISOString(), at_seq: this.board.head, count: 1 };
 					this.flushStructural();
@@ -857,9 +863,20 @@ export class SwarmRuntime {
 			}
 			// Construction failed: free the name and slot; remove a worktree nobody used.
 			if (m.session) {
-				m.unsubscribe?.();
-				void m.session.dispose().catch(() => {});
-				m.session = undefined;
+				const live = m.session;
+				this.#detachMember(m, "closing");
+				op.disposal = live.dispose();
+				if (await settleWithin(op.disposal, TIMING.killStopMs)) op.disposal = undefined;
+				if (m.killed || this.closing) return null;
+			}
+			if (op.disposal) {
+				m.op = undefined;
+				m.phase = "stopped";
+				m.failure = { kind: "start", text: "session construction failed and did not stop in time", at: new Date().toISOString(), at_seq: this.board.head, count: 1 };
+				this.#trackDrain(m, op.disposal);
+				this.flushStructural();
+				this.changed();
+				return m.failure.text;
 			}
 			if (ws && ws.mode !== "inherit") await discardFreshWorktree(this.deps.git, ws).catch(() => {});
 			this.members.delete(m.name);
@@ -897,6 +914,7 @@ export class SwarmRuntime {
 	}
 
 	#attachSession(m: Member, session: WorkerSession, gen: number): void {
+		m.agentId = session.agentId;
 		m.session = session;
 		m.conversationId = session.sessionId;
 		m.sessionFile = session.sessionFile ? basename(session.sessionFile) : null;
@@ -905,51 +923,115 @@ export class SwarmRuntime {
 		m.expectedModel = m.model;
 		m.expectedEffort = m.effort;
 		m.stoppedCleanly = false;
+		m.drain = undefined;
 		m.unsubscribe = session.subscribe(ev => onWorkerEvent(this, m, gen, ev));
+		this.flushStructural();
 	}
 
 	// -------------------------------------------------------------------------
 	// kill (§6.10 with SW-06)
 	// -------------------------------------------------------------------------
 
-	async kill(m: Member, opts: { discardIgnored: boolean; keepWorkspace: boolean }): Promise<DisposeResult | null> {
-		if (!m.killed) {
-			const pendingOp = m.opSettled;
+	kill(m: Member, opts: { discardIgnored: boolean; keepWorkspace: boolean }): Promise<DisposeResult | null> {
+		if (m.killPromise) return m.killPromise;
+		const session = m.session;
+		const pending = m.opSettled;
+		const op = m.op;
+		const drain = m.drain?.promise;
+		return this.#startKill(m, opts, m.killed ? undefined : async () => {
+			await Promise.all([session?.stop(), pending, drain]);
+			await op?.disposal;
+		});
+	}
+
+	#hostHooks(m: Member, gen: number): Pick<CreateWorkerOptions, "onHostKill" | "onHostDispose" | "onHostRelease"> {
+		const current = (): boolean => !this.closing && !m.killed && m.gen === gen && this.members.get(m.name) === m;
+		const release = Promise.withResolvers<() => Promise<void>>();
+		return {
+			onHostKill: identity => {
+				if (!current()) return;
+				m.agentId = identity.agentId;
+				m.conversationId = identity.sessionId;
+				m.sessionFile = identity.sessionFile ? basename(identity.sessionFile) : m.sessionFile;
+				const pending = m.opSettled;
+				const op = m.op;
+				const stopped = release.promise.then(async confirmIdle => {
+					await pending;
+					await op?.disposal;
+					await confirmIdle();
+				});
+				void this.#startKill(m, { discardIgnored: false, keepWorkspace: false }, () => stopped)
+					.catch(err => this.log(`omp-agy-swarm: ${m.name}: native stop cleanup: ${String(err)}`));
+				this.coordinatorNotice("worker_stopped", `${m.name} was stopped in omp and permanently killed in the swarm.`);
+			},
+			onHostDispose: (identity, rootClosing, closed) => {
+				if (!current()) return;
+				if (rootClosing && !this.#rootShutdownHadLiveWork) this.#rootShutdownHadLiveWork = liveTaskWork(this).includes(m);
+				m.agentId = identity.agentId;
+				m.conversationId = identity.sessionId;
+				m.sessionFile = identity.sessionFile ? basename(identity.sessionFile) : m.sessionFile;
+				if (m.phase === "parked") m.lastPark = { mode: m.wakeMode, since: m.waitSince, until: m.waitUntil };
+				const pending = m.opSettled;
+				this.#trackDrain(m, closed.finally(async () => { await pending; }));
+				this.#detachMember(m, "closing");
+				m.phase = "stopped";
+				this.flushStructural();
+				this.changed();
+			},
+			onHostRelease: release.resolve,
+		};
+	}
+
+	#trackDrain(m: Member, promise: Promise<void>): void {
+		const drain = { promise, pending: true };
+		m.drain = drain;
+		void promise.then(() => {
+			if (m.drain === drain) m.drain = undefined;
+		}, () => { drain.pending = false; });
+	}
+
+	#detachMember(m: Member, reason: "closing" | "killed" | "aborted"): void {
+		m.gen++;
+		this.#cancelOp(m);
+		m.unsubscribe?.();
+		m.unsubscribe = undefined;
+		if (m.delivery) clearTimeout(m.delivery.receiptTimer);
+		m.delivery = undefined;
+		m.pendingSwitch = undefined;
+		m.nudgePending = false;
+		clearTimeout(m.reconcileTimer);
+		m.reconcileTimer = undefined;
+		if (m.waiter) claim(this, m, m.waiter.id, reason);
+		m.session = undefined;
+	}
+
+	#startKill(m: Member, opts: { discardIgnored: boolean; keepWorkspace: boolean }, stop?: () => Promise<void>): Promise<DisposeResult | null> {
+		const result = Promise.withResolvers<DisposeResult | null>();
+		m.killPromise = result.promise; // Install before notifying listeners or cancelling a pending create.
+		let stopped: Promise<boolean> | undefined;
+		if (stop) {
 			m.killed = true;
 			m.killedAt = new Date().toISOString();
 			m.killedSeq = this.board.head;
-			m.gen++;
-			this.#cancelOp(m);
-			const d = m.delivery;
-			if (d) clearTimeout(d.receiptTimer);
-			m.delivery = undefined;
 			m.notices = [];
-			m.pendingSwitch = undefined;
-			m.nudgePending = false;
-			clearTimeout(m.reconcileTimer);
-			m.reconcileTimer = undefined;
-			if (m.waiter) claim(this, m, m.waiter.id, "killed");
+			this.#detachMember(m, "killed");
 			m.phase = "killed";
 			this.flushStructural();
+			const confirmed = stop().then(() => { m.stoppedCleanly = true; });
+			stopped = settleWithin(confirmed, TIMING.killStopMs);
 			this.changed();
-			const session = m.session;
-			m.unsubscribe?.();
-			m.unsubscribe = undefined;
-			m.stopPromise = (async () => {
-				let ok = true;
-				if (pendingOp) ok = await settleWithin(pendingOp, TIMING.killStopMs);
-				if (!session) return ok;
-				const stopped = settleWithin(
-					session.abort().then(() => session.dispose()),
-					TIMING.killStopMs,
-				);
-				return (await stopped) && ok;
-			})();
 		}
-		m.stoppedCleanly = (await m.stopPromise) ?? true;
-		const res = await this.#disposeWs(m, opts);
-		this.#reevaluateRetainedForDependents();
-		return res;
+		Promise.resolve().then(async () => {
+			await stopped;
+			if (this.closing) return null;
+			const res = await this.#disposeWs(m, opts);
+			if (!this.closing) this.#reevaluateRetainedForDependents();
+			return res;
+		}).then(
+			value => { m.killPromise = undefined; result.resolve(value); },
+			err => { m.killPromise = undefined; result.reject(err); },
+		);
+		return result.promise;
 	}
 
 	#dependentsOf(m: Member): string[] {
@@ -970,6 +1052,7 @@ export class SwarmRuntime {
 			stoppedCleanly: m.stoppedCleanly,
 		});
 		if (!res) return null;
+		if (this.closing) return res;
 		m.workspace.state = res.state;
 		const idx = this.retained.findIndex(r => r.name === m.name);
 		if (idx >= 0) this.retained.splice(idx, 1);
@@ -1006,6 +1089,7 @@ export class SwarmRuntime {
 		if (m.killed) return "killed";
 		if (m.op) return m.op.kind === "revive" ? "already reviving" : `busy (${m.op.kind})`;
 		if (m.phase !== "stopped") return `not stopped (${m.state})`;
+		if (m.drain?.pending) return "the previous session has not finished closing";
 		if (m.failure?.kind === "lost") return `lost: ${m.failure.text}`;
 		if (m.failure?.kind === "start" || !m.conversationId || !m.sessionFile) return "never started: kill it and add a replacement";
 		if (this.spendExceeded()) return "the spend ceiling was reached";
@@ -1038,7 +1122,10 @@ export class SwarmRuntime {
 			session = await this.factory.create({
 				name: m.name,
 				role: m.role === "narrator" || m.role === "monitor" ? m.role : "worker",
-				agentId: m.agentId || `swarm-${this.sid}-${m.name}`,
+				agentId: m.agentId,
+				brief: m.task || m.brief,
+				signal: op.abort.signal,
+				...this.#hostHooks(m, op.gen),
 				cwd: m.workspace.path,
 				sessionsDir: join(this.dir, "sessions"),
 				model,
@@ -1050,12 +1137,19 @@ export class SwarmRuntime {
 				enableLsp: m.role === "worker",
 			});
 		} catch (err) {
+			if (err instanceof WorkerStartupUnstopped) {
+				op.disposal = err.disposal;
+				if (this.opValid(m, op)) this.#trackDrain(m, op.disposal);
+				return fail("error", err.message);
+			}
 			const text = err instanceof Error ? err.message : String(err);
 			const lost = /ENOENT|no such file|missing|does not match|conversation/i.test(text);
 			return fail(lost ? "lost" : "error", lost ? `transcript missing or mismatched: ${text}` : text);
 		}
 		if (!this.opValid(m, op)) {
-			void session.dispose().catch(() => {});
+			op.disposal = session.dispose();
+			if (!m.killed && !this.closing && m.gen === op.gen) this.#trackDrain(m, op.disposal);
+			await settleWithin(op.disposal, TIMING.killStopMs);
 			return;
 		}
 		this.#attachSession(m, session, op.gen);
@@ -1306,6 +1400,7 @@ export class SwarmRuntime {
 		const lastSeq = posts[posts.length - 1];
 		const row: Record<string, unknown> = {
 			name: m.name,
+			agent_id: m.agentId,
 			role: m.role,
 			state: m.state,
 			detail: m.detail,
@@ -1356,7 +1451,7 @@ export class SwarmRuntime {
 
 	async shutdown(): Promise<void> {
 		if (this.closing) return;
-		if (!this.outcome && liveTaskWork(this).length) {
+		if (!this.outcome && (this.#rootShutdownHadLiveWork || liveTaskWork(this).length)) {
 			this.outcome = { value: "aborted", reason: "shutdown with live work", at: new Date().toISOString(), terminal: true };
 		}
 		this.closing = true;
@@ -1369,7 +1464,7 @@ export class SwarmRuntime {
 		// Checkpoint first, so parks and states are recorded as they were (last_park on reload).
 		this.#writeRoster(true);
 		this.writeMetrics();
-		const sessions: WorkerSession[] = [];
+		const disposals: Promise<void>[] = [];
 		for (const m of this.members.values()) {
 			this.#cancelOp(m);
 			if (m.waiter) claim(this, m, m.waiter.id, "closing");
@@ -1378,12 +1473,9 @@ export class SwarmRuntime {
 			if (d) clearTimeout(d.receiptTimer);
 			m.unsubscribe?.();
 			m.unsubscribe = undefined;
-			if (m.session) {
-				try {
-					m.session.beginDispose();
-				} catch {}
-				sessions.push(m.session);
-			}
+			const session = m.session;
+			m.session = undefined;
+			if (session) disposals.push(session.dispose());
 		}
 		for (const w of [...this.#versionWaiters]) w();
 		if (this.ephemeral) {
@@ -1393,7 +1485,7 @@ export class SwarmRuntime {
 		}
 		this.store.close();
 		this.#listeners.clear();
-		await raceTimeout(Promise.allSettled(sessions.map(s => s.dispose())), TIMING.shutdownDisposeMs, undefined, { unref: true });
+		await raceTimeout(Promise.allSettled(disposals), TIMING.shutdownDisposeMs, undefined, { unref: true });
 	}
 }
 

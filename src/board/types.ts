@@ -103,6 +103,7 @@ export interface MemberStats {
 export interface MemberRecord {
 	role: Role;
 	conversation_id: string;
+	/** Native registry id, independent of conversation_id; absent in older v1 rosters. */
 	agent_id?: string;
 	gen?: number;
 	model: string;

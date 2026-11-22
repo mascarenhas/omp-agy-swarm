@@ -12,6 +12,7 @@
     "@oh-my-pi/pi-coding-agent": "19.1.0",
     "@oh-my-pi/pi-tui": "19.1.0",
     "@oh-my-pi/pi-utils": "19.1.0",
+    "@oh-my-pi/pi-wire": "19.1.0",
     "@types/bun": "1.4.5",
     "playwright-core": "1.65.1",
     "typescript": "5.9.3"

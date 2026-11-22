@@ -100,6 +100,7 @@ export interface TranscriptEntry {
 }
 
 export interface WorkerSession {
+	readonly agentId: string;
 	readonly sessionId: string;
 	readonly sessionFile: string | undefined;
 	readonly model: ModelInfo | undefined;
@@ -117,7 +118,9 @@ export interface WorkerSession {
 	getLastAssistantMessage(): HostMessage | undefined;
 	/** Current-branch entries (live transcript source). */
 	branchEntries(): readonly TranscriptEntry[];
-	beginDispose(): void;
+	setBoardWait(waitId: string, waiting: boolean): void;
+	/** Explicit swarm kill. Other disposal paths leave the member revivable. */
+	stop(): Promise<void>;
 	dispose(): Promise<void>;
 }
 
@@ -126,10 +129,31 @@ export type SessionMode =
 	| { kind: "revive"; file: string; conversationId: string }
 	| { kind: "fork"; sourceFile: string };
 
+export interface WorkerIdentity {
+	agentId: string;
+	sessionId: string;
+	sessionFile: string | undefined;
+}
+
+/** Startup failed and its raw session has not confirmed that it stopped. */
+export class WorkerStartupUnstopped extends Error {
+	constructor(cause: unknown, readonly disposal: Promise<void>) {
+		super(`session startup failed without confirming disposal: ${String(cause)}`, { cause });
+	}
+}
+
 export interface CreateWorkerOptions {
 	name: string;
 	role: "worker" | "narrator" | "monitor";
 	agentId: string;
+	brief: string;
+	signal: AbortSignal;
+	/** Synchronous fence from the owned, detached registry tombstone. */
+	onHostKill(identity: WorkerIdentity): void;
+	/** Disposal started without a tombstone. The barrier tracks the actual raw session teardown. */
+	onHostDispose(identity: WorkerIdentity, rootClosing: boolean, closed: Promise<void>): void;
+	/** Delivered after a native tombstone release, without waiting on worker construction. */
+	onHostRelease(confirmIdle: () => Promise<void>): void;
 	cwd: string;
 	sessionsDir: string;
 	model: ModelInfo | undefined;

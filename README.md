@@ -2,7 +2,7 @@
 
 An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.1.0**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
 
-- **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances in a per-swarm private `AgentRegistry` (`~/.omp/agent/agents/` is never touched; worker transcripts stay under `<swarm_dir>/sessions/`).
+- **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances registered in omp's global `AgentRegistry`—making live workers inspectable via `/hub`, native transcript focus, and (in tray-capable hosts like Tern) Tray cards without touching `~/.omp/agent/agents/` (worker transcripts stay under `<swarm_dir>/sessions/`).
 - **Full per-worker model and exact reasoning effort control:** inherit the coordinator's model and effort by default, or pin any runnable `provider/id` and exact effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — never `auto`) with live boundary model switching, immediate effort-only switching, and no silent fallback downgrades.
 - **SSH-first native TUI (`/swarm`) + opt-in local web board (`/swarm-ui`):** `/swarm` provides four keyboard-driven views (Overview, Board, Members, Transcript) plus a live status widget under the editor with **zero open network ports**. `/swarm-ui` starts a read-only loopback web board only when explicitly requested.
 - **First-class headless (`omp -p`) execution:** stop-gate, stall/quiescence detection, spend ceilings, monotonic deadlines, and durable `metrics.json` outcomes.
@@ -44,6 +44,7 @@ Read skill://swarm and split the parser rewrite across two authors (lexer and pa
 
 - A single-line status widget appears below the editor (`swarm · <title> · ●2 ○1 · #12 · /swarm`).
 - Run `/swarm` at any time to open the full-screen terminal board (or `/swarm board`, `/swarm members`, `/swarm transcript <name>`).
+- Open omp's **Agent Hub** (`/hub` → `1` Agents → select → `Enter`)—or click a **Tern Tray** card in a tray-capable host—to focus a live member's native omp transcript.
 - Optionally run `/swarm-ui start` to start the read-only loopback web board: in TUI the status widget immediately shows `http://127.0.0.1:<port>/` (even mid-turn, clipping the URL only if it alone exceeds the terminal width), and a copyable transcript notice appears immediately when idle or when the active run ends (a brief toast is also sent, though it may not appear when idle—notably in Tern—and neither display depends on it).
 
 ### Headless (`omp -p`)
@@ -68,9 +69,9 @@ In headless runs (`print` and `json` modes):
 
 | Action | Key parameters | Purpose | Approval tier | Who can call |
 |---|---|---|---|---|
-| `status` | — | Swarm state, mode, `swarm_dir`, `open_board`, `completion`, `outcome`, swarm-level `spend` (`{ tokens, cost, ceiling, unknown? }`), `attention`, and per-member status/cursors/owed/spend | `read` | Coordinator, workers |
+| `status` | — | Swarm state, mode, `swarm_dir`, `open_board`, `completion`, `outcome`, swarm-level `spend` (`{ tokens, cost, ceiling, unknown? }`), `attention`, and per-member `agent_id`/status/cursors/owed/spend | `read` | Coordinator, workers |
 | `models` | `query?`, `provider?`, `limit?` (1..100, default 40) | Lists runnable models, supported `efforts`, context window, and per-provider `quota` summary | `read` | Coordinator, workers |
-| `add` | `name?`, `brief?`, `model?`, `effort?`, `tasks?` (1..16), `n?` (2..16), `fork?`, `workspace?`, `channels?`, `role?` (`worker`\|`narrator`\|`monitor`) | Starts a worker, numbered group (`<name>-1..k`), or singleton role worker (`narrator`/`monitor`) and posts its brief | `exec` | Coordinator (any role); workers (`worker` helpers up to depth 2) |
+| `add` | `name?`, `brief?`, `model?`, `effort?`, `tasks?` (1..16), `n?` (2..16), `fork?`, `workspace?`, `channels?`, `role?` (`worker`\|`narrator`\|`monitor`) | Starts a worker, numbered group (`<name>-1..k`), or singleton role worker (`narrator`/`monitor`), returns its `agent_id`, and posts its brief | `exec` | Coordinator (any role); workers (`worker` helpers up to depth 2) |
 | `model` | `name?`, `model?`, `effort?` | Changes a member's (or caller's) model and/or reasoning effort while keeping its conversation | `write` | Coordinator (anyone); workers (self or own helpers) |
 | `kill` | `name`, `discard_ignored?`, `keep_workspace?` | Permanently stops a member (or group) and runs preservation-first worktree cleanup | `exec` | Coordinator (any non-coordinator); workers (own helpers) |
 | `revive` | `name?` | Revives stopped members after a restart (omit `name` to revive all stopped members with owed posts) and replays owed posts | `exec` | Coordinator (any non-coordinator); workers (own helpers) |
@@ -130,6 +131,24 @@ In `rpc` mode, `/swarm` prints a compact text summary notification.
 | | `Enter`, `t`, `K` | Toggle detail view, open transcript, toggle killed members |
 | **4 Transcript** | `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Page backwards/forwards across the full conversation branch |
 | | `f`, `[` / `]`, `/`, `Esc` | Toggle follow, cycle member, search loaded items, go back |
+
+### Native omp Agent Hub & Tern Tray (`/hub`)
+
+Live workers (including `narrator` and `monitor`) register in omp's global `AgentRegistry` without writing any agent profiles (`~/.omp/agent/agents/` is never touched). In interactive sessions, they appear in `/hub` (subject to the persisted-root filter below) and in Tray on tray-capable native hosts such as Tern with agent display enabled (which may group settled members).
+
+- **Native transcript focus & input:** open `/hub` → `1` (Agents) → select a member → `Enter` (or click its Tray card) to view the worker's live native omp transcript (`Esc` returns to Main when the composer is empty; otherwise it clears the draft first). Submitting sends live human input to the focused worker—steering an active run or starting an idle one.
+- **Live activity:** Tray cards and Hub rows show live tool/activity updates; a worker parked in `swarm_wait` shows `waiting on board`.
+- **Registry IDs:** new allocations and collision fallbacks use `swarm~<name>` (adding `~2`, `~3`, … only on collision), persisted in `members.json` and preferred on `revive` (an available persisted legacy ID is reused verbatim). The assigned ID is shown in Tray and Hub and returned as `agent_id` in `swarm{action:"add"}` and `swarm{action:"status"}` results.
+- **Stop, exit, and `/clear`:**
+  - Stopping a member from Hub (`x`) or Tray permanently **kills** it in the swarm: the fence engages at the native tombstone transition (Hub/Tray may await abort first), the coordinator receives one stop notice (unlike explicit `swarm{action:"kill"}`, which emits no stop notice), and preservation-first workspace WIP cleanup runs once stop is confirmed.
+  - Normal session exit reloads non-killed members as `stopped`; `swarm{action:"revive"}` restarts members that have a valid recorded transcript and workspace (an interrupted launch that never recorded a session cannot be revived).
+  - `/clear` keeps live workers running and preserves their registry refs and existing Hub/Tray visibility.
+- **Limitations:**
+  - A custom `OMP_SWARM_DIR` outside a persisted root session's artifact tree hides workers from the in-session Hub filter and excludes them from native subagent tree cost (durable swarm spend in `status`/`metrics.json` is unaffected; when the default `<Main artifacts>/swarm/sessions` directory is reached through a symlink such as `/home` → `/var/home`, worker transcript paths use Main's spelling when both resolve to that same physical directory, while custom paths keep their own spelling and stay subject to Hub's lexical filter). With `--no-session` (which falls back to a temp dir only when `OMP_SWARM_DIR` is unset), the Hub's root-file filter is disabled so workers remain visible, though file-backed worker refs do not contribute to native tree cost without a matching root.
+  - After a restart, stopped workers stay hidden from Hub and Tray until revived with `swarm{action:"revive"}`.
+  - Creating, forking, and reviving workers never overwrites the terminal's resume breadcrumb, so `omp --continue` (and auto-resume) follows omp's normal breadcrumb and recent-session rules rather than jumping to a worker transcript. If an older plugin version left the terminal's resume pointer on a worker transcript, resume the coordinator session once explicitly (`omp --resume <session id prefix>`) to reset it.
+  - Live swarm workers are among the global registry's visible peers and can appear in `agent://all` broadcast receipts (worker IRC remains disabled).
+  - Headless (`print`/`json`) runs register globally too, but have no Hub or Tray UI.
 
 ### Optional Web Board (`/swarm-ui`)
 

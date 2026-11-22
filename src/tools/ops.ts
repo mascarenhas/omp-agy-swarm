@@ -424,6 +424,7 @@ async function addOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResult> {
 	return ok({
 		added: out.added.map(m => ({
 			name: m.name,
+			agent_id: m.agentId,
 			role: m.role,
 			model: m.model,
 			effort: m.effort,

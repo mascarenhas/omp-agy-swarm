@@ -125,10 +125,10 @@ read_board{}                   # read unread posts (or pass since / channel)
 ```
 
 `swarm{action:"status"}` reports `mode`, `head`, `swarm_dir`, `open_board`,
-`completion`, `outcome`, `attention`, and each member's `state`, `detail`,
-`model`, `effort`, `channels`, `workspace`, `last_read_seq`, `unread`, `owed`
-(posts addressed to it that it has not read), `error`, and spend. Each worker
-is in one of four states:
+`completion`, `outcome`, `attention`, and each member's `agent_id` (also
+returned by `add`), `state`, `detail`, `model`, `effort`, `channels`,
+`workspace`, `last_read_seq`, `unread`, `owed` (posts addressed to it that it
+has not read), `error`, and spend. Each worker is in one of four states:
 
 - `waiting`: asleep on the board (`in swarm_wait` or `idle`), costing nothing
   until woken. It will not stir for anything that does not name it (unless
@@ -142,13 +142,17 @@ is in one of four states:
   `post_message` returns `stopped: […]` with a hint, and you receive a notice.
   Call `swarm{action:"revive"}` (or `swarm{action:"revive", name}`) — an
   exec-tier action — to start stopped members again and replay their owed posts.
-- `killed`: gone for good; names are never reused. If unfinished work remains,
-  `add` a fresh worker and brief it on the board.
+- `killed`: gone for good; names are never reused. The user can also stop a
+  worker from omp's Agent Hub or Tern Tray, which permanently kills it,
+  delivers a stop notice to you, and runs kill workspace/WIP rules. If
+  unfinished work remains, `add` a fresh worker and brief it on the board.
 
-Failures, stuck workers (10 minutes without activity while `working`), spend
-ceiling hits, revival requests, and retained workspaces reach you as `notices`
-inside wake messages and `swarm_wait` results, and under `attention` in
-`status`.
+Failures, stuck workers (10 minutes without activity while `working`), user
+stops from Hub/Tray, spend ceiling hits, revival requests, and retained
+workspaces reach you as `!`-prefixed notice lines in wake messages and in the
+`notices` field of `swarm_wait` results (`status` `attention` surfaces
+failures, stuck workers, retained workspaces, storage errors, and `incomplete`
+runs).
 
 The loop, until the goal is met:
 
@@ -392,8 +396,8 @@ Call `swarm_wait` rather than polling `read_board` in a loop. Waiting is free.
 - **Wake reasons (`woke`):**
   - `post`: new matching posts arrived (or quiescent unaddressed posts); check
     `more` and call `read_board` if `true`.
-  - `notice`: system notices arrived (failure, stuck, `revive_needed`,
-    `workspace_retained`, cost ceiling, storage).
+  - `notice`: system notices arrived (failure, stuck, user stop, revival
+    needed, retained workspace, cost ceiling, storage).
   - `timeout`: `timeout_seconds` elapsed.
   - `stall`: every task worker is waiting or stopped and nothing is addressed
     to you (`final: true` on the second identical stall).

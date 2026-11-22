@@ -52,6 +52,8 @@ describe("switch (I7, SW-04)", () => {
 	test("parked worker: claim switch, abort, switch, exactly one resume carrying a post from meanwhile", async () => {
 		h = new Harness();
 		await parked("w");
+		const original = h.session("w");
+		const gen = h.member("w").gen;
 		h.factory.switchModes.set("w", "slow");
 		const switching = h.swarm({ action: "model", name: "w", model: "mock/worker-b", effort: "high" });
 		await until(() => h.member("w").phase === "switching", 1000, "switching");
@@ -63,6 +65,10 @@ describe("switch (I7, SW-04)", () => {
 		expect(sw?.effort).toBe("high");
 		expect(sw?.resumed).toBe(true);
 		const s = h.session("w");
+		expect(s).toBe(original);
+		expect(h.factory.created).toHaveLength(1);
+		expect(h.member("w").gen).toBe(gen);
+		expect(h.member("w").agentId).toBe(original.agentId);
 		await until(() => s.inputs.length === 2, 1000, "one resume");
 		expect(s.inputs[1]).toContain("Your model is now mock/worker-b (high)");
 		expect(s.inputs[1]).toContain("new info");

@@ -205,17 +205,19 @@ describe("add", () => {
 		expect(!s || s.disposed).toBe(true);
 	});
 
-	test("agent ids use the full session id; two sids sharing a prefix do not collide", async () => {
-		h = new Harness({ sid: "01a1fc2e-0000-0000-0000-000000000001" });
-		await h.swarm({ action: "add", name: "w", brief: "x" });
-		expect(h.member("w").agentId).toBe("swarm-01a1fc2e-0000-0000-0000-000000000001-w");
-		const h2 = new Harness({ sid: "01a1fc2e-0000-0000-0000-000000000002" });
-		try {
-			await h2.swarm({ action: "add", name: "w", brief: "x" });
-			expect(h2.member("w").agentId).not.toBe(h.member("w").agentId);
-		} finally {
-			await h2.close();
-		}
+	test("checkpoints the actual registry id before the first worker prompt", async () => {
+		h = new Harness();
+		h.factory.resolvedIds.set("w", "swarm~w~3");
+		h.factory.brains.set("w", async () => {
+			const members = JSON.parse(readFileSync(join(h.dir, "members.json"), "utf8")).members;
+			expect(members.w.agent_id).toBe("swarm~w~3");
+			expect(members.w.conversation_id).toBe(h.session("w").sessionId);
+		});
+		const add = await h.swarm({ action: "add", name: "w", brief: "x" });
+		await until(() => h.member("w").phase === "idle", 1000, "prompt complete");
+		expect(h.factory.created[0]?.agentId).toBe("swarm~w");
+		expect(add.details.added).toMatchObject([{ name: "w", agent_id: "swarm~w~3" }]);
+		expect(h.member("w").failure).toBeNull();
 	});
 });
 
