@@ -38,6 +38,8 @@ export function acceptedHubFinish(c: PaidCtx, trace: Trace[]): boolean {
 /** Real native Hub actions. No TSP hello, protocol input injection, or lifecycle calls. */
 export async function driveHub(p: PtyOmp, c: PaidCtx, prompt: string): Promise<void> {
 	const alive = () => p.proc.exitCode === null && p.proc.signalCode === null;
+	// The default status bar shows π in idle Main and the worker ID in a focused transcript.
+	const mainStatus = /(?:^|[\r\n])[ \t]*π\s*>\s*[^>\r\n]*(?:DeepSeek|Mock coord)/i;
 	const submit = async (text: string): Promise<void> => {
 		if (text.startsWith("/")) await p.type(text);
 		else {
@@ -47,7 +49,7 @@ export async function driveHub(p: PtyOmp, c: PaidCtx, prompt: string): Promise<v
 		p.write("\r");
 	};
 	await until(() => evidence(c).some(row => row.kind === "root"), 20_000, "session startup", alive);
-	await p.waitFor(text => /Haiku|Mock coord/.test(text), 15_000, "Main editor");
+	await p.waitFor(text => mainStatus.test(text), 15_000, "Main editor");
 	await submit(prompt);
 	await until(() => {
 		const trace = evidence(c);
@@ -57,7 +59,8 @@ export async function driveHub(p: PtyOmp, c: PaidCtx, prompt: string): Promise<v
 			!!w.workspace.path && existsSync(join(w.workspace.path, "dirty-hub.txt")) &&
 			trace.some(row => row.kind === "event" && row.id === "Main" && row.event === "agent_end");
 	}, 120_000, "dirty parked worker", alive);
-	await p.waitFor(text => text.includes("R9-MAIN-READY") && /Haiku|Mock coord/.test(text), 30_000, "Main ready to open Hub");
+	await until(() => evidence(c).some(row => row.kind === "response" && row.id === "Main" && row.text === "R9-MAIN-READY"),
+		30_000, "Main assistant's ready acknowledgement", alive);
 	if (p.since().includes(HUB_MARKER)) throw new Error("the private worker transcript marker leaked into Main before focus");
 	const id = roster(c).lens!.agent_id!;
 	const openHub = async (): Promise<void> => {
@@ -75,14 +78,14 @@ export async function driveHub(p: PtyOmp, c: PaidCtx, prompt: string): Promise<v
 	mark(c, "hub-focus", { id, text: p.since() });
 	p.mark();
 	p.write("\x1b");
-	await p.waitFor(text => /Haiku|Mock coord/.test(text), 10_000, "return to Main");
+	await p.waitFor(text => mainStatus.test(text), 10_000, "return to Main");
 	await openHub();
 	mark(c, "hub-x", { id });
 	p.write("x");
 	await until(() => roster(c).lens?.killed === true && roster(c).lens?.workspace.state === "removed", 15_000, "Hub kill and dirty-worktree disposition", alive);
 	p.mark();
 	p.write("\x1b");
-	await p.waitFor(text => /Haiku|Mock coord/.test(text) && text.includes(HUB_NOTICE), 20_000, "return to Main and display the Hub stop notice");
+	await p.waitFor(text => mainStatus.test(text) && text.includes(HUB_NOTICE), 45_000, "return to idle Main and display the Hub stop notice");
 	await until(() => {
 		const trace = evidence(c);
 		const notice = trace.findIndex(row => row.kind === "event" && row.id === "Main" && row.customType === "swarm-wake" && row.text?.includes(HUB_NOTICE));
@@ -92,8 +95,11 @@ export async function driveHub(p: PtyOmp, c: PaidCtx, prompt: string): Promise<v
 	p.mark();
 	await submit('Attempt one post_message addressed to @lens with the exact text "@lens R9-RESUME-PROBE". Read the board once for any still-unread notices. Finish the swarm normally with summary "R9 Hub check finished", then reply R9-MAIN-COMPLETE. Do not revive or add any worker.');
 	await until(() => acceptedHubFinish(c, evidence(c)), 90_000, "accepted interactive finish on the board", alive);
-	await p.waitFor(text => text.includes("R9-MAIN-COMPLETE"), 20_000, "Main final answer");
-	await until(() => evidence(c).slice(afterNotice).some(row => row.kind === "event" && row.id === "Main" && row.event === "agent_end"), 20_000, "Main's final turn ended", alive);
+	await until(() => {
+		const turn = evidence(c).slice(afterNotice);
+		const reply = turn.findIndex(row => row.kind === "response" && row.id === "Main" && row.text === "R9-MAIN-COMPLETE");
+		return reply >= 0 && turn.slice(reply + 1).some(row => row.kind === "event" && row.id === "Main" && row.event === "agent_end");
+	}, 20_000, "Main assistant's completion acknowledgement and terminal turn", alive);
 	await submit("/quit");
 	await until(() => p.proc.exitCode !== null, 10_000, "graceful /quit", alive);
 }

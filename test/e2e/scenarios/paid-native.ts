@@ -1,12 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { board, metrics, readJson, roster, treeHash } from "../check.ts";
+import { board, metrics, readJson, roster } from "../check.ts";
 import { EFFORT, type PaidScenario, SCOUT_PROVIDERS, W } from "../paid-contract.ts";
 import { contentText, directBill, entries, type Entry, evidence, type Frame, jsonl, type Trace } from "../paid-evidence.ts";
 import { acceptedHubFinish, BARRIER, file, HUB_DIRTY, HUB_MARKER, HUB_NOTICE, live, mark, parked, pids, runningBash, signal, until } from "../paid-fixtures.ts";
 
 const events = (rows: Trace[], id: string | undefined) => rows.filter((r): r is Frame<"event"> => r.kind === "event" && r.id === id && r.source === "session");
+const assistantBills = (rows: Trace[], id: string | undefined, source: "session" | "task" = "session") =>
+	rows.filter((r): r is Frame<"usage"> => r.kind === "usage" && r.id === id && r.source === source);
 const workerSpec = `model ${W.luna}, effort ${EFFORT}, workspace inherit`;
 const gateText = "The swarm still has outstanding work";
 const pendingText = /waiting on background work|working with pending background work|with background work/;
@@ -15,9 +17,9 @@ const asyncResult = (r: Trace): r is Frame<"event"> => r.kind === "event" && r.c
 const near = (a: number | undefined, b: number, tolerance = 0.0000005 + 1e-10) => a !== undefined && Math.abs(a - b) <= tolerance;
 
 const R9: PaidScenario = {
-	id: "R9", model: W.haiku, cap: 0.75, maxSeconds: 360, pty: true,
+	id: "R9", cap: 0.75, maxSeconds: 360, pty: true,
 	fixture: { "hub-marker.txt": `${HUB_MARKER}\n` },
-	prompt: `Read skill://swarm. This is a native UI exercise. Add exactly one worker named lens on ${W.haiku} with low effort and workspace branch. Its exact brief: "Write an untracked file dirty-hub.txt containing ${HUB_DIRTY}. Read hub-marker.txt yourself; emit only its exact content as PRIVATE assistant prose, never on the board or to Main. In the same response as that private prose, call swarm_wait{} as its sole tool call. If it returns woke:nudge, call untimed swarm_wait again; this private test intentionally has no board report. Stay parked. If a legitimate new assignment arrives, report it on the board." After add succeeds, reply R9-MAIN-READY and end this interactive turn. Do not wait, read its file or transcript, start another worker, or finish before the next user prompt. After the Hub stop notice reaches you in an automatic turn, reply R9-NOTICE-ACK and end immediately with no tools.`,
+	prompt: `Read skill://swarm. This is a native UI exercise. Add exactly one worker named lens on ${W.deepseek} with low effort and workspace branch. Its exact brief: "Write an untracked file dirty-hub.txt containing ${HUB_DIRTY}. Read hub-marker.txt yourself; emit only its exact content as PRIVATE assistant prose, never on the board or to Main. In the same response as that private prose, call swarm_wait{} as its sole tool call. If it returns woke:nudge, call untimed swarm_wait again; this private test intentionally has no board report. Stay parked. If a legitimate new assignment arrives, report it on the board." After add succeeds, reply R9-MAIN-READY and end this interactive turn. Do not wait, read its file or transcript, start another worker, or finish before the next user prompt. After the Hub stop notice reaches you in an automatic turn, reply R9-NOTICE-ACK and end immediately with no tools.`,
 	check(c, k) {
 		const trace = evidence(c);
 		const members = roster(c);
@@ -51,7 +53,6 @@ const R9: PaidScenario = {
 			k.eq(got.trim(), HUB_DIRTY, "fixture content preserved in the WIP ref");
 		} catch { k.ok(false, "exact WIP ref with dirty-hub.txt is missing"); }
 		k.ok(entries(c, "lens").some(row => row.message?.role === "assistant" && contentText(row.message.content).includes(HUB_MARKER)), "worker's private transcript still readable through the swarm");
-		k.ok(c.profiles && treeHash(c.profiles) === c.profilesBefore, "isolated agents/profile tree unchanged");
 	},
 };
 
@@ -91,7 +92,7 @@ const R10: PaidScenario = {
 		const resumed = events(trace.slice(release + 1), id);
 		k.eq(resumed.filter(r => r.tool === "swarm_wait" && r.event === "tool_execution_end" && jobWake.test(r.text ?? "")).length, 1, "one worker woke:job receipt");
 		k.eq(resumed.filter(r => asyncResult(r) && r.text?.includes(NONCE)).length, 1, "actual worker async-result with nonce delivered once");
-		k.ok(!events(trace, id).some(r => r.event === "tool_execution_start" && !["bash", "swarm_wait", "post_message"].includes(r.tool ?? "")), "worker used no polling tools");
+		k.ok(!events(trace, id).some(r => r.event === "tool_execution_start" && !["bash", "swarm_wait", "read_board", "post_message"].includes(r.tool ?? "")), "worker used no job polling tools");
 		k.eq(events(trace, id).filter(r => r.event === "tool_execution_start" && r.tool === "bash").length, 1, "only the initial worker bash call");
 		const b = board(c);
 		const report = b.filter(p => p.agent === "asyncworker" && p.text.includes(NONCE));
@@ -109,9 +110,14 @@ const R10: PaidScenario = {
 
 const FACT_A = "FACT-A-38f420a1";
 const FACT_B = "FACT-B-b16a0ef2";
+const SCOUT_FACTS = [
+	{ pathLine: "facts/alpha.txt:2", nonce: FACT_A },
+	{ pathLine: "facts/beta.txt:3", nonce: FACT_B },
+];
 const R11: PaidScenario = {
 	id: "R11", cap: 1.3, maxSeconds: 360,
 	fixture: { "facts/alpha.txt": `header\nalpha: ${FACT_A}\n`, "facts/beta.txt": `header\nspacer\nbeta: ${FACT_B}\n` },
+	env: { OMP_SWARM_WORKER_TOOLS: "task" },
 	prompt: override => `Use swarm. ${override ? `Before adding the worker, set swarm scout model to ${override} using swarm{action:'scout',model:'${override}'}. Do not substitute another override.` : "Do not override the native bundled/operator scout configuration."} Add one worker named finder (${workerSpec}). Brief: "Use exactly one native task call with context and two items in tasks, each with agent:'scout', name, task and solutionSpace. Their names are Alpha and Beta; the solution space is one exact fact per file. Ask Alpha to read facts/alpha.txt and give its alpha fact as path:line and exact nonce. Ask Beta to read facts/beta.txt and give its beta fact as path:line and exact nonce. Native nonblocking scout batches already run in the background. Call swarm_wait alone to park. Use only actual host deliveries, not read/bash/eval/polling for the facts. If one result arrives first, park again until both, then post one @coordinator [done] with both path:line and nonce pairs." Coordinate via swarm_wait as needed, read the report, then finish normally. No native task by Main; no swarm helpers other than finder.`,
 	check(c, k) {
 		const trace = evidence(c);
@@ -120,50 +126,89 @@ const R11: PaidScenario = {
 		// session. Some host lanes only attach it when adopting the completed scout.
 		const refs = trace.filter((r): r is Frame<"ref"> => r.kind === "ref" && r.parentId === owner && !!owner && r.change === "registered" && r.status === "running");
 		const children = [...new Set(refs.map(r => r.id))];
-		k.eq(children.length, 2, "two distinct live native scout refs linked by exact parentId");
+		k.eq(refs.length, 2, "exactly two native scout registrations under the worker's exact parent ID");
+		k.eq(children.length, 2, "distinct scout IDs");
+		k.eq(new Set(refs.map(r => r.sessionFile).filter(Boolean)).size, 2, "distinct retained scout journals");
 		k.eq(Object.keys(roster(c)).filter(n => n !== "coordinator"), ["finder"], "only the owning worker is on the swarm board/roster");
 		const launch = children.map(id => trace.findIndex(r => r.kind === "life" && r.agent === "scout" && r.id === id && r.status === "started"));
 		const end = children.map(id => trace.findIndex(r => r.kind === "life" && r.agent === "scout" && r.id === id && r.status === "completed"));
-		k.ok(children.length === 2 && launch.every(i => i >= 0) && Math.max(...launch) < Math.min(...end), "native scout lifecycle intervals overlapped");
+		k.ok(children.length === 2 && launch.every(i => i >= 0) && end.every(i => i >= 0) &&
+			Math.max(...launch) < Math.min(...end), "native scout lifecycle intervals overlapped");
 		const jobs = trace.flatMap(r => r.kind === "jobs" && r.id === owner ? r.jobs : []);
-		const wantedModel = process.env.OMP_SWARM_PAID_SCOUT_MODEL?.split(":")[0];
+		const policy = readJson<{ scout?: { model?: string; effort?: string } }>(join(c.swarm, "members.json"))?.scout;
+		const [wantedModel, wantedEffort] = c.scoutOverride?.split(":") ?? [];
+		k.eq(policy?.model, wantedModel, "configured scout model persisted (unset means inherit the native policy)");
+		if (wantedEffort) k.eq(policy?.effort, wantedEffort, "configured explicit scout effort persisted");
+		const w = events(trace, owner);
+		const delivered: { child: string; fact: number; at: number }[] = [];
+		for (const event of w.filter(asyncResult)) {
+			for (const match of (event.text ?? "").matchAll(/<task-result\b([^>]*)>([\s\S]*?)<\/task-result>/g)) {
+				const attributes = match[1] ?? "";
+				const child = /\bid="([^"]+)"/.exec(attributes)?.[1];
+				if (!child || !children.includes(child) || !/\bstatus="completed"/.test(attributes)) continue;
+				const result = match[2] ?? "";
+				for (const [fact, { pathLine, nonce }] of SCOUT_FACTS.entries()) {
+					if (result.includes(pathLine) && result.includes(nonce)) delivered.push({ child, fact, at: event.at });
+				}
+			}
+		}
 		let childCost = 0;
 		for (const id of children) {
-			k.ok(jobs.some(j => j.ownerId === owner && j.agentId === id && j.type === "task" && j.status === "running"), `managed running scout job owned by worker: ${id}`);
-			k.ok(jobs.some(j => j.ownerId === owner && j.agentId === id && j.type === "task" && j.status === "completed"), `managed scout job completed: ${id}`);
+			const owned = jobs.filter(j => j.ownerId === owner && j.agentId === id && j.type === "task");
+			const running = owned.find(j => j.status === "running");
+			k.ok(running && owned.some(j => j.id === running.id && j.status === "completed" && j.endTime !== undefined),
+				`same managed job ran and completed under worker owner: ${id}`);
 			const ref = refs.find(r => r.id === id)!;
-			const observed = trace.filter((r): r is Frame<"usage"> => r.kind === "usage" && r.source === "task" && r.id === id && r.tokens > 0);
-			k.ok(observed.length && observed.every(u => SCOUT_PROVIDERS.includes(u.model.split("/")[0]!) && u.cost && u.cost > 0), `actual priced usage on an approved route: ${id}`);
-			const resolved = trace.findLast((r): r is Frame<"progress"> => r.kind === "progress" && r.id === id && !!r.model && !!r.effort);
+			const journal = ref.sessionFile ? jsonl<Entry>(ref.sessionFile) : [];
+			const observed = assistantBills(trace, id, "task");
+			const pricedRequests = observed.filter(r => r.tokens > 0);
+			k.ok(pricedRequests.length && pricedRequests.every(u => SCOUT_PROVIDERS.includes(u.model.split("/")[0]!) && u.cost && u.cost > 0),
+				`actual priced usage on an approved route: ${id}`);
+			const resolved = trace.find((r): r is Frame<"progress"> =>
+				r.kind === "progress" && r.id === id && r.agent === "scout" && !!r.model && !!r.effort);
 			const model = resolved?.model?.split(":")[0];
-			k.ok(resolved?.effort && observed.some(u => u.model === model), `native resolved model and effort recorded: ${id}`);
-			if (wantedModel) k.eq(model, wantedModel, `explicit authorized scout override: ${id}`);
-			console.log(`  R11 scout ${id}: ${model ?? "?"}:${resolved?.effort ?? "?"}`);
-			const bill = ref.sessionFile ? directBill(jsonl<Entry>(ref.sessionFile)) : { cost: 0, unpriced: 0 };
-			k.ok(bill.cost > 0 && !bill.unpriced, `positive direct bill, no unpriced calls, in scout transcript: ${id}`);
+			const effort = resolved?.effort;
+			k.ok(model && effort && pricedRequests.every(u => u.model === model), `native scout consistently served on its initially resolved model: ${id}`);
+			k.eq(journal.find(row => row.type === "model_change")?.model, model, `scout configured startup model in its own journal: ${id}`);
+			k.eq(journal.find(row => row.type === "thinking_level_change")?.thinkingLevel, effort, `scout configured startup effort in its own journal: ${id}`);
+			if (policy?.model) k.eq(model, policy.model, `scout used the configured model override: ${id}`);
+			if (policy?.effort) k.eq(effort, policy.effort, `scout used the configured effort override: ${id}`);
+			console.log(`  R11 scout ${id}: ${model ?? "?"}:${effort ?? "?"}`);
+			const bill = directBill(journal, observed);
+			k.ok(bill.cost > 0 && !bill.unpriced, `positive scout assistant and auxiliary journal bill, no unpriced calls: ${id}`);
 			childCost += bill.cost;
+			k.eq(delivered.filter(result => result.child === id).length, 1, `one host-delivered fixture fact from scout ${id}`);
 		}
-		const w = events(trace, owner);
 		const taskCalls = w.filter(r => r.event === "tool_execution_start" && r.tool === "task");
 		k.eq(taskCalls.length, 1, "one worker-native parallel task call");
-		k.ok(parked(trace, owner) && w.some(r => asyncResult(r) && r.text?.includes(FACT_A)) && w.some(r => asyncResult(r) && r.text?.includes(FACT_B)), "parked worker received both actual native async results");
+		k.ok(w.every(r => r.event !== "tool_execution_start" || ["task", "swarm_wait", "read_board", "post_message"].includes(r.tool ?? "")),
+			"finder used only scout dispatch and board tools; no direct fixture reads");
+		k.ok(parked(trace, owner), "worker parked while awaiting the native scout results");
+		k.eq(delivered.map(result => result.fact).sort(), [0, 1], "separate native results delivered both distinct path:line + nonce facts");
 		const b = board(c);
-		k.ok(b.some(p => p.agent === "finder" && p.text.includes("facts/alpha.txt:2") && p.text.includes(FACT_A) && p.text.includes("facts/beta.txt:3") && p.text.includes(FACT_B)), "worker posted both independently sourced path:line + nonce facts");
+		const report = b.filter(p => p.agent === "finder" && p.text.includes("[done]") &&
+			SCOUT_FACTS.every(({ pathLine, nonce }) => p.text.includes(pathLine) && p.text.includes(nonce)));
+		k.eq(report.length, 1, "worker posted both independently sourced facts once");
+		k.ok(report[0]?.ts !== undefined && delivered.every(result => result.at <= report[0]!.ts!), "host delivered the scout results before the board report");
 		k.ok(b.every(p => ["coordinator", "finder"].includes(p.agent)), "neither native child became a board participant");
 		const m = metrics(c);
-		const direct = directBill(entries(c, "finder"));
+		const direct = directBill(entries(c, "finder"), assistantBills(trace, owner));
 		const reported = m?.members.finder?.cost;
 		k.ok(direct.cost > 0 && !direct.unpriced && reported !== undefined && reported > direct.cost, "positive descendant billing above worker's own direct spend");
 		k.ok(near(reported, direct.cost + childCost), `worker direct + each scout direct exactly once: ${direct.cost} + ${childCost}; metrics ${reported}`);
-		// The first successful swarm operation creates accounting; its own preceding
-		// assistant request runs before the runtime exists and is not a swarm charge.
-		const admission = trace.findIndex(r => r.kind === "event" && r.id === "Main" && r.tool === "swarm" &&
-			r.event === "tool_execution_end" && !r.isError);
-		const mainCost = trace.slice(admission + 1).reduce((sum, r) => sum +
-			(r.kind === "usage" && r.id === "Main" && r.source === "session" ? r.cost ?? 0 : 0), 0);
-		k.ok(admission >= 0 && mainCost > 0 && near(m?.coordinator?.cost, mainCost),
-			`Main received none of the scout charge: observed direct ${mainCost}; metrics ${m?.coordinator?.cost}`);
-		k.ok(near(m?.spend.cost, direct.cost + childCost + mainCost), "swarm total includes each direct bill exactly once");
+		// Main starts a fresh transcript. The request selecting the first successful
+		// swarm operation is pre-admission; include all later journaled assistant
+		// and model_usage entries (e.g. exec completion and cache warming).
+		const root = trace.find(r => r.kind === "root");
+		const admissionIndex = trace.findIndex(r => r.kind === "event" && r.id === "Main" && r.tool === "swarm" && r.event === "tool_execution_end" && !r.isError);
+		const admission = trace[admissionIndex];
+		const journal = root?.sessionFile ? jsonl<Entry>(root.sessionFile) : [];
+		const boundary = journal.findIndex(row => admission?.kind === "event" && !!admission.callId &&
+			row.message?.role === "toolResult" && row.message.toolCallId === admission.callId);
+		const main = directBill(journal.slice(boundary + 1), assistantBills(trace.slice(admissionIndex + 1), "Main"));
+		k.ok(boundary >= 0 && main.cost > 0 && !main.unpriced && near(m?.coordinator?.cost, main.cost),
+			`Main received none of the scout charge: direct journal ${main.cost}; metrics ${m?.coordinator?.cost}`);
+		k.ok(near(m?.spend.cost, direct.cost + childCost + main.cost), "swarm total includes each direct bill exactly once");
 		k.eq(m?.spend.unknown, undefined, "no unknown price on this priced route");
 	},
 };

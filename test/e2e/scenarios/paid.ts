@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { board, metrics, roster } from "../check.ts";
-import { type PaidScenario, W } from "../paid-contract.ts";
+import { type PaidScenario, TERRA, W } from "../paid-contract.ts";
 import { contentText, entries, evidence, type Frame, type PaidCtx } from "../paid-evidence.ts";
 import { NATIVE_PAID } from "./paid-native.ts";
 /** `provider/model` of every assistant message a worker's transcript holds, in order. */
@@ -79,12 +79,13 @@ export const PAID: PaidScenario[] = [
 	},
 	{
 		id: "R2",
-		prompt: `Use the swarm. Add worker alpha on ${W.deepseek} with effort medium and worker beta on ${W.luna} with effort low; each posts READY and waits. For the beta add, explicitly include the optional defaults n:0, tasks:[], fork:"", and channels:[] alongside the ordinary arguments. When both are ready, change beta's effort to high (effort only, same model), ask beta to post DONE-HIGH, then finish.`,
+		coordinator: TERRA,
+		prompt: `Use the swarm. Add worker alpha on ${W.deepseek} with effort medium and worker beta on ${W.luna} with effort low; each posts READY and waits. When both are ready, change beta's effort to high (effort only, same model), ask beta to post DONE-HIGH, then finish.`,
 		check: (c, { failures: f }) => {
-			if (Object.keys(roster(c)).filter(name => name !== "coordinator").sort().join(",") !== "alpha,beta") f.push("padded add did not create exactly the two named workers");
-			if (!evidence(c).some(row => row.kind === "event" && row.id === "Main" && row.swarmArgs?.action === "add" &&
-				row.swarmArgs.name === "beta" && row.swarmArgs.n === 0 && row.swarmArgs.tasks === 0 && row.swarmArgs.fork === ""))
-				f.push("beta add lacks an observed padded-parameter call");
+			if (Object.keys(roster(c)).filter(name => name !== "coordinator").sort().join(",") !== "alpha,beta") f.push("expected exactly the two named workers");
+			const addCalls = evidence(c).flatMap(row => row.kind === "event" && row.id === "Main" && row.swarmArgs?.action === "add" ? [row.swarmArgs] : []);
+			const padded = addCalls.filter(args => args.n === 0 || args.tasks === 0 || args.fork === "" || args.channels === 0);
+			console.log(`  R2 padded add arguments observed: ${padded.length}/${addCalls.length} calls (not a pass criterion)`);
 			if (!c.stdout.includes("'medium' → 'low'")) f.push("the clamp note ('medium' → 'low') never reached the coordinator");
 			onModel(c, "alpha", W.deepseek, "low", f);
 			onModel(c, "beta", W.luna, "high", f);

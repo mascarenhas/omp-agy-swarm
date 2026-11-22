@@ -6,7 +6,7 @@ export interface PaidScenario {
 	prompt: string | ((scoutOverride: string | undefined) => string);
 	fixture?: Record<string, string>;
 	mock?: boolean;
-	model?: string;
+	coordinator?: string;
 	cap?: number;
 	maxSeconds?: number;
 	pty?: boolean;
@@ -18,6 +18,8 @@ export interface PaidScenario {
 }
 
 export const W = { haiku: "anthropic/claude-haiku-5-5", luna: "openai-codex/gpt-6-luna", deepseek: "opencode-go/deepseek-v4.1-flash" };
+export const TERRA = "openai-codex/gpt-6.1-terra";
+export const COORDINATOR = W.deepseek;
 export const EFFORT = "low";
 export const OBSERVER = new URL("./paid-observer.ts", import.meta.url).pathname;
 export const SCOUT_PROVIDERS = ["openai-codex", "anthropic", "antigravity-cli"];

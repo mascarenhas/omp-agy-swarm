@@ -8,6 +8,7 @@ import {
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL,
 	type SubagentLifecyclePayload, type SubagentProgressPayload,
 } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { getAgentDbPath, getAgentDir, getTerminalSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import { contentText, type TraceBody, usageTokens } from "./paid-evidence.ts";
 
 export default function observe(pi: ExtensionAPI): void {
@@ -44,7 +45,9 @@ export default function observe(pi: ExtensionAPI): void {
 				break;
 			case "tool_execution_start": {
 				const args = ev.toolName === "swarm" ? ev.args as Record<string, unknown> | undefined : undefined;
-				const swarmArgs = args && { action: args.action, name: args.name, n: args.n, tasks: Array.isArray(args.tasks) ? args.tasks.length : undefined, fork: args.fork };
+				const swarmArgs = args && { action: args.action, name: args.name, n: args.n, fork: args.fork,
+					tasks: Array.isArray(args.tasks) ? args.tasks.length : undefined,
+					channels: Array.isArray(args.channels) ? args.channels.length : undefined };
 				write({ ...base, tool: ev.toolName, callId: ev.toolCallId, swarmArgs });
 				break;
 			}
@@ -57,6 +60,10 @@ export default function observe(pi: ExtensionAPI): void {
 				if (m.role === "assistant") {
 					write({ kind: "usage", id, source, model: `${m.provider}/${m.model}`, cost: m.usage?.cost?.total,
 						tokens: usageTokens(m.usage), timestamp: m.timestamp });
+					if (id === "Main" && process.env.OMP_SWARM_PAID_HUB === "1") {
+						const marker = /\bR9-MAIN-(?:READY|COMPLETE)\b/.exec(contentText(m.content))?.[0];
+						if (marker) write({ kind: "response", id, text: marker });
+					}
 				} else if (m.role === "custom") {
 					write({ ...base, customType: m.customType, text: contentText(m.content).slice(0, 8000) });
 				}
@@ -88,7 +95,8 @@ export default function observe(pi: ExtensionAPI): void {
 		if (ctx.agent.kind !== "main" || cleanup) return;
 		const sessionFile = ctx.sessionManager.getSessionFile();
 		const artifacts = ctx.sessionManager.getArtifactsDir();
-		write({ kind: "root", sessionFile, swarm: sessionFile && artifacts ? join(artifacts, "swarm") : undefined });
+		write({ kind: "root", sessionFile, swarm: sessionFile && artifacts ? join(artifacts, "swarm") : undefined,
+			agentDir: getAgentDir(), agentDb: getAgentDbPath(), terminalSessionsDir: getTerminalSessionsDir() });
 		const stops = [
 			registry.onChange(({ ref, type }) => observeRef(ref, type)),
 			pi.events.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, (data: unknown) => {

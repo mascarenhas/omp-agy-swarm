@@ -4,6 +4,7 @@ import { expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { resolveOmpBin } from "../../scripts/omp-bin.ts";
 import type { Rule, Script, ToolCallSpec } from "./mock-llm/server.ts";
+import { directBill, type Entry, evidence, jsonl } from "./paid-evidence.ts";
 import { HUB_DIRTY, HUB_MARKER } from "./paid-fixtures.ts";
 import { runPaidCase } from "./paid-runner.ts";
 import { tool } from "./scenario.ts";
@@ -24,10 +25,10 @@ const scripts: Record<string, Script> = {
 	R9: {
 		coord: { rules: [
 			call("This is a native UI exercise", add("lens", "branch")),
-			say('"added"', "R9-MAIN-READY"),
+			say('"added"', "Ready to open the Hub: R9-MAIN-READY."),
 			say("permanently killed in the swarm", "R9-NOTICE-ACK"),
 			call("Attempt one post_message addressed to @lens", post("@lens R9-RESUME-PROBE")),
-			say(accepted, "R9-MAIN-COMPLETE"),
+			say(accepted, "R9-MAIN-COMPLETE. Hub check finished."),
 			call('^tool:.*"seq":\\d+,"channel":"main"', tool("read_board")),
 			call('^tool:.*"messages"', finish("R9 Hub check finished")),
 		] },
@@ -57,7 +58,9 @@ const scripts: Record<string, Script> = {
 	R11: {
 		coord: { rules: [
 			call("Add one worker named finder", swarm("scout", { model: "mock/worker-b:low" })),
-			call('"scout":\\{"model":"mock/worker-b"', add("finder")),
+			call('"scout":\\{"model":"mock/worker-b"', tool("eval", { language: "js", title: "Measure a loopback side call",
+				code: 'const probe = await completion("R11-AUX-PROBE", { model: "smol" }); console.log(await probe.wait());' })),
+			call("R11-AUX-RESULT", add("finder")),
 			call("FACT-A-38f420a1.*FACT-B-b16a0ef2", finish("Both facts verified")),
 			say(accepted, "R11 complete"),
 		], default: { tools: [wait] } },
@@ -75,6 +78,7 @@ const scripts: Record<string, Script> = {
 			say("alpha: FACT-A", "facts/alpha.txt:2 FACT-A-38f420a1"),
 			say("beta: FACT-B", "facts/beta.txt:3 FACT-B-b16a0ef2"),
 		] },
+		plain: { rules: [say("R11-AUX-PROBE", "R11-AUX-RESULT")] },
 	},
 	R12: {
 		coord: { rules: [
@@ -91,13 +95,30 @@ const scripts: Record<string, Script> = {
 	},
 };
 
+test("R11 direct bill excludes transcript mirrors, child aggregates and discarded-turn replacements", () => {
+	const assistants = [{ cost: 1, tokens: 5 }, { cost: 2, tokens: 10 }];
+	const journal: Entry[] = [
+		{ type: "message", message: { role: "assistant", usage: { totalTokens: 5, cost: { total: 1 } } } },
+		{ type: "model_usage", purpose: "discarded-turn", usage: { totalTokens: 10, cost: { total: 2 } } },
+		{ type: "message", message: { role: "toolResult", usage: { totalTokens: 50, cost: { total: 32 } } } },
+		{ type: "model_usage", purpose: "completion", usage: { totalTokens: 20, cost: { total: 4 } } },
+		{ type: "model_usage", purpose: "judge", usage: { totalTokens: 7, cost: { total: 0 } } },
+	];
+	expect(directBill(journal, assistants)).toEqual({ cost: 7, unpriced: 1 });
+});
+
 for (const scenario of NATIVE_PAID) {
 	test.skipIf(scenario.id === "R12" && process.platform !== "linux")(`${scenario.id} loopback smoke (no paid evidence)`, async () => {
-		const result = await runPaidCase(scenario, { omp: resolveOmpBin(), cap: 1, deadline: performance.now() + 55_000, loopback: scripts[scenario.id]! });
+		const result = await runPaidCase(scenario, { omp: resolveOmpBin(), cap: 1, deadline: performance.now() + 55_000,
+			scoutOverride: scenario.id === "R11" ? "mock/worker-b:low" : undefined, loopback: scripts[scenario.id]! });
 		// The two model-route failures are intentional: loopback is not an authorized paid scout route.
 		const failures = result.k.failures.filter(f => !(scenario.id === "R11" && f.startsWith("actual priced usage on an approved route:")));
 		expect(failures, `Retained loopback artifacts: ${result.c.T}`).toEqual([]);
-		if (scenario.id === "R11") expect(result.k.failures).toHaveLength(2);
+		if (scenario.id === "R11") {
+			expect(result.k.failures).toHaveLength(2);
+			const transcript = evidence(result.c).find(row => row.kind === "root")?.sessionFile;
+			expect(transcript && jsonl<Entry>(transcript).some(row => row.type === "model_usage" && (row.usage?.cost?.total ?? 0) > 0)).toBe(true);
+		}
 		rmSync(result.c.T, { recursive: true, force: true });
 	}, 90_000);
 }

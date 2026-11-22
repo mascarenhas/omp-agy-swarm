@@ -10,19 +10,19 @@ export interface PaidCtx {
 	stdout: string;
 	stderr: string;
 	code: number | null;
-	profiles?: string;
-	profilesBefore?: string;
+	scoutOverride?: string;
 }
 
 type Identity = { id: string; generation: number; parentId?: string };
 export type Job = { id: string; ownerId?: string; agentId?: string; type: string; status: string; startTime: number; endTime?: number };
 type RecordBody =
-	| { kind: "root"; swarm?: string; sessionFile?: string }
+	| { kind: "root"; swarm?: string; sessionFile?: string; agentDir: string; agentDb: string; terminalSessionsDir: string }
 	| ({ kind: "ref"; change: string; status: string; attached: boolean; sessionFile: string | null; model?: string; effort?: string } & Identity)
 	| ({ kind: "jobs"; jobs: Job[] } & Identity)
 	| { kind: "life"; id: string; status: string; agent: string }
 	| { kind: "progress"; id: string; status: string; agent: string; tool?: string; intent?: string; model?: string; effort?: string }
-	| { kind: "event"; id: string; source: "session" | "task"; event: string; awaiting?: boolean; callId?: string; tool?: string; isError?: boolean; text?: string; customType?: string; swarmArgs?: { action?: unknown; name?: unknown; n?: unknown; tasks?: unknown; fork?: unknown } }
+	| { kind: "event"; id: string; source: "session" | "task"; event: string; awaiting?: boolean; callId?: string; tool?: string; isError?: boolean; text?: string; customType?: string; swarmArgs?: { action?: unknown; name?: unknown; n?: unknown; tasks?: number; fork?: unknown; channels?: number } }
+	| { kind: "response"; id: string; text: string }
 	| { kind: "usage"; id: string; source: "session" | "task"; model: string; cost?: number; tokens: number; timestamp: number }
 	| { kind: "stop"; pending: readonly string[] }
 	| { kind: "harness"; action: string; id?: string; text?: string };
@@ -58,9 +58,11 @@ export interface Usage {
 
 export interface Entry {
 	type?: string;
+	purpose?: string;
+	model?: string;
 	thinkingLevel?: string | null;
 	usage?: Usage;
-	message?: { role?: string; provider?: string; model?: string; content?: unknown; usage?: Usage };
+	message?: { role?: string; provider?: string; model?: string; content?: unknown; usage?: Usage; toolCallId?: string };
 }
 
 export function entries(c: PaidCtx, name: string): Entry[] {
@@ -72,15 +74,23 @@ export function usageTokens(u: Usage | undefined): number {
 	return u?.totalTokens || (u?.input ?? 0) + (u?.output ?? 0);
 }
 
-/** Own-session billing only: never add embedded task-result usage to a child's direct bill. */
-export function directBill(rows: Entry[]): { cost: number; unpriced: number } {
+/**
+ * Read own-session bills only. A live assistant stream survives `/discard`;
+ * its `discarded-turn` journal replacement is not a second request. The
+ * stream supplies assistant bills and the journal supplies new auxiliary
+ * calls. Never read usage from embedded tool/child results.
+ */
+export function directBill(rows: Entry[], assistants: Iterable<{ cost?: number; tokens: number }>): { cost: number; unpriced: number } {
 	let cost = 0;
 	let unpriced = 0;
-	for (const row of rows) {
-		const usage = row.type === "model_usage" ? row.usage : row.message?.role === "assistant" ? row.message.usage : undefined;
-		const price = usage?.cost?.total;
+	const add = (price: number | undefined, tokens: number): void => {
 		if (typeof price === "number" && Number.isFinite(price) && price > 0) cost += price;
-		else if (usageTokens(usage) > 0) unpriced++;
+		else if (tokens > 0) unpriced++;
+	};
+	for (const { cost: price, tokens } of assistants) add(price, tokens);
+	for (const row of rows) {
+		if (row.type === "model_usage" && row.purpose !== "discarded-turn" && row.usage)
+			add(row.usage.cost?.total, usageTokens(row.usage));
 	}
 	return { cost, unpriced };
 }
