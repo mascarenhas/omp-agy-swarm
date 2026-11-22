@@ -16,23 +16,40 @@ export function isTask(m: Member): boolean {
 	return m.role === "worker" && !m.killed;
 }
 
-/** §7.1: some task member is running, being started/switched, receiving, or parked with a deadline. */
+/** §7.1: active work, including waiting for a timer or for native background work. */
 export function liveTaskWork(rt: SwarmRuntime): Member[] {
 	const out: Member[] = [];
 	for (const m of rt.members.values()) {
 		if (!isTask(m)) continue;
 		const live =
 			m.phase === "starting" ||
-			m.phase === "working" ||
+			(m.phase === "working" || (m.phase === "idle" && m.hostWorking)) ||
 			m.phase === "resuming" ||
 			m.phase === "switching" ||
 			!!m.op ||
 			!!m.delivery ||
 			m.reconcileTimer !== undefined ||
-			(m.phase === "parked" && m.waiter?.deadline !== undefined);
+			(m.phase === "parked" && m.waiter?.deadline !== undefined) ||
+			m.awaiting || !!m.session?.wakeSources;
 		if (live) out.push(m);
 	}
 	return out;
+}
+
+export function liveWorkReason(m: Member, finish = false): string {
+	const deadline = m.waiter?.deadline;
+	if (m.phase === "parked" && deadline !== undefined) {
+		const seconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+		const eta = seconds >= 3600 ? `${Math.ceil(seconds / 3600)}h` : seconds >= 60 ? `${Math.ceil(seconds / 60)}m` : `${seconds}s`;
+		const reason = `${m.name} is parked in a timed swarm_wait (wakes in ~${eta}).`;
+		return finish ? `${reason} Post \`@${m.name} end your turn without rearming the timer\`, wait if the wake is wanted, or use \`finish{abandon:true}\` only to cancel outstanding work intentionally.` : reason;
+	}
+	if (m.awaiting || m.session?.wakeSources) return `${m.name} is ${m.state === "waiting" ? "waiting on" : "working with pending"} background work.`;
+	if (m.phase === "working" && m.runId > m.settledRun && m.stats.posts > m.postsAtLoopStart) {
+		const reason = `${m.name} posted, but its turn is still open.`;
+		return finish ? `${reason} Call \`swarm_wait{}\`; when it wakes, retry \`finish\` without \`abandon:true\`.` : reason;
+	}
+	return `${m.name} is ${m.detail}.`;
 }
 
 export interface Owed {
@@ -91,7 +108,7 @@ export function completionLabel(rt: SwarmRuntime): string {
 	if (completionCurrent(rt)) return "accepted";
 	const parts: string[] = [];
 	const live = liveTaskWork(rt);
-	if (live.length) parts.push(`${live.map(m => m.name).join(", ")} working`);
+	if (live.length) parts.push(live.map(m => liveWorkReason(m)).join(" "));
 	const d = doneMarker(rt);
 	const o = owed(rt, d?.abandoned ? d.seq : 0);
 	if (o.posts.length) parts.push(`unread ${o.posts.map(s => `#${s}`).join(", ")}`);
@@ -179,6 +196,14 @@ export interface GateEvent {
 
 export type GateResult = { decision: "block"; reason: string } | undefined;
 
+/** A no-wake terminal loop may reach here directly instead of via the stop hook. */
+export function recordGateCompletion(rt: SwarmRuntime): void {
+	if (rt.outcome?.terminal) return;
+	const d = doneMarker(rt);
+	if (completionCurrent(rt)) recordOutcome(rt, d?.abandoned ? "complete_with_abandonment" : "complete", "completion accepted");
+	else recordOutcome(rt, "quiescent_no_done", "nothing running, nothing unread, no [done]");
+}
+
 /** §7.3 headless stop-gate (session_stop, print/json). Never waits longer than the 20 s budget. */
 export async function stopGate(rt: SwarmRuntime, ev: GateEvent): Promise<GateResult> {
 	if (ev.signal.aborted || rt.closing) return undefined;
@@ -211,12 +236,7 @@ export async function stopGate(rt: SwarmRuntime, ev: GateEvent): Promise<GateRes
 			const v = rt.version;
 			switch (decide(rt)) {
 				case "ALLOW":
-					if (!rt.outcome?.terminal) {
-						const d = doneMarker(rt);
-						if (completionCurrent(rt))
-							recordOutcome(rt, d?.abandoned ? "complete_with_abandonment" : "complete", "completion accepted");
-						else recordOutcome(rt, "quiescent_no_done", "nothing running, nothing unread, no [done]");
-					}
+					recordGateCompletion(rt);
 					return undefined;
 				case "DELIVER":
 					if (deadlineReached(rt)) return undefined;
@@ -236,7 +256,7 @@ export async function stopGate(rt: SwarmRuntime, ev: GateEvent): Promise<GateRes
 							declareIncomplete(rt, `the coordinator stopped ${rt.gate.refusals} times while members worked`);
 							return undefined;
 						}
-						return block(rt, waitText(liveTaskWork(rt).map(m => m.name)));
+						return block(rt, waitText(liveTaskWork(rt).map(m => liveWorkReason(m))));
 					}
 					await rt.changedSince(v, deadline, ev.signal);
 					if (ev.signal.aborted) return undefined;

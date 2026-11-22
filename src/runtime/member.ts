@@ -29,6 +29,7 @@ export interface Op {
 /** Canonical wait outcomes (SW-14); the elision table lives in tools/ops.ts. */
 export type ClaimReason =
 	| "post"
+	| "job"
 	| "timeout"
 	| "notice"
 	| "stall"
@@ -154,6 +155,7 @@ export class Member {
 	waiter: Waiter | undefined;
 	delivery: Delivery | undefined;
 	session: WorkerSession | undefined;
+	awaiting = false;
 	unsubscribe: (() => void) | undefined;
 	cycle: Cycle | undefined;
 	notices: Notice[] = [];
@@ -171,6 +173,7 @@ export class Member {
 	opSettled: Promise<unknown> | undefined;
 	reconcileTimer: Timer | undefined;
 	runId = 0;
+	postsAtLoopStart = 0;
 	settledRun = 0;
 	/** The session's cost-cap refusal when the current run started (a newer one ends the run as a cost failure). */
 	costRefusalSeen: unknown;
@@ -208,6 +211,12 @@ export class Member {
 		return this.role === "narrator" || this.role === "monitor";
 	}
 
+	/** Native work may start while a swarm operation still owns the phase. */
+	get hostWorking(): boolean {
+		const session = this.session;
+		return !!session && (session.isStreaming || (!this.awaiting && session.isRunActive));
+	}
+
 	/** Reported state (§6.1). */
 	get state(): "waiting" | "working" | "stopped" | "killed" {
 		switch (this.phase) {
@@ -226,7 +235,7 @@ export class Member {
 	get detail(): string {
 		switch (this.phase) {
 			case "parked":
-				return "in swarm_wait";
+				return this.session?.wakeSources ? "in swarm_wait, with background work" : "in swarm_wait";
 			case "starting":
 				return this.op?.kind === "revive" ? "reviving" : this.op ? "starting" : "wake arriving";
 			case "switching":
@@ -234,7 +243,7 @@ export class Member {
 			case "resuming":
 				return "waking";
 			case "idle":
-				return this.failure ? `failed (${this.failure.kind})` : "idle";
+				return this.awaiting ? "waiting on background work" : this.failure ? `failed (${this.failure.kind})` : "idle";
 			case "stopped":
 				return this.failure ? `stopped (${this.failure.kind})` : "stopped";
 			default:

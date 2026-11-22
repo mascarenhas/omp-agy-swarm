@@ -10,6 +10,7 @@ export interface ContractInput {
 	cwd: string;
 	baseDesc: string;
 	swarmDir: string;
+	backgroundJobs?: boolean;
 }
 
 export function workspaceParagraph(ws: WorkspaceRecord, cwd: string, baseDesc: string): string {
@@ -34,8 +35,8 @@ Board tools
   or interface everyone needs. A post that names nobody may be read by nobody.
 - read_board{since?, limit?, channel?}: read posts after your read cursor (or after \`since\`).
 - swarm_wait{mentions_only?, timeout_seconds?}: sleep until a post names you (mentions_only:false: any post you can
-  see; timeout_seconds: at the latest then). It returns the new posts. Call it on its own: it must be the only tool
-  call of its response.
+  see; timeout_seconds: at the latest then). It returns the new posts${c.backgroundJobs ? `, or woke:"job" if omp has background work ready to deliver next` : ""}. Call it on its own:
+  it must be the only tool call of its response.
 - swarm{action}: "status"; "add" a helper for your own piece (it reports to you and you stay responsible); "kill",
   "revive" or "model" a helper you added; "model" with no name to change your own model or effort.
 
@@ -49,13 +50,14 @@ How you work
 3. Refer to earlier posts by number (#12). Never copy or summarize another member's post into yours.
 4. A mention is a doorbell that costs the named member a turn. Mention only who must act next. No thanks, no
    acknowledgements, no status nobody asked for.
-5. After you post, call swarm_wait and stay asleep until someone needs you. Ending your turn also parks you; either
-   way only a post that names you wakes you.
+5. For ordinary standby after posting, end your turn or use untimed swarm_wait{}. Set a timeout only if you must
+   wake yourself on a deadline.${c.backgroundJobs ? " Both directed board posts and the results of your own managed background jobs can wake you." : ""}
 6. When you wake, the new posts are in the wake message or the swarm_wait result. If it says more posts follow, read
    them with read_board first. Act on what is addressed to you, post the outcome, and wait again.
 
 You are not a task subagent: there is no \`yield\` and no parent reading your reply. Run the builds and tests your
 brief asks for yourself. Your output is your files and your board posts.
+${c.backgroundJobs ? `For long or noisy commands, use managed background bash (async:true) rather than blocking. Your jobs share your working copy while you edit. Use read proc:// to list your jobs, read proc://<id> to inspect one, or write proc://<id>/kill with empty content to cancel it. End your turn or use swarm_wait{} while work runs; omp delivers results, so do not poll.\n` : ""}\
 ${workspaceParagraph(c.workspace, c.cwd, c.baseDesc)}
 Swarm directory (shared files; save screenshots under its shots/ folder): ${c.swarmDir}
 </swarm_worker>`;
@@ -155,12 +157,8 @@ export function nudgeText(addedBy: string): string {
 	);
 }
 
-export function waitText(names: string[]): string {
-	return (
-		`[swarm] This is a headless run: nothing wakes you after your turn ends, and ${names.length} members are still ` +
-		`working (${names.join(", ")}). Call swarm_wait now to sleep until they post. When the job is finished post ` +
-		'"[done] <summary>" (or swarm{action:"finish"}) and give your final answer.'
-	);
+export function waitText(reasons: string[]): string {
+	return `[swarm] The swarm still has outstanding work: ${reasons.join(" ")} Call swarm_wait{} to wait for board activity or quiescence. When the work is finished, use swarm{action:"finish"} and give your final answer.`;
 }
 
 export const STALL_NOTE =

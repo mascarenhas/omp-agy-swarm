@@ -60,8 +60,9 @@ move it.
    row per member:
    - `name`, `role`
    - `state`: `waiting` | `working` | `stopped` | `killed`
-   - `detail`: sub-state (`in swarm_wait`, `idle`, `working`, `starting`,
-     `reviving`, `switching model`, `failed (<kind>)`, `stopped`, …)
+   - `detail`: sub-state (`in swarm_wait`, `in swarm_wait, with background work`,
+     `waiting on background work`, `idle`, `working`, `starting`, `reviving`,
+     `switching model`, `failed (<kind>)`, `stopped`, …)
    - `wake_mode`: `mentions` | `anything` | `working`
    - `wait_since`, `last_read_seq`, `channels` (`["main", …]` or `["all"]`)
    - `wait_until` (present when parked with a timeout)
@@ -75,9 +76,12 @@ move it.
 ### Stalled?
 
 The swarm is stalled when every live member except you (and the narrator), the
-coordinator included, is `waiting` or `stopped`, and the job is not finished.
-If anyone is `working`, it is **not** a stall: a long build or deep tool turn
-is normal.
+coordinator included, is `waiting` (with no background work and, for task
+workers, no `wait_until` timer) or `stopped`, and the job is not finished. If
+anyone is `working`, has `detail` showing background work (`waiting on
+background work` / `in swarm_wait, with background work`), or is a task worker
+with `wait_until` set, it is **not** a stall: a long build, background job,
+timed wait, or deep tool turn is normal.
 
 When stalled, identify the root cause and post once to the member who can act:
 
@@ -126,10 +130,11 @@ Stop ticking when there is nothing left to watch:
 - The coordinator posted `[done] …` (including via `swarm{action:"finish"}`).
 - No live task member remains (only you, the coordinator, and optionally the
   narrator are left).
-- Nobody is `working`, the board head has not moved and nothing changed for
-  **5 timeout ticks in a row** (~15 minutes), and you are not mid-way through
-  alerting about a stall. (While anyone is `working`, keep ticking: a long
-  build can still end in a failed turn that never posts.)
+- Nobody is `working`, waiting on background work, or a task worker parked with
+  `wait_until`, the board head has not moved and nothing changed for **5 timeout
+  ticks in a row** (~15 minutes), and you are not mid-way through alerting about
+  a stall. (While anyone is `working`, waiting on background work, or on a timed
+  task-worker wait, keep ticking: it can still wake or fail without posting.)
 
 To go dormant, call `swarm_wait{since: LAST, mentions_only: false}` **with no
 `timeout_seconds`** (sole tool call of its response). Any visible post wakes

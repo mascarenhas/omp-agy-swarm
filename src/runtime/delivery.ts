@@ -144,7 +144,7 @@ export function release(rt: SwarmRuntime, m: Member, why: string): void {
 	if (!d) return;
 	clearTimeout(d.receiptTimer);
 	m.delivery = undefined;
-	if (m.phase === "starting" && !m.op) m.phase = "idle";
+	if (m.phase === "starting" && !m.op) m.phase = m.hostWorking ? "working" : "idle";
 	if (d.kind === "aside" || d.kind === "prompt") {
 		if (m.role === "coordinator") {
 			m.redeliveryExhausted = true;
@@ -167,7 +167,7 @@ export function release(rt: SwarmRuntime, m: Member, why: string): void {
 
 /** "Is there something to deliver to an idle member?" Starts at most one delivery. */
 export function reconcile(rt: SwarmRuntime, m: Member): void {
-	if (rt.closing || m.killed || m.op || m.delivery || m.waiter || m.phase !== "idle") return;
+	if (rt.closing || m.killed || m.op || m.delivery || m.waiter || m.phase !== "idle" || m.hostWorking) return;
 	if (m.role === "coordinator" && rt.binding.headless) return;
 	if (m.role === "worker" && rt.finishing) return;
 	if (m.role !== "coordinator" && rt.spendExceeded()) return;
@@ -195,7 +195,7 @@ export function reconcile(rt: SwarmRuntime, m: Member): void {
 }
 
 export function admitDelivery(rt: SwarmRuntime, m: Member): boolean {
-	if (rt.closing || m.killed || m.op || m.delivery || m.waiter || m.phase !== "idle") return false;
+	if (rt.closing || m.killed || m.op || m.delivery || m.waiter || m.phase !== "idle" || m.hostWorking) return false;
 	if (m.role === "coordinator" && rt.binding.headless) return false;
 	// The start→prompt handoff admits directly; under a reached (or unknown) spend ceiling no
 	// member's first turn starts either (reconcile applies the same rule to every later wake).
@@ -229,14 +229,14 @@ export function admitDelivery(rt: SwarmRuntime, m: Member): boolean {
 function cancel(rt: SwarmRuntime, m: Member, d: Delivery): void {
 	if (m.delivery !== d) return;
 	m.delivery = undefined;
-	if (m.phase === "starting" && !m.op) m.phase = "idle";
+	if (m.phase === "starting" && !m.op) m.phase = m.hostWorking ? "working" : "idle";
 	rt.changed();
 }
 
 /** The dedicated start→prompt handoff: the operation that created the session ends here. */
 export function handoffPrompt(rt: SwarmRuntime, m: Member): void {
 	m.op = undefined;
-	m.phase = "idle";
+	m.phase = m.hostWorking ? "working" : "idle";
 	admitDelivery(rt, m);
 }
 
@@ -343,7 +343,7 @@ function afterSend(rt: SwarmRuntime, m: Member, d: Delivery, gen: number): void 
 	if (m.delivery === d) {
 		release(rt, m, "the wake did not start a turn");
 		reconcile(rt, m);
-	} else if (m.phase === "starting" || m.phase === "working") {
+	} else if ((m.phase === "starting" || m.phase === "working") && !m.hostWorking) {
 		m.phase = "idle";
 		rt.changed();
 		reconcile(rt, m);
@@ -356,10 +356,11 @@ function sendFailed(rt: SwarmRuntime, m: Member, d: Delivery, gen: number, err: 
 	if (m.delivery === d) release(rt, m, text);
 	if (d.kind === "aside" && m.runId === d.runIdAtDispatch) {
 		// A rejected wake is a release, not a failed turn: it is replayed with backoff.
-		if (m.phase === "starting") m.phase = "idle";
+		if (m.phase === "starting") m.phase = m.hostWorking ? "working" : "idle";
 		reconcile(rt, m);
 		return;
 	}
+	if (m.hostWorking) return;
 	// prompt() rejected: this is the run's failure (single report through settleRun, §6.7).
 	if (m.runId === d.runIdAtDispatch) m.runId++;
 	settleRun(rt, m, text);

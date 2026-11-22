@@ -82,7 +82,7 @@ describe("restart and revival (I10, SW-09)", () => {
 		const s = h.session("lexer");
 		expect(s.sessionId).toBe(conv);
 		expect(s.opts.mode.kind).toBe("revive");
-		expect(s.inputs[0]).toContain("You were stopped by a restart");
+		expect(s.inputs[0]).toContain("Background jobs from the previous session are not resumed");
 		expect(s.inputs[0]).toContain("please continue");
 		await until(() => h.member("lexer").lastReadSeq >= Number(p.details.seq), 1000, "cursor");
 	});
@@ -153,7 +153,9 @@ describe("restart and revival (I10, SW-09)", () => {
 		await h.swarm({ action: "revive", name: "nb-1" });
 		await until(() => (h.factory.sessions.get("nb-1")?.inputs.length ?? 0) >= 1, 1000, "brief replayed");
 		const replay = h.session("nb-1").inputs[0] ?? "";
-		expect(replay).toBe(`[swarm] You are \`nb-1\`. Brief from coordinator (board #${seq}):\n\nthe real brief\n\nYour slice: slice one`);
+		const [reminder, brief] = replay.split("\n\n[swarm]");
+		expect(reminder).toContain("Background jobs from the previous session are not resumed");
+		expect(`[swarm]${brief}`).toBe(`[swarm] You are \`nb-1\`. Brief from coordinator (board #${seq}):\n\nthe real brief\n\nYour slice: slice one`);
 		expect(replay.split("Your slice:").length).toBe(2);
 		expect(first.length).toBe(0); // the dropped prompt never started a run
 		await until(() => h.member("nb-1").briefPresented, 1000, "presented after the replay");

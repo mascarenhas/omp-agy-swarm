@@ -24,7 +24,7 @@ export const DESCRIPTIONS = {
 		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it as the last tool call of your response. Sleeping costs nothing." +
 		OMIT_UNUSED,
 	swarm_wait_worker:
-		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it on its own: it must be the only tool call of its response. Sleeping costs nothing." +
+		"Sleep until a board post names you (mentions_only:false: any visible post), omp has background work ready, or timeout_seconds pass. woke:job means omp will deliver background work after the tool returns. For standby, omit the timeout. Call it as the only tool call of its response." +
 		OMIT_UNUSED,
 } as const;
 

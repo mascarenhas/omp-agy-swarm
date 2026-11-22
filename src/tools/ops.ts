@@ -42,6 +42,7 @@ import { helperDepth, permitted } from "./permissions.ts";
 
 export const WOKE = [
 	"post",
+	"job",
 	"timeout",
 	"notice",
 	"stall",
@@ -60,6 +61,7 @@ export type Woke = (typeof WOKE)[number];
 /** Results that carry no information and are elided from context later (H18). */
 export const USELESS_WOKE: Readonly<Record<Woke, boolean>> = {
 	post: false,
+	job: false,
 	timeout: false,
 	notice: false,
 	stall: false,
@@ -834,6 +836,8 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 			note: !pending.length && quiescentUnread.length ? QUIESCENT_NOTE : undefined,
 		});
 	}
+	if (!isCoord && m.session?.wakeSources?.queued)
+		return ok({ woke: "job", note: "Background work is ready; omp delivers it after this tool returns." });
 	closeCycle(m);
 	if (isCoord) rt.gate.refusals = 0;
 	const started = Date.now();
@@ -844,6 +848,7 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 	if (why === "interrupted" || why === "aborted" || why === "killed" || why === "closing") return ok({ woke: why }, true);
 	if (why === "switch") return ok({ woke: "switch", note: "Your model is being switched; you will be resumed on the new model." });
 	if (ctx.signal?.aborted) return ok({ woke: "aborted" }, true);
+	if (why === "job") return ok({ woke: "job", note: "Background work is ready; omp delivers it after this tool returns.", waited_seconds: waited });
 	if (why === "incomplete") return ok({ ...INCOMPLETE_RESULT });
 	const extra = waiter.extra ?? {};
 	const presented = presentToolResult(rt, m, ctx.toolCallId, why === "timeout" ? "timeout" : why === "stall" ? "stall" : why === "notice" ? "notice" : "post", {

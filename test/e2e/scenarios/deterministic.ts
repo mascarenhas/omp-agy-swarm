@@ -444,7 +444,7 @@ const D9: Scenario = {
 			rules: [
 				{ when: '"added"', reply: { text: "Started; not waiting." } },
 				// Every gate refusal is answered by stopping again, never by waiting.
-				{ when: "Call swarm_wait now", reply: { text: "Still not waiting." } },
+				{ when: "The swarm still has outstanding work", reply: { text: "Still not waiting." } },
 			],
 			default: { tools: [tool("swarm", { action: "add", name: "w", brief: "wait a while", model: "mock/worker-a" })] },
 		},
@@ -497,7 +497,7 @@ const D10: Scenario = {
 				},
 				"worker-a": {
 					rules: [
-						{ when: "You were stopped by a restart", reply: { tools: [tool("post_message", { text: "@coordinator [done] GOT-NEXT" })] } },
+						{ when: "Background jobs from the previous session are not resumed", reply: { tools: [tool("post_message", { text: "@coordinator [done] GOT-NEXT" })] } },
 						{ when: '^tool: \\{"seq":', reply: { tools: [tool("swarm_wait", {})] } },
 					],
 				},
@@ -508,7 +508,7 @@ const D10: Scenario = {
 		k.eq(metrics(c)?.outcome?.value, "complete", "outcome of the resumed run");
 		const r = roster(c);
 		k.ok(r.w?.conversation_id, "same member");
-		const wakes = requests(c, "worker-a").filter(q => q.last.includes("You were stopped by a restart"));
+		const wakes = requests(c, "worker-a").filter(q => q.last.includes("Background jobs from the previous session are not resumed"));
 		k.eq(wakes.length, 1, "one revival wake");
 		k.ok(wakes[0]?.last.includes("NEXT-STEP"), "the owed post was delivered by the revival");
 		const files = readdirSync(join(c.swarm, "sessions")).filter(f => f.endsWith(".jsonl"));

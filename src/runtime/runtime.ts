@@ -20,7 +20,7 @@ import type {
 import { LIMITS, raceTimeout, type SwarmEnv, TIMING } from "../env.ts";
 import { messageText } from "./activity.ts";
 import { acknowledge, handoffPrompt, reconcile, release, wakePendingFor } from "./delivery.ts";
-import { completionLabel, declareIncomplete, evaluateQuiescence, liveTaskWork, owed } from "./gate.ts";
+import { completionCurrent, completionLabel, decide, declareIncomplete, evaluateQuiescence, liveTaskWork, liveWorkReason, owed, recordGateCompletion } from "./gate.ts";
 import { type Member, memberFromRecord, Member as MemberClass, type Op, type OpKind, preferredAgentId, roleDefaultMode } from "./member.ts";
 import { applyCoordinatorSwitch, QuotaCache } from "./models.ts";
 import {
@@ -131,7 +131,7 @@ export class SwarmRuntime {
 	outcome: Outcome | null = null;
 	readonly gate = { refusals: 0, waiting: false };
 	readonly stall = { timer: undefined as Timer | undefined, counts: new Map<string, number>(), interactiveStalled: false };
-	readonly metrics = { gate_refusals: 0, stall_wakes: 0, native_async_mix: false };
+	readonly metrics = { gate_refusals: 0, stall_wakes: 0 };
 	closing = false;
 	finishing = false;
 	recovered = false;
@@ -149,6 +149,8 @@ export class SwarmRuntime {
 	#keepAlive: Timer | undefined;
 	#quiescenceQueued = false;
 	#rootShutdownHadLiveWork = false;
+	#mainAwaiting = false;
+	#printWakeReleased = false;
 	#noticeSeq = 0;
 	#spendNotified = false;
 	/** Why the spend is unknown under a ceiling (a priced-less message used tokens); fails closed. */
@@ -187,6 +189,8 @@ export class SwarmRuntime {
 			rt.coordinatorSwitch = binding.pendingSelfSwitch;
 			binding.pendingSelfSwitch = undefined;
 		}
+		rt.#printWakeReleased = binding.headless && completionCurrent(rt);
+		rt.factory.setPrintWake(binding.headless && !rt.#printWakeReleased);
 		return rt;
 	}
 
@@ -252,6 +256,7 @@ export class SwarmRuntime {
 
 	rebind(binding: CoordinatorPort): void {
 		this.binding = binding;
+		this.factory.setPrintWake(binding.headless && !this.closing && !this.#printWakeReleased);
 		this.refreshCoordinator();
 	}
 
@@ -263,6 +268,10 @@ export class SwarmRuntime {
 	}
 
 	changed(): void {
+		if (this.#printWakeReleased && !this.closing && !completionCurrent(this)) {
+			this.#printWakeReleased = false;
+			this.factory.setPrintWake(this.binding.headless);
+		}
 		this.version++;
 		for (const cb of this.#listeners) {
 			try {
@@ -458,7 +467,6 @@ export class SwarmRuntime {
 			spend: this.spendView(),
 			members,
 			coordinator,
-			native_async_mix: this.metrics.native_async_mix,
 			retained_workspaces: this.retained,
 			recovered: this.recovered,
 		};
@@ -491,7 +499,7 @@ export class SwarmRuntime {
 	keepAlive(): void {
 		const needed =
 			!this.closing &&
-			(this.gate.waiting || [...this.members.values()].some(m => !!m.waiter || !!m.op || m.phase === "working" || m.phase === "starting"));
+			(this.gate.waiting || [...this.members.values()].some(m => !!m.waiter || !!m.op || m.awaiting || m.phase === "working" || m.phase === "starting"));
 		if (needed && !this.#keepAlive) this.#keepAlive = setInterval(() => this.#tick(), TIMING.keepAliveMs);
 		else if (!needed && this.#keepAlive) {
 			clearInterval(this.#keepAlive);
@@ -503,7 +511,10 @@ export class SwarmRuntime {
 		if (this.closing) return;
 		const now = Date.now();
 		for (const m of this.members.values()) {
-			if (m.role !== "worker" || m.killed || m.phase !== "working" || m.stuckNotified) continue;
+			if (m.role !== "worker" || m.killed) continue;
+			const waiter = m.waiter;
+			if (waiter && m.session?.wakeSources?.queued) claim(this, m, waiter.id, "job");
+			if (m.phase !== "working" || m.stuckNotified) continue;
 			if (m.tracker.lastEventAt && now - m.tracker.lastEventAt > TIMING.stuckMs) {
 				m.stuckNotified = true;
 				this.noticeToCoordinator(m, "stuck", `${m.name} has shown no activity for ${Math.round(TIMING.stuckMs / 60_000)} minutes while working.`);
@@ -563,14 +574,17 @@ export class SwarmRuntime {
 	 * makes its tools refuse and its events be ignored, the session is disposed in the
 	 * background, and the member is left stopped (revivable from its transcript).
 	 */
-	#fenceUnstopped(m: Member, session: WorkerSession): void {
-		if (m.session !== session) return;
+	#detachForAbandon(m: Member, session: WorkerSession, timedOut: boolean): Promise<void> {
+		if (m.session !== session) return Promise.resolve();
 		this.#detachMember(m, "aborted");
 		m.phase = "stopped";
-		m.failure = { kind: "error", text: "did not stop when finish abandoned its work", at: new Date().toISOString(), at_seq: this.board.head, count: (m.failure?.count ?? 0) + 1 };
-		this.#trackDrain(m, session.dispose());
+		if (timedOut)
+			m.failure = { kind: "error", text: "did not stop when finish abandoned its work", at: new Date().toISOString(), at_seq: this.board.head, count: (m.failure?.count ?? 0) + 1 };
+		const disposal = session.dispose();
+		this.#trackDrain(m, disposal);
 		this.flushStructural();
 		this.changed();
+		return disposal;
 	}
 
 	// -------------------------------------------------------------------------
@@ -607,6 +621,7 @@ export class SwarmRuntime {
 	/** Synchronous: durable append first, then memory, ring sets and the wake engine. */
 	commitPost(author: Member, text: string, opts: CommitOptions = {}): CommitResult | { error: string } {
 		if (this.closing) return { error: "the swarm is shutting down; nothing was posted" };
+		if (author.killed || (this.finishing && author.role !== "coordinator")) return { error: "the member is stopping; nothing was posted" };
 		const now = Date.now();
 		const record = {
 			seq: this.board.head + 1,
@@ -904,6 +919,7 @@ export class SwarmRuntime {
 			cwd: ws.path,
 			baseDesc: describeBase(ws),
 			swarmDir: this.dir,
+			backgroundJobs: m.role === "worker",
 		});
 		if (m.role !== "narrator" && m.role !== "monitor") return contract;
 		let body = "";
@@ -992,6 +1008,7 @@ export class SwarmRuntime {
 
 	#detachMember(m: Member, reason: "closing" | "killed" | "aborted"): void {
 		m.gen++;
+		m.awaiting = false;
 		this.#cancelOp(m);
 		m.unsubscribe?.();
 		m.unsubscribe = undefined;
@@ -1158,8 +1175,11 @@ export class SwarmRuntime {
 		m.redeliveryExhausted = false;
 		m.redeliveryAttempts = 0;
 		m.notBefore = 0;
-		if (m.briefPresented)
-			m.reminders.resume = "You were stopped by a restart and are live again. Unless the posts below need action, call swarm_wait again.";
+		if (m.role === "worker") {
+			m.reminders.resume = "You are live again. Background jobs from the previous session are not resumed; check their outputs before restarting work. For standby, call untimed swarm_wait{}.";
+		} else if (m.briefPresented) {
+			m.reminders.resume = "You are live again. Unless the posts below need action, call swarm_wait again.";
+		}
 		this.flushStructural();
 		handoffPrompt(this, m);
 	}
@@ -1174,10 +1194,12 @@ export class SwarmRuntime {
 			const o = owed(this);
 			if (live.length || o.posts.length || o.notices) {
 				const parts: string[] = [];
-				if (live.length) parts.push(`working: ${live.map(m => m.name).join(", ")}`);
-				if (o.posts.length) parts.push(`unread: ${o.posts.map(s => `#${s}`).join(", ")}`);
-				if (o.notices) parts.push(`notices: ${o.notices}`);
-				return { error: `cannot finish yet (${parts.join("; ")}); read them, or pass abandon:true to cancel what is still running` };
+				if (live.length) parts.push(live.map(m => liveWorkReason(m, true)).join(" "));
+				if (o.posts.length || o.notices) {
+					const unread = [o.posts.length ? `posts ${o.posts.map(s => `#${s}`).join(", ")}` : "", o.notices ? `${o.notices} notices` : ""].filter(Boolean);
+					parts.push(`Read unread ${unread.join(" and ")} before retrying.`);
+				}
+				return { error: `Cannot finish: ${parts.join(" ")}` };
 			}
 			const r = this.commitPost(this.coordinator, `[done] ${summary}`);
 			if ("error" in r) return r;
@@ -1185,21 +1207,35 @@ export class SwarmRuntime {
 		}
 		this.finishing = true;
 		const abandoned: AbandonedItem[] = [];
+		const deadlineAt = Date.now() + TIMING.killStopMs;
+		const disposals: Promise<boolean>[] = [];
 		const stops: { m: Member; session: WorkerSession; item: AbandonedItem; settled: Promise<boolean> }[] = [];
 		try {
 			for (const m of this.members.values()) {
 				if (m.role !== "worker" || m.killed) continue;
 				const unread = wakePendingFor(this, m).map(p => p.seq);
 				const notices = m.notices.length;
+				const session = m.session;
+				const asyncWork = m.awaiting || !!session?.hasBackgroundWork;
 				let was: string;
 				if (m.op) was = m.op.kind === "start" ? "starting" : m.op.kind === "revive" ? "reviving" : "switching";
 				else if (m.phase === "stopped") was = "stopped";
-				else if (m.phase === "parked") was = m.waiter?.deadline !== undefined ? "waiting with a timeout" : "";
+				else if (m.phase === "parked") was = m.waiter?.deadline !== undefined ? "waiting with a timeout" : asyncWork ? "in swarm_wait with background work" : "";
+				else if (asyncWork) was = m.hostWorking || m.phase === "working" ? "working with pending background work" : "waiting on background work";
 				else if (m.phase === "idle") was = m.delivery || m.reconcileTimer ? "about to be woken" : m.nudgePending ? "owed a nudge" : "";
 				else was = "working";
 				if (!was && unread.length === 0 && notices === 0) continue;
 				const item: AbandonedItem = { name: m.name, was: was || "waiting", ...(unread.length ? { unread } : {}), ...(notices ? { notices } : {}) };
 				abandoned.push(item);
+				if (session && asyncWork) {
+					m.notices = [];
+					item.was += "; session detached to stop background work";
+					disposals.push(settleWithin(this.#detachForAbandon(m, session, false), Math.max(0, deadlineAt - Date.now())).then(settled => {
+						if (!settled) item.was += "; stop not confirmed";
+						return settled;
+					}));
+					continue;
+				}
 				// Cancelled operations never post: start, revive and switch re-check their op before
 				// every board or session step, so they are not awaited (construction may hang).
 				if (m.op) this.#cancelOp(m);
@@ -1218,21 +1254,20 @@ export class SwarmRuntime {
 				m.nudgePending = false;
 				m.notices = [];
 				if (m.waiter && m.waiter.deadline !== undefined) claim(this, m, m.waiter.id, "aborted");
-				const session = m.session;
 				const running = m.phase === "working" || m.phase === "resuming" || m.phase === "starting" || m.phase === "switching";
 				if (session && (running || sendInFlight || session.isStreaming)) {
 					// Stopped means idle: abort, then wait for the run to settle, bounded.
-					stops.push({ m, session, item, settled: settleWithin(session.abort().then(() => session.waitForIdle()), TIMING.killStopMs) });
+					stops.push({ m, session, item, settled: settleWithin(session.abort().then(() => session.waitForIdle()), Math.max(0, deadlineAt - Date.now())) });
 				}
 			}
 			const results = await Promise.all(stops.map(s => s.settled));
 			for (const [i, s] of stops.entries()) {
-				if (results[i] && !s.session.isStreaming) continue;
-				// A worker that did not stop is fenced off: its tools and events belong to a dead
-				// generation, so a post from the abandoned turn can never land after the [done].
-				this.#fenceUnstopped(s.m, s.session);
-				s.item.was = `${s.item.was}; did not stop, detached`;
+				const stopped = results[i] && !s.session.isStreaming;
+				if (stopped && !s.session.hasBackgroundWork) continue;
+				disposals.push(settleWithin(this.#detachForAbandon(s.m, s.session, !stopped), Math.max(0, deadlineAt - Date.now())));
+				s.item.was += stopped ? "; late background work, session detached" : "; did not stop, detached";
 			}
+			await Promise.all(disposals);
 			const c = this.coordinator;
 			const o = owed(this);
 			if (o.posts.length || o.notices) abandoned.push({ name: "coordinator", was: "unread", ...(o.posts.length ? { unread: o.posts } : {}), ...(o.notices ? { notices: o.notices } : {}) });
@@ -1248,7 +1283,7 @@ export class SwarmRuntime {
 			for (const m of this.members.values()) {
 				if (m.role === "worker" && !m.killed) {
 					m.wakeFloor = Math.max(m.wakeFloor, r.msg.seq);
-					if (m.phase !== "stopped" && !m.op && !m.waiter && m.phase !== "idle" && !m.session?.isStreaming) m.phase = "idle";
+					if (m.phase !== "stopped" && !m.op && !m.waiter) m.phase = m.hostWorking ? "working" : "idle";
 				}
 			}
 			c.wakeFloor = Math.max(c.wakeFloor, r.msg.seq);
@@ -1312,6 +1347,7 @@ export class SwarmRuntime {
 	// -------------------------------------------------------------------------
 
 	onMainAgentStart(): void {
+		this.#mainAwaiting = false;
 		const c = this.coordinator;
 		c.runId++;
 		c.stats.runs++;
@@ -1349,23 +1385,42 @@ export class SwarmRuntime {
 		else acknowledge(this, c, d);
 	}
 
-	onMainAgentEnd(ev: { willContinue?: boolean; awaitingAsyncWork?: boolean }): void {
-		// 19.0.1 sends awaitingAsyncWork only together with willContinue, so this is checked first.
-		if (ev.awaitingAsyncWork && liveTaskWork(this).length && !this.metrics.native_async_mix) {
-			this.metrics.native_async_mix = true;
-			this.log("omp-agy-swarm: the coordinator is waiting on native background work while swarm members are live; headless completion is not guaranteed in this mode");
-			this.writeMetrics();
+	onMainStopHook(): void {
+		this.#mainAwaiting = false;
+	}
+
+	onMainAgentEnd(ev: { willContinue?: boolean; awaitingAsyncWork?: boolean; mayResume?: boolean }): void {
+		if (ev.willContinue) {
+			this.#mainAwaiting = this.binding.headless && ev.awaitingAsyncWork === true;
+			return;
 		}
-		if (ev.willContinue) return;
+		const endedWithoutResult = this.#mainAwaiting;
+		this.#mainAwaiting = false;
 		const c = this.coordinator;
-		if (c.runId <= c.settledRun) return;
-		c.settledRun = c.runId;
-		c.tracker.onRunEnd();
-		if (c.delivery) release(this, c, "the run ended before the wake was received");
-		if (c.phase !== "parked") c.phase = "idle";
-		c.redeliveryExhausted = false;
-		this.changed();
-		if (this.binding.headless) return;
+		if (c.runId > c.settledRun || endedWithoutResult) {
+			c.settledRun = c.runId;
+			c.tracker.onRunEnd();
+			if (c.delivery) release(this, c, "the run ended before the wake was received");
+			if (c.phase !== "parked") c.phase = "idle";
+			c.redeliveryExhausted = false;
+			this.changed();
+		} else if (!this.binding.headless) return;
+		if (this.binding.headless) {
+			if (endedWithoutResult && ev.mayResume && !this.closing && !this.outcome?.terminal) {
+				if (decide(this) === "ALLOW") recordGateCompletion(this);
+				else if (this.deadlineExceeded()) declareIncomplete(this, `run deadline of ${this.env.deadlineSeconds} s passed`);
+				else this.binding.sendWake({
+					customType: "swarm-gate-reminder",
+					content: "[swarm] Your native background work ended without waking you. Call swarm_wait{} to continue supervising the swarm, then finish when the work is done.",
+					display: false, details: {},
+				});
+			}
+			if (completionCurrent(this)) {
+				this.#printWakeReleased = true;
+				this.factory.setPrintWake(false);
+			}
+			return;
+		}
 		if (this.coordinatorSwitch) {
 			void applyCoordinatorSwitch(this).then(res => {
 				if (res && res.state !== "ok") this.coordinatorNotice("external_change", res.text.replace(/^\[swarm\] /, ""));
@@ -1455,6 +1510,8 @@ export class SwarmRuntime {
 			this.outcome = { value: "aborted", reason: "shutdown with live work", at: new Date().toISOString(), terminal: true };
 		}
 		this.closing = true;
+		this.factory.setPrintWake(false);
+		const deadlineAt = Date.now() + TIMING.shutdownDisposeMs;
 		clearTimeout(this.#flushTimer);
 		clearTimeout(this.#metricsTimer);
 		clearTimeout(this.#activityTimer);
@@ -1467,6 +1524,7 @@ export class SwarmRuntime {
 		const disposals: Promise<void>[] = [];
 		for (const m of this.members.values()) {
 			this.#cancelOp(m);
+			m.awaiting = false;
 			if (m.waiter) claim(this, m, m.waiter.id, "closing");
 			clearTimeout(m.reconcileTimer);
 			const d = m.delivery;
@@ -1476,6 +1534,7 @@ export class SwarmRuntime {
 			const session = m.session;
 			m.session = undefined;
 			if (session) disposals.push(session.dispose());
+			else if (m.drain?.pending) disposals.push(m.drain.promise);
 		}
 		for (const w of [...this.#versionWaiters]) w();
 		if (this.ephemeral) {
@@ -1485,7 +1544,8 @@ export class SwarmRuntime {
 		}
 		this.store.close();
 		this.#listeners.clear();
-		await raceTimeout(Promise.allSettled(disposals), TIMING.shutdownDisposeMs, undefined, { unref: true });
+		await raceTimeout(Promise.allSettled(disposals), Math.max(0, deadlineAt - Date.now()), undefined, { unref: true });
+		await this.factory.dispose(deadlineAt);
 	}
 }
 

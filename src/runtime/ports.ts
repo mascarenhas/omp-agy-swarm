@@ -52,6 +52,7 @@ export interface HostMessage {
 export type WorkerEvent =
 	| { type: "agent_start" }
 	| { type: "agent_end" }
+	| { type: "agent_pause"; yielded: boolean; awaiting: boolean }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: HostMessage }
 	| { type: "message_end"; message: HostMessage }
@@ -99,6 +100,12 @@ export interface TranscriptEntry {
 	thinkingLevel?: string | null;
 }
 
+export interface WakeSources {
+	readonly jobs: readonly string[];
+	readonly agents: readonly string[];
+	readonly queued: boolean;
+}
+
 export interface WorkerSession {
 	readonly agentId: string;
 	readonly sessionId: string;
@@ -106,6 +113,10 @@ export interface WorkerSession {
 	readonly model: ModelInfo | undefined;
 	readonly thinkingLevel: string | undefined;
 	readonly isStreaming: boolean;
+	readonly isRunActive: boolean;
+	readonly wakeSources: WakeSources | undefined;
+	/** Also includes owned jobs whose result will not wake the session. */
+	readonly hasBackgroundWork: boolean;
 	/** The latest model request the host's cost gate refused (a new object per refusal). */
 	readonly costCapRefusal: { readonly message: string } | undefined;
 	prompt(text: string): Promise<unknown>;
@@ -167,6 +178,8 @@ export interface CreateWorkerOptions {
 
 export interface SessionFactory {
 	create(options: CreateWorkerOptions): Promise<WorkerSession>;
+	setPrintWake(active: boolean): void;
+	dispose(deadlineAt: number): Promise<void>;
 }
 
 export interface UsageLimitView {

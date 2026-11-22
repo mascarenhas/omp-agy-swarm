@@ -8,7 +8,7 @@ import { MEMBER_TOOL_NAMES, readEnv, SUPPORTED_HOST, TIMING } from "./env.ts";
 import { CoordinatorBinding } from "./runtime/coordinator.ts";
 import { stopGate } from "./runtime/gate.ts";
 import { applyPreSwarmSwitch } from "./runtime/models.ts";
-import { createSessionFactory, HOST_VERSION, scopedSettings, thinkingCaps } from "./runtime/omp-adapter.ts";
+import { createSessionFactory, HOST_VERSION, mainCanResume, scopedSettings, thinkingCaps } from "./runtime/omp-adapter.ts";
 import type { HostMessage } from "./runtime/ports.ts";
 import { registry } from "./runtime/registry.ts";
 import type { RuntimeDeps, SwarmRuntime } from "./runtime/runtime.ts";
@@ -124,7 +124,12 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		rt.rebind(bind(ctx));
-		rt.onMainAgentEnd({ willContinue: e.willContinue, awaitingAsyncWork: e.awaitingAsyncWork });
+		const last = rt.binding.headless && !e.willContinue ? e.messages.findLast(message => message.role === "assistant") : undefined;
+		rt.onMainAgentEnd({
+			willContinue: e.willContinue,
+			awaitingAsyncWork: e.awaitingAsyncWork,
+			mayResume: last?.role === "assistant" && last.stopReason !== "aborted" && last.stopReason !== "error" && mainCanResume(rt.sid),
+		});
 	});
 
 	pi.on("session_stop", async (e, ctx) => {
@@ -141,6 +146,7 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 		}
 		rt.rebind(b);
 		if (!b.headless) return;
+		rt.onMainStopHook();
 		const last = e.last_assistant_message as unknown as HostMessage | undefined;
 		return stopGate(rt, { signal: e.signal, lastStopReason: last?.stopReason });
 	});

@@ -20,10 +20,12 @@ import {
 	usageContextTokens,
 	VERSION,
 } from "@oh-my-pi/pi-coding-agent";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentLifecycleManager, type AgentLifecycleApi } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { cfgAsyncMaxJobs, cfgAsyncPrintWake } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { raceTimeout, TIMING } from "../env.ts";
@@ -31,6 +33,7 @@ import { HubBridge } from "./hub-bridge.ts";
 import { preferredAgentId } from "./member.ts";
 import type { CoordinatorBinding } from "./coordinator.ts";
 import { WorkerStartupUnstopped } from "./ports.ts";
+import { leasePrintWake } from "./print-wake.ts";
 import type {
 	CreateWorkerOptions,
 	CustomWakeMessage,
@@ -39,6 +42,7 @@ import type {
 	SessionFactory,
 	ThinkingCaps,
 	TranscriptEntry,
+	WakeSources,
 	WorkerEvent,
 	WorkerIdentity,
 	WorkerSession,
@@ -107,6 +111,15 @@ class HostWorkerSession implements WorkerSession {
 	get isStreaming(): boolean {
 		return this.#s.isStreaming;
 	}
+	get isRunActive(): boolean {
+		return this.#s.isRunActive;
+	}
+	get wakeSources(): WakeSources | undefined {
+		return this.#s.wakeSources;
+	}
+	get hasBackgroundWork(): boolean {
+		return !!this.#s.wakeSources || this.#host.hasOwnerWork();
+	}
 	get costCapRefusal(): { readonly message: string } | undefined {
 		return this.#s.costCapRefusal;
 	}
@@ -154,6 +167,11 @@ const loggedMissing = new Set<string>();
 
 type WorkerBus = ExtensionAPI["events"];
 
+/** Do not re-prompt Main from a terminal hook while the root is disposing or aborting. */
+export function mainCanResume(sid: string): boolean {
+	const main = AgentRegistry.global().get(MAIN_AGENT_ID)?.session;
+	return main instanceof AgentSession && main.sessionManager.getSessionId() === sid && !main.isDisposed && !main.isAborting;
+}
 // Cover the async gap before the SDK CAS, and keep a stopped id unavailable until
 // release completes (Tray's native stop path does not pass an exact ref).
 const reservedIds = new Set<string>();
@@ -163,6 +181,7 @@ class RegistryIdOccupied extends Error {}
 class WorkerRegistration {
 	readonly #registry: AgentRegistryApi;
 	readonly #lifecycle: AgentLifecycleApi;
+	readonly #jobs: AsyncJobManager | undefined;
 	readonly #options: CreateWorkerOptions;
 	readonly #coordinatorId: string;
 	readonly #identity: WorkerIdentity;
@@ -181,9 +200,10 @@ class WorkerRegistration {
 	#externalReleaseHook = false;
 	#releaseNotified = false;
 
-	constructor(registry: AgentRegistryApi, lifecycle: AgentLifecycleApi, options: CreateWorkerOptions, identity: WorkerIdentity, coordinatorId: string) {
+	constructor(registry: AgentRegistryApi, lifecycle: AgentLifecycleApi, options: CreateWorkerOptions, identity: WorkerIdentity, coordinatorId: string, jobs: AsyncJobManager | undefined) {
 		this.#registry = registry;
 		this.#lifecycle = lifecycle;
+		this.#jobs = jobs;
 		this.#options = options;
 		this.#coordinatorId = coordinatorId;
 		this.#identity = identity;
@@ -209,6 +229,7 @@ class WorkerRegistration {
 				try {
 					options.onHostKill(identity);
 				} finally {
+					this.#jobs?.cancelAll({ ownerId: ref.id });
 					this.#quiesce(true);
 				}
 			} else if (this.#raw && ((type === "removed" && ref === this.#ref) || (type === "registered" && ref !== this.#ref))) {
@@ -284,12 +305,20 @@ class WorkerRegistration {
 			if (this.#rawDisposal) return this.#rawDisposal;
 			const done = Promise.withResolvers<void>();
 			this.#rawDisposal = done.promise;
+			this.#jobs?.cancelAll({ ownerId: ref.id });
 			void dispose(options).catch(async err => {
 				// Fence the old transcript writer even on a failed native teardown.
 				// The failure still cannot authorize destructive workspace cleanup.
 				raw.sessionManager.seal();
 				await Promise.allSettled([raw.sessionManager.close(), raw.abort().catch(() => {}).then(() => raw.waitForIdle())]);
 				throw err;
+			}).finally(async () => {
+				// Dispose fences new admission and drains tool handlers. Re-scan
+				// owner jobs afterwards; cancellation alone does not reap them.
+				if (this.#jobs) {
+					const { completion } = await this.#jobs.cancelAndReapOwnerJobs(ref.id, Date.now() + TIMING.killStopMs);
+					await completion;
+				}
 			}).then(done.resolve, done.reject);
 			return done.promise;
 		};
@@ -307,6 +336,12 @@ class WorkerRegistration {
 		// adoption callback is installed. SDK construction has now also unwound.
 		if (this.#owner === "hostKill" && !this.#externalReleaseHook) void this.#released();
 		if (this.#retired) reservedIds.delete(this.id.toLowerCase());
+	}
+
+	hasOwnerWork(): boolean {
+		if (!this.#jobs) return false;
+		const filter = { ownerId: this.id };
+		return this.#jobs.getRunningJobs(filter).length > 0 || this.#jobs.hasPendingDeliveries(filter);
 	}
 
 	setBoardWait(waitId: string, waiting: boolean): void {
@@ -384,6 +419,7 @@ class WorkerRegistration {
 				// abort completes before disposal (as in Hub and Tray), but a
 				// stuck abort must not prevent disposal from starting.
 				if (ref) this.#registry.unregister(this.id, ref);
+				this.#jobs?.cancelAll({ ownerId: this.id });
 				const abort = raw.abort().then(() => ({ ok: true as const }), err => ({ ok: false as const, err }));
 				await raceTimeout(abort, TIMING.killStopMs / 2, undefined, { unref: true });
 				await raw.dispose();
@@ -409,19 +445,45 @@ class WorkerRegistration {
 
 /** Host registration is identical in TUI, RPC, print and JSON. */
 export function createSessionFactory(binding: CoordinatorBinding, events: WorkerBus, log: (line: string) => void): SessionFactory {
+	let manager: AsyncJobManager | undefined;
+	let factoryDisposal: Promise<void> | undefined;
+	let leasedSettings: Settings | undefined;
+	let releasePrintWake: (() => void) | undefined;
 	return {
+		setPrintWake(active) {
+			const settings = active && binding.headless ? binding.settings : undefined;
+			if (leasedSettings === settings) return;
+			releasePrintWake?.();
+			leasedSettings = settings;
+			releasePrintWake = settings ? leasePrintWake(settings, cfgAsyncPrintWake) : undefined;
+		},
+		dispose(deadlineAt) {
+			if (!factoryDisposal) {
+				releasePrintWake?.();
+				releasePrintWake = undefined;
+				leasedSettings = undefined;
+				factoryDisposal = (manager?.dispose({ timeoutMs: Math.max(0, deadlineAt - Date.now()) }) ?? Promise.resolve())
+					.then(() => {});
+			}
+			return factoryDisposal;
+		},
 		async create(o: CreateWorkerOptions): Promise<WorkerSession> {
 			o.signal.throwIfAborted();
 			const coordinatorId = binding.sessionId;
 			const rootFile = binding.sessionFile();
 			const base = binding.settings;
 			if (!base) throw new Error("the coordinator's settings are not captured yet");
+			const jobs = o.role === "worker"
+				? (manager ??= new AsyncJobManager({ maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(base)) }))
+				: undefined;
 			const scoped = sameRealPath(o.cwd, base.getCwd()) ? base : await base.cloneForCwd(o.cwd);
 			const settings = createSubagentSettings(scoped, {
 				...subagentLspWritethroughSettings(scoped),
-				"async.enabled": false,
-				"bash.autoBackground.enabled": false,
-				"eval.autoBackground.enabled": false,
+				...(jobs ? { "async.enabled": true } : {
+					"async.enabled": false,
+					"bash.autoBackground.enabled": false,
+					"eval.autoBackground.enabled": false,
+				}),
 			});
 			mkdirSync(o.sessionsDir, { recursive: true, mode: 0o700 });
 			// Hub and tree cost match lexical paths. The store uses realpath for
@@ -479,7 +541,7 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 					if (!occupied.has(key) && !reservedIds.has(key)) break;
 				} while (true);
 				reservedIds.add(key);
-				const registration = new WorkerRegistration(registry, lifecycle, o, { agentId: id, sessionId: sessionManager.getSessionId(), sessionFile: file }, coordinatorId);
+				const registration = new WorkerRegistration(registry, lifecycle, o, { agentId: id, sessionId: sessionManager.getSessionId(), sessionFile: file }, coordinatorId, jobs);
 				let sdkReturned = false;
 				try {
 					let checkedSlot = false;
@@ -488,6 +550,7 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						authStorage: binding.ctx.modelRegistry.authStorage,
 						modelRegistry: binding.ctx.modelRegistry,
 						settings,
+						asyncJobManager: jobs,
 						sessionManager,
 						model,
 						thinkingLevel: o.effort as ThinkingLevel | undefined,
@@ -502,6 +565,9 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						lspReadOnly: false,
 						skipPythonPreflight: true,
 						hasUI: false,
+						// The eval agent/workpool bridges consult this policy even
+						// when the native task tool is absent.
+						spawns: "",
 						parentTaskPrefix: id,
 						agentId: id,
 						agentDisplayName: o.name,

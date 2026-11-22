@@ -10,6 +10,7 @@ import type {
 	ModelInfo,
 	SessionFactory,
 	TranscriptEntry,
+	WakeSources,
 	WorkerEvent,
 	WorkerSession,
 } from "../../src/runtime/ports.ts";
@@ -64,6 +65,14 @@ export class ScriptedSession implements WorkerSession {
 	readonly #factory: ScriptedFactory;
 	readonly entries: TranscriptEntry[] = [];
 	#run: { ac: AbortController; done: Promise<void> } | undefined;
+	#runOpen = false;
+	get isRunActive(): boolean {
+		return this.#runOpen;
+	}
+	wakeSources: WakeSources | undefined;
+	get hasBackgroundWork(): boolean {
+		return !!this.wakeSources;
+	}
 	#last: HostMessage | undefined;
 	disposed = false;
 	/** Set by a test (or a brain) to emulate the host cost gate refusing a request. */
@@ -124,7 +133,10 @@ export class ScriptedSession implements WorkerSession {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#run = { ac, done: promise };
 		this.inputs.push(input);
-		for (const listener of this.#runListeners) listener("running");
+		if (!this.#runOpen) {
+			this.#runOpen = true;
+			for (const listener of this.#runListeners) listener("running");
+		}
 		this.emit({ type: "agent_start" });
 		this.emit({ type: "message_start", message: receipt });
 		this.emit({ type: "message_end", message: receipt });
@@ -196,9 +208,16 @@ export class ScriptedSession implements WorkerSession {
 		this.#entry(this.#last);
 		this.emit({ type: "turn_end" });
 		this.#run = undefined;
+		if (stopReason !== "aborted" && this.wakeSources) this.emit({ type: "agent_pause", yielded: true, awaiting: true });
+		else this.endRun();
+		resolve();
+	}
+
+	endRun(): void {
+		if (!this.#runOpen) return;
+		this.#runOpen = false;
 		for (const listener of this.#runListeners) listener("idle");
 		this.emit({ type: "agent_end" });
-		resolve();
 	}
 
 	async prompt(text: string): Promise<unknown> {
@@ -244,6 +263,8 @@ export class ScriptedSession implements WorkerSession {
 		if (f === "throw-before") throw new Error("switch failed before applying (scripted)");
 		this.model = model;
 		if (effort !== undefined) this.thinkingLevel = effort;
+		const gate = this.#factory.switchGates.get(this.name);
+		if (gate) await gate;
 		if (f === "throw-after") throw new Error("reconcile failed after applying (scripted)");
 		if (f === "slow") await Bun.sleep(50);
 	}
@@ -285,6 +306,10 @@ export class ScriptedSession implements WorkerSession {
 		const gate = this.#factory.disposeGates.get(this.name);
 		if (gate) await gate;
 		this.disposed = true;
+		if (this.wakeSources) {
+			this.teardown.push(`cancel/reap ${this.agentId}`);
+			this.wakeSources = undefined;
+		}
 		this.#run?.ac.abort();
 	}
 }
@@ -298,6 +323,7 @@ export class ScriptedFactory implements SessionFactory {
 	readonly sent: { name: string; message: CustomWakeMessage }[] = [];
 	readonly sendModes = new Map<string, SendMode[]>();
 	readonly switchModes = new Map<string, string>();
+	readonly switchGates = new Map<string, Promise<void>>();
 	readonly disposeHangs = new Set<string>();
 	readonly disposeGates = new Map<string, Promise<void>>();
 	/** Gates construction per name (resolve to let it finish). */
@@ -307,6 +333,11 @@ export class ScriptedFactory implements SessionFactory {
 	readonly usage = new Map<string, HostMessage["usage"]>();
 	defaultBrain: Brain = async () => {};
 	#ids = 0;
+	readonly printWake: boolean[] = [];
+	setPrintWake(active: boolean): void {
+		this.printWake.push(active);
+	}
+	async dispose(): Promise<void> {}
 
 	sendMode(name: string): SendMode {
 		const q = this.sendModes.get(name);
