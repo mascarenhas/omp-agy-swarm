@@ -17,6 +17,8 @@ function shortModel(m: unknown): string {
 }
 
 export function callLine(tool: string, args: Record<string, unknown>): string {
+	const name = typeof args.name === "string" ? args.name.trim() : "";
+	const channel = typeof args.channel === "string" ? args.channel.trim() : "";
 	switch (tool) {
 		case "swarm": {
 			const a = String(args.action ?? "");
@@ -24,20 +26,20 @@ export function callLine(tool: string, args: Record<string, unknown>): string {
 				const bits = [shortModel(args.model), args.effort, args.workspace && args.workspace !== "inherit" ? args.workspace : ""]
 					.filter(Boolean)
 					.join(" · ");
-				const who = args.role && args.role !== "worker" ? String(args.role) : String(args.name ?? "");
+				const who = args.role && args.role !== "worker" ? String(args.role) : name;
 				return `swarm add ${who}${bits ? ` (${bits})` : ""}`;
 			}
-			if (a === "model") return `swarm model ${args.name ?? "self"} → ${shortModel(args.model) || ""}${args.effort ? ` · ${args.effort}` : ""}`;
-			if (a === "channel") return `swarm channel ${args.op ?? ""} ${args.channel ? `#${args.channel}` : ""}`;
-			return `swarm ${a}${args.name ? ` ${args.name}` : ""}`;
+			if (a === "model") return `swarm model ${name || "self"} → ${shortModel(args.model) || ""}${args.effort ? ` · ${args.effort}` : ""}`;
+			if (a === "channel") return `swarm channel ${args.op ?? ""} ${channel ? `#${channel}` : ""}`;
+			return `swarm ${a}${name ? ` ${name}` : ""}`;
 		}
 		case "post_message": {
 			const text = String(args.text ?? "");
 			const to = text.match(/^\s*(@[#\w-]+)/)?.[1] ?? "";
-			return `post${to ? ` → ${to}` : ""}${args.channel ? ` · #${args.channel}` : ""}`;
+			return `post${to ? ` → ${to}` : ""}${channel ? ` · #${channel}` : ""}`;
 		}
 		case "read_board":
-			return args.status ? "read_board status" : `read_board${args.channel ? ` #${args.channel}` : ""}${args.since !== undefined ? ` after #${args.since}` : ""}`;
+			return args.status ? "read_board status" : `read_board${channel ? ` #${channel}` : ""}${typeof args.since === "number" ? ` after #${args.since}` : ""}`;
 		case "swarm_wait":
 			return `swarm_wait${args.mentions_only === false ? " (any post)" : ""}${args.timeout_seconds ? ` ≤${args.timeout_seconds}s` : ""}`;
 		default:

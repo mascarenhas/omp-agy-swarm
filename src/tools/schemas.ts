@@ -8,17 +8,24 @@ import type { PostParams, ReadParams, SwarmParams, WaitParams } from "./ops.ts";
 
 export type Zod = ExtensionAPI["zod"];
 
+const OMIT_UNUSED = " Omit unused optional arguments; use null if your tool-call format requires a value.";
+
 export const DESCRIPTIONS = {
 	swarm:
-		"Manage the swarm: parallel worker agents, each in its own conversation, sharing one message board. Actions: status | models | add | model | kill | revive | finish | title | channel. add{name, brief, model?, effort?, tasks?|n?, fork?, workspace?, channels?, role?} starts a worker and posts its brief as `@name brief`; without model/effort it runs on yours. model{name?, model?, effort?} changes a waiting member's (or your own) model or effort; it keeps its conversation. kill{name} is permanent. workspace: inherit = your working copy; share = its own git worktree starting from your working copy as it stands (uncommitted changes included, ignored files not); branch = its own worktree from your last commit. models{query?, provider?} lists runnable models with their effort levels. Coordinators: read skill://swarm before the first add.",
+		"Manage the swarm: parallel worker agents, each in its own conversation, sharing one message board. Actions: status | models | add | model | kill | revive | finish | title | channel. add{name, brief, model?, effort?, tasks?|n?, fork?, workspace?, channels?, role?} starts a worker and posts its brief as `@name brief`; without model/effort it runs on yours. model{name?, model?, effort?} changes a waiting member's (or your own) model or effort; it keeps its conversation. kill{name} is permanent. workspace: inherit = your working copy; share = its own git worktree starting from your working copy as it stands (uncommitted changes included, ignored files not); branch = its own worktree from your last commit. models{query?, provider?} lists runnable models with their effort levels. Coordinators: read skill://swarm before the first add." +
+		' Omit unused parameters; use "" for unused enum fields, [] for arrays, or null for other optional fields.',
 	post_message:
-		"Post to the swarm's message board. Start with the @name of whoever must act on it (@all for everyone, @#channel for a channel's members); a mention wakes that member. Refer to earlier posts as #seq.",
+		"Post to the swarm's message board. Start with the @name of whoever must act on it (@all for everyone, @#channel for a channel's members); a mention wakes that member. Refer to earlier posts as #seq." +
+		OMIT_UNUSED,
 	read_board:
-		'Read the swarm\'s message board: posts after `since` (default: your read cursor) in your own view; channel:"name" reads one channel, "*" all. status:true returns each member\'s state, wake mode and cursors instead of posts.',
+		'Read the swarm\'s message board: posts after `since` (default: your read cursor) in your own view; channel:"name" reads one channel, "*" all. status:true returns each member\'s state, wake mode and cursors instead of posts.' +
+		OMIT_UNUSED,
 	swarm_wait:
-		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it as the last tool call of your response. Sleeping costs nothing.",
+		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it as the last tool call of your response. Sleeping costs nothing." +
+		OMIT_UNUSED,
 	swarm_wait_worker:
-		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it on its own: it must be the only tool call of its response. Sleeping costs nothing.",
+		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it on its own: it must be the only tool call of its response. Sleeping costs nothing." +
+		OMIT_UNUSED,
 } as const;
 
 export interface Schemas {
@@ -29,48 +36,58 @@ export interface Schemas {
 }
 
 export function buildSchemas(z: Zod): Schemas {
-	const effort = z.enum(EFFORTS);
+	// Keep one concrete wire type per field for CCA and Cursor. The host
+	// already drops null for non-nullable optional enum and array inputs.
+	const text = z.string().nullable().transform(value => value?.trim() ? value : undefined).optional();
+	const bool = z.boolean().nullable().transform(value => value ?? undefined).optional();
+	const array = z.array(z.string()).transform(value => value.length ? value : undefined).optional();
+	const integer = z.number().int().min(0);
+	const seq = integer.nullable().transform(value => value ?? undefined).optional();
+	const count = (schema: ZodLikeSchema<number>) =>
+		schema.nullable().transform(value => value === 0 ? undefined : value ?? undefined).optional();
+	const choice = (values: readonly [string, ...string[]]) =>
+		z.enum(["", ...values]).transform(value => value === "" ? undefined : value).optional();
 	return {
 		swarm: z.object({
 			action: z
 				.enum(["status", "models", "add", "model", "kill", "revive", "finish", "title", "channel"])
 				.describe("What to do"),
-			name: z.string().optional().describe("add: worker name or group prefix; model/kill/revive: member or group prefix; channel (un)subscribe: member"),
-			brief: z.string().optional().describe("add: what the worker owns (≤ 6000 characters); optional for role narrator|monitor"),
-			model: z.string().optional().describe('add, model: "provider/id" | bare id | "@role", optional ":effort" suffix'),
-			effort: effort.optional().describe("add, model: reasoning effort"),
-			tasks: z.array(z.string()).optional().describe("add: 1..16 slices, each ≤ 1500 characters → <name>-1..<name>-k"),
-			n: z.number().int().optional().describe("add: 2..16 homogeneous copies (not with tasks)"),
-			fork: z.string().optional().describe('add: member name or "coordinator" whose conversation the worker starts from'),
-			workspace: z.enum(["inherit", "share", "branch"]).optional().describe("add: where the worker works (default inherit)"),
-			channels: z.array(z.string()).optional().describe("add: initial subscriptions; the first is the brief's channel"),
-			role: z.enum(["worker", "narrator", "monitor"]).optional().describe("add: default worker"),
-			discard_ignored: z.boolean().optional().describe("kill: also remove ignored files in the worktree"),
-			keep_workspace: z.boolean().optional().describe("kill: keep the worktree"),
-			summary: z.string().optional().describe("finish: the [done] summary (no @mentions)"),
-			abandon: z.boolean().optional().describe("finish: cancel what is still running and record it"),
-			title: z.string().optional().describe("title: ≤ 80 characters"),
-			op: z.enum(["create", "list", "subscribe", "unsubscribe", "archive"]).optional().describe("channel: operation"),
-			channel: z.string().optional().describe("channel: channel name"),
-			topic: z.string().optional().describe("channel create: topic"),
-			query: z.string().optional().describe("models: terms that must all match provider/id or name"),
-			provider: z.string().optional().describe("models: exact provider"),
-			limit: z.number().int().optional().describe("models: 1..100 (default 40)"),
+			name: text.describe("add: worker name or group prefix; model/kill/revive: member or group prefix; channel (un)subscribe: member"),
+			brief: text.describe("add: what the worker owns (≤ 6000 characters); optional for role narrator|monitor"),
+			model: text.describe('add, model: "provider/id" | bare id | "@role", optional ":effort" suffix'),
+			effort: choice(EFFORTS).describe('add, model: "" uses the model suffix or inherited/current effort; "off" explicitly disables reasoning'),
+			tasks: array.describe("add: 1..16 slices, each ≤ 1500 characters → <name>-1..<name>-k; [] omits"),
+			n: count(integer).describe("add: 2..16 homogeneous copies (not with tasks); 0 or null omits"),
+			fork: text.describe('add: member name or "coordinator" whose conversation the worker starts from'),
+			workspace: choice(["inherit", "share", "branch"]).describe('add: where the worker works ("" defaults to inherit)'),
+			channels: array.describe('add: initial subscriptions; first is the brief channel; [] omits; ["main"] selects only main'),
+			role: choice(["worker", "narrator", "monitor"]).describe('add: "" defaults to worker'),
+			discard_ignored: bool.describe("kill: also remove ignored files in the worktree"),
+			keep_workspace: bool.describe("kill: keep the worktree"),
+			summary: text.describe("finish: the [done] summary (no @mentions)"),
+			abandon: bool.describe("finish: cancel what is still running and record it"),
+			title: text.describe("title: ≤ 80 characters"),
+			op: choice(["create", "list", "subscribe", "unsubscribe", "archive"]).describe('channel: operation; use "" for other actions'),
+			channel: text.describe("channel: channel name"),
+			topic: text.describe("channel create: topic"),
+			query: text.describe("models: terms that must all match provider/id or name"),
+			provider: text.describe("models: exact provider"),
+			limit: count(integer).describe("models: 1..100 (0 or null uses default 40)"),
 		}),
 		post_message: z.object({
 			text: z.string().describe("The post (1..8000 characters). Start with the @name of whoever must act."),
-			channel: z.string().optional().describe("Channel (default: your default channel, else main)"),
+			channel: text.describe("Channel (default: your default channel, else main)"),
 		}),
 		read_board: z.object({
-			since: z.number().int().min(0).optional().describe("Posts after this seq (default: your read cursor)"),
-			limit: z.number().int().min(1).max(200).optional().describe("At most this many posts (default 50)"),
-			channel: z.string().optional().describe('"*" = every channel; a name = that channel only; omitted = your own view'),
-			status: z.boolean().optional().describe("true: member status instead of posts"),
+			since: seq.describe("Posts after this seq (0 reads from the start; null uses your read cursor)"),
+			limit: count(integer.max(200)).describe("At most this many posts (0 or null uses default 50)"),
+			channel: text.describe('"*" = every channel; a name = that channel only; omitted = your own view'),
+			status: bool.describe("true: member status instead of posts"),
 		}),
 		swarm_wait: z.object({
-			since: z.number().int().min(0).optional().describe("Advisory; the board remembers your cursor"),
-			mentions_only: z.boolean().optional().describe("Default true; false wakes on any post you can see"),
-			timeout_seconds: z.number().int().min(1).max(86_400).optional().describe("Wake at the latest after this many seconds"),
+			since: seq.describe("Advisory; null uses the remembered read cursor"),
+			mentions_only: bool.describe("Null or true wakes only if named; false wakes on any post you can see"),
+			timeout_seconds: count(integer.max(86_400)).describe("Wake at the latest after this many seconds (0 or null means no timer)"),
 		}),
 	};
 }

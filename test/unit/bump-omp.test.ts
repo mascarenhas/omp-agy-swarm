@@ -31,6 +31,8 @@ describe("bump-omp helpers", () => {
 		const res = updatePackageJson(raw, "19.9.9");
 		expect(res.changed).toBe(true);
 		expect(res.packages).toEqual([
+			"@oh-my-pi/omptype",
+			"@oh-my-pi/pi-ai",
 			"@oh-my-pi/pi-catalog",
 			"@oh-my-pi/pi-coding-agent",
 			"@oh-my-pi/pi-tui",
@@ -39,6 +41,8 @@ describe("bump-omp helpers", () => {
 		]);
 		const parsed = JSON.parse(res.next);
 		expect(parsed.peerDependencies["@oh-my-pi/pi-coding-agent"]).toBe("19.9.9");
+		expect(parsed.devDependencies["@oh-my-pi/omptype"]).toBe("19.9.9");
+		expect(parsed.devDependencies["@oh-my-pi/pi-ai"]).toBe("19.9.9");
 		expect(parsed.devDependencies["@oh-my-pi/pi-coding-agent"]).toBe("19.9.9");
 		expect(parsed.devDependencies["@oh-my-pi/pi-catalog"]).toBe("19.9.9");
 		expect(parsed.devDependencies["@oh-my-pi/pi-tui"]).toBe("19.9.9");

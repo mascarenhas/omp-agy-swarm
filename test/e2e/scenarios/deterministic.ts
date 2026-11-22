@@ -1,9 +1,10 @@
-// D0–D12 (§12.3): deterministic scenarios against the real omp binary and the scripted mock.
+// D0–D13 (§12.3): deterministic scenarios against the real omp binary and the scripted mock.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveOmpBin, stripNodeModulesBins } from "../../../scripts/omp-bin.ts";
+import { paddedAdd, paddedWait } from "../../fixtures/zero-filled.ts";
 import { board, type Ctx, metrics, requests, roster } from "../check.ts";
 import type { Rule, Script } from "../mock-llm/server.ts";
 import { REPO, type Scenario, tool } from "../scenario.ts";
@@ -585,4 +586,42 @@ const D12: Scenario = {
 	},
 };
 
-export const DETERMINISTIC: Scenario[] = [D0a, D0b, D0c, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12];
+const D13: Scenario = {
+	id: "D13",
+	title: "zero-filled add, member post and member wait behave like omitted arguments",
+	script: () => ({
+		coord: {
+			rules: [
+				accepted,
+				{ when: "^tool:.*DONE-PADDING", reply: finish("padding verified") },
+				{
+					when: "^tool:.*READY-PADDING",
+					times: 1,
+					reply: { tools: [tool("post_message", { text: "@probe CHALLENGE-PADDING", channel: "" })] },
+				},
+				{ when: "^tool:", reply: { tools: [tool("swarm_wait", paddedWait)] } },
+			],
+			default: { tools: [tool("swarm", { ...paddedAdd, model: "mock/worker-a" })] },
+		},
+		"worker-a": {
+			rules: [
+				{ when: "You are `probe`", reply: { tools: [tool("post_message", { text: "@coordinator READY-PADDING", channel: "" })] } },
+				{
+					when: '^tool:.*"woke":"post".*CHALLENGE-PADDING',
+					reply: { tools: [tool("post_message", { text: "@coordinator [done] DONE-PADDING", channel: "" })] },
+				},
+				{ when: '^tool: \\{"seq":', reply: { tools: [tool("swarm_wait", paddedWait)] } },
+			],
+		},
+	}),
+	runs: [{ prompt: "run padding probe" }],
+	check: (c, k) => {
+		k.eq(metrics(c)?.outcome?.value, "complete", "outcome");
+		const r = roster(c);
+		k.eq(Object.keys(r).filter(name => name !== "coordinator"), ["probe"], "one worker, not a group");
+		k.eq(r.probe?.effort, "high", "worker inherits coordinator effort");
+		k.ok(board(c).some(m => m.text === "@coordinator [done] DONE-PADDING"), "padded worker wait delivered the challenge");
+	},
+};
+
+export const DETERMINISTIC: Scenario[] = [D0a, D0b, D0c, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13];
