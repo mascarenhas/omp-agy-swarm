@@ -24,13 +24,14 @@ export default function observe(pi: ExtensionAPI): void {
 	const sample = (): void => {
 		for (const holder of sessions.values()) {
 			const snapshot = holder.session.getAsyncJobSnapshot();
-			if (!snapshot) continue;
-			const jobs = [...snapshot.running, ...snapshot.recent].map(({ id, ownerId, agentId, type, status, startTime, endTime }) =>
+			const wakeSources = holder.session.wakeSources;
+			if (!snapshot && !wakeSources) continue;
+			const jobs = [...snapshot?.running ?? [], ...snapshot?.recent ?? []].map(({ id, ownerId, agentId, type, status, startTime, endTime }) =>
 				({ id, ownerId, agentId, type, status, startTime, endTime }));
-			const next = JSON.stringify(jobs);
+			const next = JSON.stringify({ jobs, wakeSources });
 			if (next === holder.last) continue;
 			holder.last = next;
-			write({ kind: "jobs", ...holder.identity, jobs });
+			write({ kind: "jobs", ...holder.identity, jobs, wakeSources });
 		}
 	};
 	const record = (id: string, source: "session" | "task", ev: AgentSessionEvent): void => {
@@ -48,10 +49,14 @@ export default function observe(pi: ExtensionAPI): void {
 				const swarmArgs = args && { action: args.action, name: args.name, n: args.n, fork: args.fork,
 					tasks: Array.isArray(args.tasks) ? args.tasks.length : undefined,
 					channels: Array.isArray(args.channels) ? args.channels.length : undefined };
-				write({ ...base, tool: ev.toolName, callId: ev.toolCallId, swarmArgs });
+				const timeout = (ev.toolName === "swarm_wait" ? ev.args as { timeout_seconds?: unknown } | undefined : undefined)?.timeout_seconds;
+				write({ ...base, tool: ev.toolName, callId: ev.toolCallId, swarmArgs, timeoutSeconds: typeof timeout === "number" ? timeout : undefined });
 				break;
 			}
 			case "tool_execution_end":
+				// Snapshot exact owner work before recording Main's wait result, not
+				// only on the next periodic sample (which may be after a job ends).
+				if (id === "Main" && ev.toolName === "swarm_wait") sample();
 				write({ ...base, tool: ev.toolName, callId: ev.toolCallId, isError: ev.isError,
 					text: contentText(ev.result?.content).slice(0, 8000) });
 				break;

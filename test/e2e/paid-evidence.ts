@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { roster } from "./check.ts";
+import { type Checks, roster } from "./check.ts";
 
 export interface PaidCtx {
 	T: string;
@@ -18,10 +18,10 @@ export type Job = { id: string; ownerId?: string; agentId?: string; type: string
 type RecordBody =
 	| { kind: "root"; swarm?: string; sessionFile?: string; agentDir: string; agentDb: string; terminalSessionsDir: string }
 	| ({ kind: "ref"; change: string; status: string; attached: boolean; sessionFile: string | null; model?: string; effort?: string } & Identity)
-	| ({ kind: "jobs"; jobs: Job[] } & Identity)
+	| ({ kind: "jobs"; jobs: Job[]; wakeSources?: { jobs: readonly string[]; agents: readonly string[]; queued: boolean } } & Identity)
 	| { kind: "life"; id: string; status: string; agent: string }
 	| { kind: "progress"; id: string; status: string; agent: string; tool?: string; intent?: string; model?: string; effort?: string }
-	| { kind: "event"; id: string; source: "session" | "task"; event: string; awaiting?: boolean; callId?: string; tool?: string; isError?: boolean; text?: string; customType?: string; swarmArgs?: { action?: unknown; name?: unknown; n?: unknown; tasks?: number; fork?: unknown; channels?: number } }
+	| { kind: "event"; id: string; source: "session" | "task"; event: string; awaiting?: boolean; callId?: string; tool?: string; timeoutSeconds?: number; isError?: boolean; text?: string; customType?: string; swarmArgs?: { action?: unknown; name?: unknown; n?: unknown; tasks?: number; fork?: unknown; channels?: number } }
 	| { kind: "response"; id: string; text: string }
 	| { kind: "usage"; id: string; source: "session" | "task"; model: string; cost?: number; tokens: number; timestamp: number }
 	| { kind: "stop"; pending: readonly string[] }
@@ -72,6 +72,51 @@ export function entries(c: PaidCtx, name: string): Entry[] {
 
 export function usageTokens(u: Usage | undefined): number {
 	return u?.totalTokens || (u?.input ?? 0) + (u?.output ?? 0);
+}
+
+/** Returned stall wakes, checked against the task workers' state at that trace position. */
+function stallWakes(trace: Trace[], workers: ReadonlyMap<string, Entry[]>) {
+	const stalls: { at: number; pending: string[] }[] = [];
+	for (const [index, row] of trace.entries()) {
+		if (row.kind !== "event" || row.id !== "Main" || row.source !== "session" ||
+			row.tool !== "swarm_wait" || row.event !== "tool_execution_end" || !/"woke"\s*:\s*"stall"/.test(row.text ?? "")) continue;
+		const prior = trace.slice(0, index);
+		const pending: string[] = [];
+		for (const [id, journal] of workers) {
+			const ref = prior.findLast((r): r is Frame<"ref"> => r.kind === "ref" && r.id === id);
+			if (ref?.change === "removed" || ref?.status === "aborted") continue;
+			const snapshot = prior.findLast((r): r is Frame<"jobs"> => r.kind === "jobs" && r.id === id && (!ref || r.generation === ref.generation));
+			const job = snapshot?.jobs.find(j => j.ownerId === id && j.status === "running" && j.startTime <= row.at);
+			if (job) pending.push(`${id}: pending job ${job.id}`);
+			if (snapshot?.wakeSources) pending.push(`${id}: native wake sources`);
+			const loop = prior.findLast((r): r is Frame<"event"> => r.kind === "event" && r.id === id && r.source === "session" &&
+				["agent_start", "agent_pause", "agent_end"].includes(r.event));
+			if (loop?.event === "agent_pause" && loop.awaiting) pending.push(`${id}: awaiting background work`);
+			const wait = prior.findLast((r): r is Frame<"event"> => r.kind === "event" && r.id === id && r.source === "session" &&
+				r.tool === "swarm_wait" && (r.event === "tool_execution_start" || r.event === "tool_execution_end"));
+			const progress = prior.findLast((r): r is Frame<"progress"> => r.kind === "progress" && r.id === id);
+			const parked = wait?.event === "tool_execution_start" && progress?.tool === "swarm_wait" && progress.intent === "waiting on board";
+			if (parked) {
+				// Older receipts omit timeoutSeconds; the matching assistant tool
+				// call in the journal still distinguishes timed from untimed waits.
+				const calls = journal.flatMap(entry => entry.message?.role === "assistant" && Array.isArray(entry.message.content)
+					? entry.message.content as { type?: string; id?: string; arguments?: { timeout_seconds?: unknown } }[] : []);
+				const timeout = wait.timeoutSeconds ?? calls.find(call => call.type === "toolCall" && call.id === wait.callId)?.arguments?.timeout_seconds;
+				if (typeof timeout === "number" && timeout > 0) pending.push(`${id}: armed timed wait`);
+			} else if (loop ? loop.event !== "agent_end" : ref?.status === "running") {
+				pending.push(`${id}: open turn`);
+			}
+		}
+		stalls.push({ at: row.at, pending });
+	}
+	return stalls;
+}
+
+export function checkStallWakes(k: Checks, trace: Trace[], workers: ReadonlyMap<string, Entry[]>, count: number | undefined): void {
+	const stalls = stallWakes(trace, workers);
+	k.eq(stalls.length, count, "stall count matches observer receipts");
+	for (const { at, pending } of stalls)
+		k.ok(!pending.length, `coordinator woke:stall at ${new Date(at).toISOString()} with pending worker work (${pending.join(", ")})`);
 }
 
 /**

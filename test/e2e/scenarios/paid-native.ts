@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { board, metrics, readJson, roster } from "../check.ts";
 import { EFFORT, type PaidScenario, SCOUT_PROVIDERS, W } from "../paid-contract.ts";
-import { contentText, directBill, entries, type Entry, evidence, type Frame, jsonl, type Trace } from "../paid-evidence.ts";
+import { checkStallWakes, contentText, directBill, entries, type Entry, evidence, type Frame, jsonl, type Trace } from "../paid-evidence.ts";
 import { acceptedHubFinish, BARRIER, file, HUB_DIRTY, HUB_MARKER, HUB_NOTICE, live, mark, parked, pids, runningBash, signal, until } from "../paid-fixtures.ts";
 
 const events = (rows: Trace[], id: string | undefined) => rows.filter((r): r is Frame<"event"> => r.kind === "event" && r.id === id && r.source === "session");
@@ -88,7 +88,9 @@ const R10: PaidScenario = {
 		k.ok(refusal > ready && block > refusal && release > block && runningBash(trace.slice(0, release), id) && trace.slice(refusal + 1, block).some(r => r.kind === "stop"),
 			"normal finish refused and actual stop gate blocked for background work while the latch was held");
 		k.ok((metrics(c)?.coordinator?.gate_refusals ?? 0) >= 1, "real stop-gate refusal persisted");
-		k.eq(metrics(c)?.coordinator?.stall_wakes, 0, "no false stall wake");
+		const workers = new Map(Object.entries(members).flatMap(([name, member]) =>
+			member.role === "worker" && member.agent_id ? [[member.agent_id, entries(c, name)] as const] : []));
+		checkStallWakes(k, trace, workers, metrics(c)?.coordinator?.stall_wakes);
 		const resumed = events(trace.slice(release + 1), id);
 		k.eq(resumed.filter(r => r.tool === "swarm_wait" && r.event === "tool_execution_end" && jobWake.test(r.text ?? "")).length, 1, "one worker woke:job receipt");
 		k.eq(resumed.filter(r => asyncResult(r) && r.text?.includes(NONCE)).length, 1, "actual worker async-result with nonce delivered once");

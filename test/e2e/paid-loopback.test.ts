@@ -5,9 +5,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveOmpBin } from "../../scripts/omp-bin.ts";
+import { Checks, metrics, roster } from "./check.ts";
 import type { Rule, Script, ToolCallSpec } from "./mock-llm/server.ts";
-import { directBill, type Entry, evidence, jsonl, type PaidCtx, type Trace } from "./paid-evidence.ts";
-import { HUB_DIRTY, HUB_MARKER } from "./paid-fixtures.ts";
+import { checkStallWakes, directBill, entries, type Entry, evidence, jsonl, type PaidCtx, type Trace } from "./paid-evidence.ts";
+import { HUB_DIRTY, HUB_MARKER, mark } from "./paid-fixtures.ts";
 import { runPaidCase, untouchedHubStartup } from "./paid-runner.ts";
 import { tool } from "./scenario.ts";
 import { NATIVE_PAID } from "./scenarios/paid-native.ts";
@@ -22,6 +23,38 @@ const finish = (summary: string) => swarm("finish", { summary });
 const bash = (command: string, async = false) => tool("bash", { command, async, timeout: 45 });
 const accepted = '"completion":"accepted"';
 const workerStart = (name: string) => `You are \`${name}\``;
+
+const R10_LATE_REFUSAL = /Cannot finish: asyncworker (?:is working|posted, but its turn is still open)/;
+
+function r10Script(workerReturn: Promise<void>): Script {
+	return {
+		coord: { rules: [
+			call("Add one worker named asyncworker", add("asyncworker")),
+			call('"added"', bash("/usr/bin/python3 barrier.py wait worker && echo HELD-WORKER")),
+			call("HELD-WORKER", finish("R10 early probe")),
+			say("Cannot finish.*background work|waiting on background work", "The held job prevents finish."),
+			call("The swarm still has outstanding work", wait),
+			call("R10-WORKER-ef328d8a", bash("/usr/bin/python3 barrier.py nonce main", true)),
+			call("R10-MAIN-e174c301", finish("R10-MAIN-e174c301")),
+			call(R10_LATE_REFUSAL.source, wait),
+			call('"woke":"stall"', finish("R10-MAIN-e174c301")),
+			say(accepted, "R10 complete"),
+			say('^tool:|^user:', "I will yield to native work."),
+		] },
+		"worker-a": { rules: [
+			call(workerStart("asyncworker"), bash("/usr/bin/python3 barrier.py nonce worker", true)),
+			call("R10-WORKER-ef328d8a", post("@coordinator [done] R10-WORKER-ef328d8a")),
+			{ when: '^tool:\\s*\\{"seq":2,', reply: { text: "Reported the worker nonce; no more work.", wait: workerReturn } },
+		], default: { tools: [wait] } },
+	};
+}
+
+function r10WaitAfterRefusal(trace: Trace[]): number {
+	const refused = trace.findIndex(row => row.kind === "event" && row.id === "Main" &&
+		row.tool === "swarm" && row.event === "tool_execution_end" && row.isError && R10_LATE_REFUSAL.test(row.text ?? ""));
+	return refused < 0 ? -1 : trace.findIndex((row, i) => i > refused && row.kind === "event" && row.id === "Main" &&
+		row.tool === "swarm_wait" && row.event === "tool_execution_start");
+}
 
 const scripts: Record<string, Script> = {
 	R9: {
@@ -39,23 +72,6 @@ const scripts: Record<string, Script> = {
 			{ when: `^tool:.*${HUB_MARKER}`, reply: { text: HUB_MARKER, tools: [wait] } },
 			call('"woke":"nudge"', wait),
 		] },
-	},
-	R10: {
-		coord: { rules: [
-			call("Add one worker named asyncworker", add("asyncworker")),
-			call('"added"', bash("/usr/bin/python3 barrier.py wait worker && echo HELD-WORKER")),
-			call("HELD-WORKER", finish("R10 early probe")),
-			say("Cannot finish.*background work|waiting on background work", "The held job prevents finish."),
-			call("The swarm still has outstanding work", wait),
-			call("R10-WORKER-ef328d8a", bash("/usr/bin/python3 barrier.py nonce main", true)),
-			call("R10-MAIN-e174c301", finish("R10-MAIN-e174c301")),
-			say(accepted, "R10 complete"),
-			say('^tool:|^user:', "I will yield to native work."),
-		] },
-		"worker-a": { rules: [
-			call(workerStart("asyncworker"), bash("/usr/bin/python3 barrier.py nonce worker", true)),
-			call("R10-WORKER-ef328d8a", post("@coordinator [done] R10-WORKER-ef328d8a")),
-		], default: { tools: [wait] } },
 	},
 	R11: {
 		coord: { rules: [
@@ -132,13 +148,51 @@ test("R9 missing metrics prove zero spend only before any input and materializat
 
 for (const scenario of NATIVE_PAID) {
 	test.skipIf(scenario.id === "R12" && process.platform !== "linux")(`${scenario.id} loopback smoke (no paid evidence)`, async () => {
-		const result = await runPaidCase(scenario, { omp: resolveOmpBin(), cap: 1, deadline: performance.now() + 55_000,
+		const workerReturn = Promise.withResolvers<void>();
+		let released = false;
+		const configured = scenario.id === "R10" ? {
+			...scenario,
+			tick(c: PaidCtx, trace: Trace[]) {
+				scenario.tick?.(c, trace);
+				if (released || r10WaitAfterRefusal(trace) < 0) return;
+				released = true;
+				mark(c, "loopback:release-worker-final");
+				workerReturn.resolve();
+			},
+		} : scenario;
+		const result = await runPaidCase(configured, { omp: resolveOmpBin(), cap: 1, deadline: performance.now() + 55_000,
 			// Reproduce the paid profile's glyph, rather than relying on the loopback default.
 			loopbackSymbolPreset: scenario.id === "R9" ? "nerd" : undefined,
-			scoutOverride: scenario.id === "R11" ? "mock/worker-b:low" : undefined, loopback: scripts[scenario.id]! });
+			scoutOverride: scenario.id === "R11" ? "mock/worker-b:low" : undefined,
+			loopback: scenario.id === "R10" ? r10Script(workerReturn.promise) : scripts[scenario.id]! }).finally(workerReturn.resolve);
 		// The two model-route failures are intentional: loopback is not an authorized paid scout route.
 		const failures = result.k.failures.filter(f => !(scenario.id === "R11" && f.startsWith("actual priced usage on an approved route:")));
 		expect(failures, `Retained loopback artifacts: ${result.c.T}`).toEqual([]);
+		if (scenario.id === "R10") {
+			const trace = evidence(result.c);
+			const id = roster(result.c).asyncworker?.agent_id;
+			expect(id).toBeDefined();
+			const wait = r10WaitAfterRefusal(trace);
+			const releasedFinal = trace.findIndex(r => r.kind === "harness" && r.action === "loopback:release-worker-final");
+			const workerEnd = trace.findIndex(r => r.kind === "event" && r.id === id && r.event === "agent_end");
+			const stall = trace.findIndex(r => r.kind === "event" && r.id === "Main" && r.tool === "swarm_wait" &&
+				r.event === "tool_execution_end" && r.text?.includes('"woke":"stall"'));
+			const mainResult = trace.findIndex(r => r.kind === "event" && r.id === "Main" && r.customType === "async-result" && r.text?.includes("R10-MAIN-e174c301"));
+			const workerResult = trace.findIndex(r => r.kind === "event" && r.id === id && r.customType === "async-result" && r.text?.includes("R10-WORKER-ef328d8a"));
+			expect(workerResult >= 0 && workerResult < mainResult && mainResult < wait && wait < releasedFinal && releasedFinal < workerEnd && workerEnd < stall).toBe(true);
+			expect(metrics(result.c)?.coordinator?.stall_wakes).toBe(1);
+
+			// Negative oracle test: insert a false stall into a copy of the
+			// observed held-job interval. Never modify the live host or its receipts.
+			const releaseJob = trace.findIndex(r => r.kind === "harness" && r.action === "release:worker");
+			expect(releaseJob).toBeGreaterThan(0);
+			const falseStall: Trace = { kind: "event", at: trace[releaseJob]!.at, id: "Main", source: "session",
+				event: "tool_execution_end", tool: "swarm_wait", text: '{"woke":"stall"}' };
+			const amended = [...trace.slice(0, releaseJob), falseStall, ...trace.slice(releaseJob)];
+			const checks = new Checks();
+			checkStallWakes(checks, amended, new Map([[id!, entries(result.c, "asyncworker")]]), 2);
+			expect(checks.failures).toEqual([expect.stringMatching(/woke:stall .*pending worker work .*pending job bg_1/)]);
+		}
 		if (scenario.id === "R11") {
 			expect(result.k.failures).toHaveLength(2);
 			const transcript = evidence(result.c).find(row => row.kind === "root")?.sessionFile;
