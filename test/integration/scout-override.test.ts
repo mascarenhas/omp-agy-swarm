@@ -33,7 +33,8 @@ test("only the coordinator sets scout policy; reset and partial replacement pres
 		const revived = h.session("old");
 		expect(revived.sessionId).toBe(old.sessionId);
 		expect(revived.opts.scoutOverride).toEqual({ model: undefined, effort: "high" });
-		expect((await h.swarm({ action: "scout" })).details.scout).toBeNull();
+		expect((await h.swarm({ action: "scout" })).details).toMatchObject({ scout: null, scout_default_effort: "high" });
+		expect((await h.swarm({ action: "status" })).details).toMatchObject({ scout: null, scout_default_effort: "high" });
 		expect(JSON.parse(readFileSync(file, "utf8")).scout).toBeUndefined();
 		expect(revived.opts.scoutOverride?.effort).toBe("high");
 		await h.swarm({ action: "add", name: "inherited", brief: "Check native policy." });

@@ -127,6 +127,108 @@ eval:
 `;
 const threadedConfig = concurrentConfig.replace("  maxConcurrency: 2\n", "  maxConcurrency: 10\n  workerThreads: 1\n") + "async:\n  maxJobs: 16\n";
 
+for (const selector of ["operator", "smol", "smol-unsuffixed", "operator-cap", "model-only", "shadow-level", "shadow-default", "shadow-model-only"] as const) {
+	test(`compiled worker scout applies effort precedence for ${selector} model selection`, async () => {
+		const shadow = selector.startsWith("shadow-");
+		const modelOnly = selector.endsWith("model-only");
+		const operatorCap = selector === "operator-cap";
+		const testPins = selector === "smol" || operatorCap;
+		const model = selector === "operator" ? "scout-luna" : modelOnly ? "worker-limited" : "scout-haiku";
+		const expected = selector === "smol" ? "medium" : selector === "shadow-level" || selector === "shadow-model-only" ? "low" : "high";
+		const assignments = [
+			scout("DefaultEffort", "NATIVE-SCOUT-DEFAULT-EFFORT"),
+			{ ...scout("CoarseHi", "NATIVE-SCOUT-COARSE-HI"), effort: "hi" },
+			...(testPins ? [
+				{ ...scout("LowPin", "NATIVE-SCOUT-LOW-PIN"), model: "mock/scout-luna:low" },
+				{ ...scout("MaxPin", "NATIVE-SCOUT-MAX-PIN"), model: "mock/scout-luna:max" },
+			] : []),
+		];
+		const { diagnostic, requests, rows, metrics } = await compiled({
+			coord: { rules: [
+				{ when: "^user:.*start-native-scouts$", reply: { tools: [modelOnly
+					? tool("swarm", { action: "scout", model: `mock/${model}` })
+					: add("worker", "Check scout effort.")] } },
+				{ when: '"scout_default_effort":"high".*"scope":"newly added or revived workers"', reply: { tools: [add("worker", "Check scout effort.")] } },
+				{ when: "SCOUT-EFFORT-DONE", reply: { tools: [probe("settled")] } },
+				{ when: "^tool: SCOUTS-PROBE-settled$", reply: { tools: [finish] } },
+				{ when: '"completion":"accepted"', reply: { text: "Verified scout effort." } },
+				{ when: "^tool:", reply: { tools: [tool("swarm_wait")] } },
+			] },
+			"worker-a": { rules: [
+				{ when: "You are `worker`", reply: { tools: [batch(...assignments)] } },
+				...(testPins ? [{
+					whenAny: "(?=.*LOW-PIN-RESULT)(?=.*MAX-PIN-RESULT)", times: 1,
+					reply: { tools: [tool("eval", { language: "js", title: "Check native eval model pin",
+						code: 'const handle = await agent("NATIVE-SCOUT-EVAL-PIN", { agent: "scout", label: "EvalPin", model: "mock/scout-luna:xhigh", schema: null }); console.log(await handle.wait());' })] },
+				}] : []),
+				{ whenAny: testPins ? "(?=.*DEFAULT-EFFORT-RESULT)(?=.*COARSE-HI-RESULT)(?=.*EVAL-PIN-RESULT)"
+					: "(?=.*DEFAULT-EFFORT-RESULT)(?=.*COARSE-HI-RESULT)", times: 1,
+					reply: { tools: [tool("post_message", { text: "@coordinator SCOUT-EFFORT-DONE" })] } },
+			], default: { text: "Waiting for scout results." } },
+			[model]: { rules: [
+				{ when: "NATIVE-SCOUT-DEFAULT-EFFORT", reply: { text: "DEFAULT-EFFORT-RESULT" } },
+				{ when: "NATIVE-SCOUT-COARSE-HI", reply: { text: "COARSE-HI-RESULT" } },
+			] },
+			...(testPins ? { "scout-luna": { rules: [
+				{ when: "NATIVE-SCOUT-LOW-PIN", reply: { text: "LOW-PIN-RESULT" } },
+				{ when: "NATIVE-SCOUT-MAX-PIN", reply: { text: "MAX-PIN-RESULT" } },
+				{ when: "NATIVE-SCOUT-EVAL-PIN", reply: { text: "EVAL-PIN-RESULT" } },
+			] } } : {}),
+		}, {
+			config: `defaultThinkingLevel: xhigh
+task:
+  batch: true
+  enableEffort: true
+  perCallModel: "on"
+${operatorCap ? "  maxEffort: medium\n" : ""}${selector === "operator" ? "  agentModelOverrides:\n    scout: mock/scout-luna\n" : ""}modelRoles:
+  smol: mock/scout-haiku${selector === "smol" ? ":medium" : operatorCap ? ":high" : ""}
+  slow: mock/scout-luna
+  tiny: mock/plain
+`,
+			prep: shadow ? c => {
+				const agents = join(c.repo, ".omp", "agents");
+				mkdirSync(agents, { recursive: true });
+				const thinking = expected === "low" ? "thinking-level: low\n" : "";
+				writeFileSync(join(agents, "scout.md"), `---\nname: scout\ndescription: Local scout profile\nmodel: mock/scout-haiku\ntools: read\n${thinking}---\nAnswer briefly.\n`);
+			} : undefined,
+		});
+		const served = requests.filter(request => request.last.includes("NATIVE-SCOUT-") && request.rule >= 0);
+		for (const marker of ["DEFAULT-EFFORT", "COARSE-HI"])
+			expect(served.find(request => request.last.includes(marker)), diagnostic).toMatchObject({ model, reasoning_effort: expected });
+		if (testPins) {
+			const ceiling = operatorCap ? "medium" : "high";
+			for (const [marker, effort] of [["LOW-PIN", "low"], ["MAX-PIN", ceiling], ["EVAL-PIN", ceiling]] as const)
+				expect(served.find(request => request.last.includes(marker)), diagnostic).toMatchObject({ model: "scout-luna", reasoning_effort: effort });
+		}
+		expect(rows.find(row => row.stage === "settled"), diagnostic).toMatchObject({ mainTaskEffort: true, workerTaskEffort: false });
+		expect(metrics?.outcome.value, diagnostic).toBe("complete");
+	}, 60_000);
+}
+
+test("compiled worker scout effort off refuses native per-call model pins", async () => {
+	const { diagnostic, requests, rows, metrics } = await compiled({
+		coord: { rules: [
+			{ when: "^user:.*start-native-scouts$", reply: { tools: [tool("swarm", { action: "scout", effort: "off" })] } },
+			{ when: '"scout":\\{"effort":"off"\\}', reply: { tools: [add("worker", "Check disabled scout effort.")] } },
+			{ when: "SCOUT-OFF-DONE", reply: { tools: [probe("settled")] } },
+			{ when: "^tool: SCOUTS-PROBE-settled$", reply: { tools: [finish] } },
+			{ when: '"completion":"accepted"', reply: { text: "Verified scout effort off." } },
+			{ when: "^tool:", reply: { tools: [tool("swarm_wait")] } },
+		] },
+		"worker-a": { rules: [
+			{ when: "You are `worker`", reply: { tools: [tool("eval", { language: "js", title: "Try a pinned scout with effort off",
+				code: 'try { await agent("OFF-PIN-FORBIDDEN", { agent: "scout", model: "mock/scout-haiku:max" }); } catch (error) { console.log(String(error)); }' })] } },
+			{ when: "Per-call model is disabled", times: 1, reply: { tools: [batch(scout("Off", "SCOUT-OFF-REQUEST"))] } },
+			{ when: "SCOUT-OFF-RESULT", times: 1, reply: { tools: [tool("post_message", { text: "@coordinator SCOUT-OFF-DONE" })] } },
+		], default: { text: "Awaiting scout results." } },
+		"scout-haiku": { rules: [{ when: "SCOUT-OFF-REQUEST", reply: { text: "SCOUT-OFF-RESULT" } }] },
+	}, { config: 'task:\n  batch: true\n  perCallModel: "on"\nmodelRoles:\n  smol: mock/scout-haiku:high\n  tiny: mock/plain\neval:\n  autoProvision: false\n' });
+	expect(requests.some(request => request.model === "scout-haiku" && request.last.includes("OFF-PIN-FORBIDDEN")), diagnostic).toBe(false);
+	expect(rows.find(row => row.stage === "settled"), diagnostic)
+		.toMatchObject({ childMetrics: [{ model: "mock/scout-haiku:off" }] });
+	expect(metrics?.outcome.value, diagnostic).toBe("complete");
+}, 60_000);
+
 test("compiled worker batches native scouts, wakes from its own results, and bills direct and child requests once", async () => {
 	const held = Promise.withResolvers<void>();
 	const refused = `

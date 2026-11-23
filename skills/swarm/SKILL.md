@@ -125,7 +125,7 @@ read_board{}                   # read unread posts (or pass since / channel)
 ```
 
 `swarm{action:"status"}` reports `mode`, `head`, `swarm_dir`, `open_board`,
-`completion`, `outcome`, `scout`, `attention`, and each member's `agent_id`
+`completion`, `outcome`, `scout`, `scout_default_effort`, `scout_effort_policy`, `attention`, and each member's `agent_id`
 (also returned by `add`), `state`, `detail`, `model`, `effort`, `channels`,
 `workspace`, `last_read_seq`, `unread`, `owed` (posts addressed to it that it
 has not read), `error`, and spend. Each worker is in one of four states:
@@ -307,15 +307,28 @@ assign it work, or kill it unless the user asks.
   `agent:"scout"` (also enforced for eval `agent()`/`workpool()`): bundled
   native `task` scouts run in the background by default as the worker's own
   jobs and wake the worker with results (a custom shadow `scout` profile can
-  declare `blocking: true`); scouts are not board members. Bundled `scout`
-  defaults to `@smol` at `medium` (native precedence `project` > `user` >
-  `extension` > `bundled`; operator `task.agentModelOverrides.scout` applies).
+  declare `blocking: true`); scouts are not board members. Native profile
+  precedence is `project` > `user` > `extension` > `bundled` and operator
+  `task.agentModelOverrides.scout` applies. For worker scouts spawned without a
+  per-call model pin, effort precedence is: explicit swarm effort → configured
+  selector suffix → a custom scout profile's declared thinking level (kept even
+  with a bare operator or swarm model-only override) → `high` (replacing the
+  bundled scout's `medium` and no-level cases). Workers' `task` neither exposes
+  nor honors per-call `effort` (eval `agent()`/`workpool()` have none). Approved
+  per-call model pins (`task` `model`, eval `agent()` and `workpool()`) follow
+  omp's native permission/conflict checks under the shared cap
+  `min(task.maxEffort, swarm effort or high)`: without an explicit swarm effort
+  a pin's own suffix applies under that cap (e.g. `:low` stays low), an
+  effort-only swarm override supplies the effort for an approved pin, a
+  configured scout model override (operator or swarm) makes native preflight
+  reject pins, and swarm effort `off` disables pins. Main's own scouts keep
+  native settings (bundled `medium` unless a higher-priority selector applies).
   - Use `swarm{action:"scout", model?, effort?}` (coordinator-only) when the
     user asks to override scout model/effort: each call replaces the override,
-    `effort` alone keeps native model selection, and omitting both resets it.
-    Changes persist in `members.json` and apply only to newly added or revived
-    workers (running workers stay unchanged; your own native scouts keep Main's
-    native settings; per-call effort can still take precedence).
+    `effort` alone keeps native model selection, and omitting both resets to
+    the default precedence above. Changes persist in `members.json` and apply
+    only to newly added or revived workers (running workers stay unchanged;
+    your own native scouts keep Main's native settings).
   - Scout usage (by exact registry ancestry) and journaled eval
     `completion()`/`judge()` calls count once toward `OMP_SWARM_MAX_COST_USD`
     (unpriced token-bearing requests fail closed and persist across reopen; at

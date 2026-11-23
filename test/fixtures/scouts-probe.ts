@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync } from "node:fs";
 import { AgentRegistry, AgentSession, type AgentRef, type ExtensionAPI, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
-import { cfgTaskAgentModelOverrides, cfgTaskMaxConcurrency, cfgTaskWorkerThreads } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { cfgTaskAgentModelOverrides, cfgTaskEnableEffort, cfgTaskMaxConcurrency, cfgTaskWorkerThreads } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { TASK_SUBAGENT_EVENT_CHANNEL, type SubagentEventPayload } from "@oh-my-pi/pi-coding-agent/task/types";
 import { isRemoteScoutSession } from "../../src/runtime/omp-adapter.ts";
 import { SessionObserverRegistry, TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL, type SubagentLifecyclePayload } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
@@ -344,7 +344,10 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 							return [{ purpose: "assistant", cost: entry.message.usage.cost.total, tokens: entry.message.usage.totalTokens }];
 						return [];
 					});
+					const main = registry.get(MAIN_AGENT_ID)?.session;
 					log("settled", { childMetrics, directCost: direct.cost - direct.subagentCost, requests,
+						mainTaskEffort: main instanceof AgentSession ? cfgTaskEnableEffort.get(main.settings) : undefined,
+						workerTaskEffort: cfgTaskEnableEffort.get(raw.settings),
 						jobs: raw.asyncJobManager?.getAllJobs({ ownerId: worker.id }).filter(j => j.type === "task").map(j => j.status) });
 				} else if (action === "settings") {
 					const roles = ["worker", "fresh", "narrator", "monitor"].map(name => {
