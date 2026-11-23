@@ -27,7 +27,8 @@ import { AgentLifecycleManager, type AgentLifecycleApi } from "@oh-my-pi/pi-codi
 import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
 import { CostGate, type CostCapRefusal } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
-import { cfgTaskAgentModelOverrides } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { discoverAgents, getAgent } from "@oh-my-pi/pi-coding-agent/task/discovery";
+import { cfgTaskAgentModelOverrides, cfgTaskMaxEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { TASK_SUBAGENT_EVENT_CHANNEL, type SubagentEventPayload } from "@oh-my-pi/pi-coding-agent/task/types";
 import { cfgAsyncMaxJobs, cfgAsyncPrintWake } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import type { RemoteAgentSession } from "@oh-my-pi/pi-coding-agent/thread/remote-agent-session";
@@ -35,7 +36,7 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { MAX_THINKING_SUFFIX_OPTIONS, splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import type { SubagentLifecyclePayload } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
-import { raceTimeout, TIMING } from "../env.ts";
+import { DEFAULT_SCOUT_EFFORT, EFFORTS, isEffort, raceTimeout, TIMING } from "../env.ts";
 import { HubBridge } from "./hub-bridge.ts";
 import { preferredAgentId } from "./member.ts";
 import type { CoordinatorBinding } from "./coordinator.ts";
@@ -795,12 +796,20 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 				? (manager ??= new AsyncJobManager({ maxRunningJobs: () => Math.min(100, cfgAsyncMaxJobs.get(base)) }))
 				: undefined;
 			const scoped = sameRealPath(o.cwd, base.getCwd()) ? base : await base.cloneForCwd(o.cwd);
+			const requestedScout = o.role === "worker" && o.toolNames.includes("task");
+			const override = requestedScout ? o.scoutOverride : undefined;
+			const effort = isEffort(override?.effort) ? override.effort : DEFAULT_SCOUT_EFFORT;
+			const operatorCap = requestedScout && cfgTaskMaxEffort.get(scoped);
+			const pinCap = operatorCap && (EFFORTS.indexOf(effort) < EFFORTS.indexOf(operatorCap) ? effort : operatorCap);
 			const settings = createSubagentSettings(scoped, {
 				...subagentLspWritethroughSettings(scoped),
 				// Remote journals can arrive after another request in the same eval cell.
 				// Keep capped worker trees on the billing thread without changing concurrency.
 				...(jobs && o.checkSwarmSpend ? { "task.workerThreads": 0 } : {}),
-				...(jobs ? { "async.enabled": true } : {
+				// omp applies maxEffort to worker-supplied model pins, not native
+				// configured selectors. Its ceiling cannot express "off".
+				...(pinCap === "off" ? { "task.perCallModel": "off" } : pinCap ? { "task.maxEffort": pinCap } : {}),
+				...(jobs ? { "async.enabled": true, "task.enableEffort": false } : {
 					"async.enabled": false,
 					"bash.autoBackground.enabled": false,
 					"eval.autoBackground.enabled": false,
@@ -866,20 +875,17 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 				let sdkReturned = false;
 				try {
 					let checkedSlot = false;
-					const requestedScout = o.role === "worker" && o.toolNames.includes("task");
-					const override = requestedScout ? o.scoutOverride : undefined;
 					let scoutToolActive = requestedScout;
-					let sessionForWarning: AgentSession | undefined;
+					let workerSession: AgentSession | undefined;
 					const costGate = o.checkSwarmSpend
 						? new SwarmWorkerCostGate(settings, sessionManager.getUsageStatistics().cost, o.checkSwarmSpend,
-							message => sessionForWarning?.emitNotice("warning", message, "cost-gate"))
+							message => workerSession?.emitNotice("warning", message, "cost-gate"))
 						: undefined;
 					if (override?.model) {
 						const native = cfgTaskAgentModelOverrides.get(scoped);
 						const scout = override.effort ? `${override.model}:${override.effort}` : override.model;
 						cfgTaskAgentModelOverrides.override(settings, { ...native, scout });
 					}
-					const effort = override?.model ? undefined : override?.effort;
 					const { session } = await createAgentSession({
 						cwd: o.cwd,
 						authStorage: binding.ctx.modelRegistry.authStorage,
@@ -906,16 +912,24 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						get spawns(): string {
 							return scoutToolActive && !o.checkSwarmSpend?.() ? "scout" : "";
 						},
-						preloadedPreparedExtensions: effort ? [{
+						preloadedPreparedExtensions: requestedScout && !(override?.model && override.effort) ? [{
 							path: WORKER_SCOUT_HOOK, resolvedPath: WORKER_SCOUT_HOOK, error: null,
-							factory: pi => pi.on("before_subagent_spawn", (event, ctx) => {
+							factory: pi => pi.on("before_subagent_spawn", async (event, ctx) => {
 								if (ctx.agent.id !== id || event.agent !== "scout" || !event.patterns.length) return;
+								if (override?.effort === undefined) {
+									const { agents } = await discoverAgents(ctx.cwd, undefined, workerSession?.effectiveExtensionRoots);
+									const scout = getAgent(agents, "scout");
+									if (scout && scout.source !== "bundled" && scout.thinkingLevel !== undefined) return;
+								}
 								// The core hook leaves modelRole intact. Using its live
 								// patterns preserves aliases and the current parent model.
 								let models: Model[] | undefined;
 								return { model: event.patterns.map(pattern => {
 									const split = splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
 									const literal = split.level && (models ??= ctx.models.list()).some(m => m.id === pattern || `${m.provider}/${m.id}` === pattern);
+									// Keep the selector suffix; omp independently clamps a caller's
+									// per-call pin using task.maxEffort.
+									if (override?.effort === undefined && split.level && !literal) return pattern;
 									const base = literal ? pattern : split.base;
 									return `${base}:${effort}`;
 								}) };
@@ -942,7 +956,7 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						appendSystemPrompt: o.appendSystemPrompt,
 					});
 					sdkReturned = true;
-					sessionForWarning = session;
+					workerSession = session;
 					scoutToolActive &&= session.getActiveToolNames().includes("task");
 					if (o.onOwnedUsage && !usage) usage = new ScoutUsage(events, log);
 					registration.attach(session, events, usage);

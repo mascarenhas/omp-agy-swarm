@@ -35,6 +35,7 @@ export const DEFAULT_WORKER_TOOLS = [
 	"ast_edit",
 ] as const;
 export const NARRATOR_TOOLS = ["read", "write", "edit", "bash", "glob", "grep"] as const;
+export const DEFAULT_SCOUT_EFFORT = "high";
 
 export const LIMITS = {
 	postChars: 8000,

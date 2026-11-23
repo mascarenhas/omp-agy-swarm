@@ -134,7 +134,7 @@ export interface MemberRecord {
 	killed_seq?: number;
 }
 
-/** Absent fields keep the native scout model selection or effort. */
+/** Optional worker scout overrides; absent effort lets the swarm default fill a missing selector suffix. */
 export interface ScoutOverride {
 	model?: string;
 	effort?: string;

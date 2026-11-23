@@ -7,6 +7,7 @@ import { channelMentions, effectiveChannels, MAIN } from "../board/channels.ts";
 import type { BoardMessage, Role, WorkspaceMode } from "../board/types.ts";
 import {
 	CHANNEL_RE,
+	DEFAULT_SCOUT_EFFORT,
 	EFFORTS,
 	type Effort,
 	hasKey,
@@ -226,9 +227,11 @@ export async function swarmOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResu
 	}
 }
 
+const SCOUT_EFFORT_POLICY = `Worker scout effort: explicit swarm effort, then configured selector suffix or custom scout profile effort, then ${DEFAULT_SCOUT_EFFORT} (including model-only overrides without an explicit effort). Native per-call model pins are limited by the lower of task.maxEffort and the swarm effort (default ${DEFAULT_SCOUT_EFFORT}); swarm effort off disables worker model pins.`;
+
 function statusOp(ctx: OpsContext): ToolResult {
 	const rt = ctx.rt;
-	if (!rt || !ctx.caller) return ok({ swarm: null, hint: 'add a worker with swarm{action:"add", …}' });
+	if (!rt || !ctx.caller) return ok({ swarm: null, scout_default_effort: DEFAULT_SCOUT_EFFORT, scout_effort_policy: SCOUT_EFFORT_POLICY, hint: 'add a worker with swarm{action:"add", …}' });
 	const c = rt.coordinator;
 	const reminders = ctx.caller === c ? Object.values(c.reminders) : [];
 	return ok({
@@ -242,6 +245,8 @@ function statusOp(ctx: OpsContext): ToolResult {
 		outcome: rt.outcome ? rt.outcome.value : null,
 		spend: rt.spendView(),
 		scout: rt.scoutOverride ?? null,
+		scout_default_effort: DEFAULT_SCOUT_EFFORT,
+		scout_effort_policy: SCOUT_EFFORT_POLICY,
 		members: [...rt.members.values()].filter(m => m.role !== "coordinator").map(m => rt.memberStatus(m)),
 		attention: rt.attention(),
 		reminder: reminders.length ? reminders.join(" ") : undefined,
@@ -336,7 +341,9 @@ function scoutOp(ctx: OpsContext, p: SwarmParams): ToolResult {
 	rt?.setScoutOverride(override);
 	return ok({
 		scout: override ?? null,
+		scout_default_effort: DEFAULT_SCOUT_EFFORT,
 		scope: "newly added or revived workers",
+		scout_effort_policy: SCOUT_EFFORT_POLICY,
 		notes: resolved.notes.length ? resolved.notes : undefined,
 	});
 }
