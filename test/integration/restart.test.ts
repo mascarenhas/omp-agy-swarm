@@ -3,7 +3,7 @@
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SwarmRuntime } from "../../src/runtime/runtime.ts";
 import { NOT_A_MEMBER } from "../../src/tools/ops.ts";
@@ -25,6 +25,33 @@ function waitingWorker(inputs: string[]) {
 }
 
 describe("restart and revival (I10, SW-09)", () => {
+	test("migrates missing ids and preserves exact legacy ids without changing transcripts", async () => {
+		h = new Harness();
+		for (const name of ["legacy", "missing", "dead"]) await h.swarm({ action: "add", name, brief: "x" });
+		await until(() => h.member("legacy").phase === "idle" && h.member("missing").phase === "idle", 1000, "idle");
+		await h.swarm({ action: "kill", name: "dead" });
+		await h.rt.shutdown();
+		const path = join(h.dir, "members.json");
+		const saved = JSON.parse(readFileSync(path, "utf8"));
+		const legacyId = `swarm-${h.rt.sid}-legacy`;
+		saved.members.legacy.agent_id = legacyId;
+		delete saved.members.missing.agent_id;
+		delete saved.members.dead.agent_id;
+		writeFileSync(path, JSON.stringify(saved));
+		h.reopen();
+		const migrated = JSON.parse(readFileSync(path, "utf8")).members;
+		expect(migrated.legacy.agent_id).toBe(legacyId);
+		expect(migrated.missing.agent_id).toBe("swarm~missing");
+		expect(migrated.dead.agent_id).toBe("swarm~dead");
+		expect(h.rt.revive(h.member("dead"))).toBe("killed");
+		for (const name of ["legacy", "missing"]) {
+			await h.swarm({ action: "revive", name });
+			await until(() => h.member(name).phase === "idle", 1000, `${name} revived`);
+			expect(h.session(name).agentId).toBe(migrated[name].agent_id);
+			expect(h.session(name).sessionId).toBe(saved.members[name].conversation_id);
+		}
+	});
+
 	test("load → stopped; a post naming a stopped member does not start it; revive delivers the owed post once", async () => {
 		h = new Harness();
 		const inputs: string[] = [];
@@ -55,7 +82,7 @@ describe("restart and revival (I10, SW-09)", () => {
 		const s = h.session("lexer");
 		expect(s.sessionId).toBe(conv);
 		expect(s.opts.mode.kind).toBe("revive");
-		expect(s.inputs[0]).toContain("You were stopped by a restart");
+		expect(s.inputs[0]).toContain("Background jobs from the previous session are not resumed");
 		expect(s.inputs[0]).toContain("please continue");
 		await until(() => h.member("lexer").lastReadSeq >= Number(p.details.seq), 1000, "cursor");
 	});
@@ -126,7 +153,9 @@ describe("restart and revival (I10, SW-09)", () => {
 		await h.swarm({ action: "revive", name: "nb-1" });
 		await until(() => (h.factory.sessions.get("nb-1")?.inputs.length ?? 0) >= 1, 1000, "brief replayed");
 		const replay = h.session("nb-1").inputs[0] ?? "";
-		expect(replay).toBe(`[swarm] You are \`nb-1\`. Brief from coordinator (board #${seq}):\n\nthe real brief\n\nYour slice: slice one`);
+		const [reminder, brief] = replay.split("\n\n[swarm]");
+		expect(reminder).toContain("Background jobs from the previous session are not resumed");
+		expect(`[swarm]${brief}`).toBe(`[swarm] You are \`nb-1\`. Brief from coordinator (board #${seq}):\n\nthe real brief\n\nYour slice: slice one`);
 		expect(replay.split("Your slice:").length).toBe(2);
 		expect(first.length).toBe(0); // the dropped prompt never started a run
 		await until(() => h.member("nb-1").briefPresented, 1000, "presented after the replay");
@@ -134,6 +163,136 @@ describe("restart and revival (I10, SW-09)", () => {
 });
 
 describe("kill fence and shutdown (I11, SW-06)", () => {
+	for (const phase of ["working", "parked", "idle"] as const) {
+		test(`native stop fences ${phase} immediately and never reenters worker disposal`, async () => {
+			h = new Harness();
+			const releaseBrain = Promise.withResolvers<void>();
+			h.factory.brains.set("native", async t => {
+				if (phase === "working") await releaseBrain.promise;
+				if (phase === "parked") {
+					await t.call("post_message", { text: "ready to park" });
+					await t.call("swarm_wait", {});
+				}
+			});
+			await h.swarm({ action: "add", name: "native", brief: "x" });
+			const m = h.member("native");
+			const s = h.session("native");
+			await until(() => m.phase === phase && m.briefPresented, 1000, phase);
+			const oldGen = m.gen;
+			const head = h.rt.board.head;
+			s.hostKill();
+			expect(m.gen).toBe(oldGen + 1);
+			expect(m.state).toBe("killed");
+			expect(m.session).toBeUndefined();
+			expect(s.disposed).toBe(false);
+			if (phase === "parked") {
+				expect(s.waitTransitions).toHaveLength(2);
+				expect(s.waitTransitions[1]?.id).toBe(s.waitTransitions[0]?.id);
+				expect(s.waitTransitions.map(w => w.waiting)).toEqual([true, false]);
+			}
+			const tool = s.tools.get("post_message");
+			const late = await tool?.execute("late", { text: "@coordinator late" }, undefined, { sessionManager: { getSessionId: () => s.sessionId } });
+			expect(late?.details.error).toBe(NOT_A_MEMBER);
+			expect(h.rt.board.head).toBe(head);
+			const joining = h.rt.kill(m, { discardIgnored: false, keepWorkspace: false });
+			expect(m.killPromise).toBe(joining);
+			const released = s.hostRelease(true);
+			releaseBrain.resolve();
+			await released;
+			await joining;
+			s.hostKill(); // duplicate/stale source
+			expect(s.teardown.slice(0, 3)).toEqual(["hostKill", "dispose", "hostRelease"]);
+			expect(s.teardown.filter(step => step === "dispose")).toHaveLength(1);
+			expect(h.rt.coordinator.notices.filter(n => n.kind === "worker_stopped")).toHaveLength(1);
+			expect(h.rt.revive(m)).toBe("killed");
+		});
+	}
+
+	test("native kill retains dirty work if disposal is late, then preserves WIP on explicit cleanup", async () => {
+		h = new Harness();
+		const repo = h.binding.cwd;
+		execFileSync("git", ["init", "-q", repo]);
+		execFileSync("git", ["-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+		await h.swarm({ action: "add", name: "native", brief: "x", workspace: "branch" });
+		const m = h.member("native");
+		const s = h.session("native");
+		await until(() => m.phase === "idle", 1000, "idle");
+		const edited = join(m.workspace.path, "uncommitted.txt");
+		writeFileSync(edited, "work survives native stop");
+		const drain = Promise.withResolvers<void>();
+		h.factory.disposeGates.set("native", drain.promise);
+		s.hostKill();
+		const cleanup = m.killPromise;
+		expect(cleanup).toBeDefined();
+		expect(existsSync(edited)).toBe(true);
+		expect(m.workspace.state).toBe("active");
+		const hostDone = s.hostRelease(true);
+		expect(await cleanup).toMatchObject({ state: "retained", reason: expect.stringContaining("did not finish stopping") });
+		expect(existsSync(edited)).toBe(true);
+		expect(m.stoppedCleanly).toBe(false);
+		drain.resolve();
+		await hostDone;
+		await until(() => m.stoppedCleanly, 1000, "late stop confirmation");
+		const result = await h.rt.kill(m, { discardIgnored: false, keepWorkspace: false });
+		expect(result).toMatchObject({ state: "removed", wip_ref: `refs/swarm/${h.rt.sid}/native/wip` });
+		expect(existsSync(edited)).toBe(false);
+		expect(execFileSync("git", ["-C", repo, "show", `${result?.wip_ref}:uncommitted.txt`], { encoding: "utf8" })).toBe("work survives native stop");
+	});
+
+	test("host removal followed by an idle revival does not taint a later shutdown", async () => {
+		h = new Harness({ mode: "tui" });
+		const finishing = Promise.withResolvers<void>();
+		h.factory.brains.set("removed", async () => { await finishing.promise; });
+		await h.swarm({ action: "add", name: "removed", brief: "x" });
+		const m = h.member("removed");
+		await until(() => m.phase === "working" && m.briefPresented, 1000, "worker has live work");
+		const old = h.session("removed");
+		const stopping = old.hostRelease(false);
+		expect(m.phase).toBe("stopped");
+		expect(h.rt.revive(m)).toBe("the previous session has not finished closing");
+		finishing.resolve();
+		await stopping;
+		await until(() => !m.drain, 1000, "real disposal barrier settled");
+		expect(h.rt.revive(m)).toBeUndefined();
+		await until(() => m.phase === "idle" && m.session !== old, 1000, "replacement idle");
+		await h.rt.shutdown();
+		expect(h.rt.outcome).toBeNull();
+	});
+
+	test("clear and normal host removal preserve parks and revivable ids", async () => {
+		h = new Harness({ mode: "tui" });
+		h.factory.brains.set("root", async t => {
+			await t.call("post_message", { text: "ready to park" });
+			await t.call("swarm_wait", { timeout_seconds: 60 });
+		});
+		h.factory.resolvedIds.set("root", "swarm~root~2");
+		await h.swarm({ action: "add", name: "root", brief: "x" });
+		const m = h.member("root");
+		const old = h.session("root");
+		await until(() => m.phase === "parked", 1000, "parked");
+		h.rt.onSessionClear();
+		expect(m.session).toBe(old);
+		expect(m.phase).toBe("parked");
+		await old.hostRelease(false);
+		expect(m.phase).toBe("stopped");
+		expect(m.killed).toBe(false);
+		expect(m.lastPark?.mode).toBe("mentions");
+		await h.rt.shutdown();
+		expect(h.rt.outcome).toBeNull();
+		expect(old.teardown).toEqual(["dispose", "hostRelease"]);
+		h.reopen();
+		h.factory.resolvedIds.clear();
+		await h.swarm({ action: "revive", name: "root" });
+		await until(() => h.member("root").phase === "parked", 1000, "revived and parked");
+		const revived = h.session("root");
+		expect(revived).not.toBe(old);
+		expect(revived.agentId).toBe("swarm~root~2");
+		expect(revived.sessionId).toBe(old.sessionId);
+		old.hostKill();
+		expect(h.member("root").session).toBe(revived);
+		expect(h.member("root").killed).toBe(false);
+	});
+
 	test("a killed member's tools refuse; helpers survive; names are never reused", async () => {
 		h = new Harness();
 		let helperAdded = false;

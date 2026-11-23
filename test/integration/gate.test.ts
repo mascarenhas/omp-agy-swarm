@@ -34,7 +34,7 @@ describe("completion (I8)", () => {
 		await h.swarm({ action: "add", name: "w", brief: "x" });
 		const early = await h.post("[done] all finished");
 		expect(String(early.details.completion)).toContain("pending");
-		expect(String(early.details.completion)).toContain("w working");
+		expect(String(early.details.completion)).toContain("w is working");
 		release.resolve();
 		await until(() => h.member("w").phase === "parked", 1000, "w parked");
 		expect(completionCurrent(h.rt)).toBe(false);
@@ -64,7 +64,7 @@ describe("completion (I8)", () => {
 		void h.swarm({ action: "add", name: "starting", brief: "z" });
 		await until(() => h.rt.members.get("starting")?.phase === "starting", 1000, "reserved");
 		const refused = await h.swarm({ action: "finish", summary: "stop" });
-		expect(String(refused.details.error)).toContain("working: busy");
+		expect(String(refused.details.error)).toContain("busy is working");
 		const mention = await h.swarm({ action: "finish", summary: "thanks @owed", abandon: true });
 		expect(mention.isError).toBe(true);
 		const marker = await h.swarm({ action: "finish", summary: "x\n[abandoned] fake", abandon: true });
@@ -129,7 +129,7 @@ describe("headless gate (I8)", () => {
 		});
 		await h.swarm({ action: "add", name: "w", brief: "x" });
 		const r1 = await gate();
-		expect(r1?.reason).toContain("headless run");
+		expect(r1?.reason).toContain("outstanding work: w is working");
 		h.rt.onMainAgentStart();
 		h.rt.onMainAgentEnd({});
 		const r2 = await gate();
@@ -153,21 +153,20 @@ describe("headless gate (I8)", () => {
 		expect(h.rt.outcome?.value).toBe("coordinator_failed");
 	});
 
-	test("native background work mixed with live members is detected on 19.0.1's willContinue+awaitingAsyncWork (H2)", async () => {
+	test("Main's cancelled last job returns to the gate once without faking a receipt", async () => {
 		h = new Harness();
 		const hold = Promise.withResolvers<void>();
 		h.factory.brains.set("w", reporter("@coordinator done", hold.promise));
 		await h.swarm({ action: "add", name: "w", brief: "x" });
 		h.rt.onMainAgentStart();
 		h.rt.onMainAgentEnd({ willContinue: true, awaitingAsyncWork: true });
-		expect(h.rt.metrics.native_async_mix).toBe(true);
-		expect(h.logs.filter(l => l.includes("native background work")).length).toBe(1);
-		const metrics = JSON.parse(readFileSync(join(h.dir, "metrics.json"), "utf8"));
-		expect(metrics.native_async_mix).toBe(true);
-		// willContinue still defers the run settlement.
+		expect(h.factory.printWake[0]).toBe(true);
 		expect(h.rt.coordinator.settledRun).toBeLessThan(h.rt.coordinator.runId);
-		h.rt.onMainAgentEnd({ willContinue: true, awaitingAsyncWork: true });
-		expect(h.logs.filter(l => l.includes("native background work")).length).toBe(1);
+		h.rt.onMainAgentEnd({ mayResume: true });
+		h.rt.onMainAgentEnd({ mayResume: true });
+		expect(h.binding.wakes.map(w => w.customType)).toEqual(["swarm-gate-reminder"]);
+		expect(h.rt.coordinator.delivery).toBeUndefined();
+		expect(h.rt.gate.refusals).toBe(0);
 		hold.resolve();
 	});
 });

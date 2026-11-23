@@ -30,6 +30,8 @@ export interface MemberView {
 	killed: boolean;
 	conversationId: string;
 	sessionFile?: string;
+	/** Actual native registry id, only while this worker is attached. */
+	liveAgentId?: string;
 	briefSeq: number;
 	task: string;
 	lastEventAt: number;
@@ -77,6 +79,8 @@ export interface TranscriptPage {
 	more_before: boolean;
 	more_after: boolean;
 	epoch: string;
+	/** Requested continuation is unavailable; items are a replacement tail, not an adjacent page. */
+	cursor_reset?: true;
 }
 
 export interface TranscriptPageOptions {
@@ -107,8 +111,9 @@ export interface SwarmReadModel {
 	members(): readonly MemberView[];
 	channels(): readonly ChannelRecord[];
 	attention(): readonly AttentionItem[];
-	completion(): string;
+	completion(absoluteTime?: { hour12?: boolean }): string;
 	outcome(): Outcome | null;
+	spend(): { tokens: number; cost: number; ceiling: number | null; unknown?: string };
 	files(): ViewFiles;
 	transcript(name: string): TranscriptSource | undefined;
 	onChange(cb: () => void): () => void;
@@ -136,6 +141,7 @@ export interface ThreadRow {
 }
 
 export interface Thread {
+	id?: string;
 	title: string;
 	rows: ThreadRow[];
 }
@@ -178,23 +184,17 @@ export function postedFrames(messages: readonly BoardMessage[], members: readonl
 	return [...out.values()].slice(-cap);
 }
 
-let memoKey = "";
-let memoView: SwarmView | undefined;
+const relativeMemo = new WeakMap<SwarmReadModel, SwarmView>();
+const absoluteMemo = new WeakMap<SwarmReadModel, SwarmView>();
 
-export function project(model: SwarmReadModel): SwarmView {
-	const files = model.files();
-	const key = `${model.sid}|${model.version}|${files.key}`;
-	if (memoView && memoKey === key) return memoView;
+export function project(model: SwarmReadModel, files = model.files(), absoluteTime?: { hour12?: boolean }): SwarmView {
+	const key = `${model.version}|${files.key}|${absoluteTime ? `absolute:${absoluteTime.hour12}` : "relative"}`;
+	const memo = absoluteTime ? absoluteMemo : relativeMemo;
+	const cached = memo.get(model);
+	if (cached?.key === key) return cached;
 	const members = model.members();
 	const messages = model.messages();
-	const counts = { working: 0, waiting: 0, stopped: 0, failed: 0 };
-	for (const m of members) {
-		if (m.role === "coordinator" || m.killed) continue;
-		if (m.failure) counts.failed++;
-		if (m.state === "working") counts.working++;
-		else if (m.state === "waiting") counts.waiting++;
-		else if (m.state === "stopped") counts.stopped++;
-	}
+	const counts = countMembers(members);
 	const view = files.view ?? {};
 	const plan = files.plan ?? {};
 	const goalObj = (view.goal ?? plan.goal) as unknown;
@@ -204,6 +204,7 @@ export function project(model: SwarmReadModel): SwarmView {
 			: str(goalObj) || model.title;
 	const lastPost = new Map<string, BoardMessage>();
 	for (const msg of messages) if (!msg.control) lastPost.set(msg.agent, msg);
+
 	const byName = new Map(members.map(m => [m.name, m]));
 	const rowFor = (owner: string, title: string): ThreadRow => {
 		const m = byName.get(owner);
@@ -237,7 +238,7 @@ export function project(model: SwarmReadModel): SwarmView {
 				const owner = w ? str(list(w.owners)[0]) : "";
 				if (owner) rows.push(rowFor(owner, str(w?.title) || str(w?.note)));
 			}
-			threads.push({ title: str(tr.title) || "Thread", rows });
+			threads.push({ id: str(tr.id), title: str(tr.title) || "Thread", rows });
 		}
 	} else if (Array.isArray(plan.threads)) {
 		// plan.json (swarm_pane): threads list member names; tasks maps a name to its piece.
@@ -247,7 +248,7 @@ export function project(model: SwarmReadModel): SwarmView {
 			if (!tr) continue;
 			const rows: ThreadRow[] = [];
 			for (const name of list(tr.tasks).slice(0, 40)) if (typeof name === "string") rows.push(rowFor(name, str(tasks[name])));
-			threads.push({ title: str(tr.title) || "Thread", rows });
+			threads.push({ id: str(tr.id), title: str(tr.title) || "Thread", rows });
 		}
 	}
 	if (!threads.length) {
@@ -288,9 +289,21 @@ export function project(model: SwarmReadModel): SwarmView {
 	if (outcome?.value === "incomplete") stateLine = `incomplete: ${outcome.reason}`;
 	else if (outcome) stateLine = outcome.value.replace(/_/g, " ");
 	else if (restored) stateLine = `restored: ${restored.stopped} stopped, ${restored.owed} owed`;
-	else stateLine = model.completion();
-	const empty = members.filter(m => m.role !== "coordinator").length === 0 && messages.length === 0;
-	memoKey = key;
-	memoView = { key, counts, goal: goal || "(no goal yet)", threads, attention, reel, stateLine, empty };
-	return memoView;
+	else stateLine = model.completion(absoluteTime);
+	const empty = members.every(m => m.role === "coordinator") && messages.length === 0;
+	const projected = { key, counts, goal: goal || "(no goal yet)", threads, attention, reel, stateLine, empty };
+	memo.set(model, projected);
+	return projected;
+}
+
+export function countMembers(members: readonly MemberView[]): SwarmView["counts"] {
+	const counts = { working: 0, waiting: 0, stopped: 0, failed: 0 };
+	for (const m of members) {
+		if (m.role === "coordinator" || m.killed) continue;
+		if (m.failure) counts.failed++;
+		if (m.state === "working") counts.working++;
+		else if (m.state === "waiting") counts.waiting++;
+		else if (m.state === "stopped") counts.stopped++;
+	}
+	return counts;
 }

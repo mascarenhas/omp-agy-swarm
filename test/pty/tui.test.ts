@@ -1,6 +1,9 @@
 // PTY tests (§12.4): a real omp TUI with the plugin and the scripted mock provider.
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import type { RosterFile } from "../../src/board/types.ts";
 import type { Script } from "../e2e/mock-llm/server.ts";
 import { PtyOmp } from "../helpers/pty.ts";
 
@@ -14,9 +17,13 @@ function script(delayMs = 0): Script {
 				{ when: "start-swarm", reply: { tools: [{ name: "swarm", args: { action: "add", name: "w", brief: "report", model: "mock/worker-a" } }] } },
 				{ when: '"added"', reply: { text: "STARTED" } },
 				{ when: "park-now", reply: { tools: [{ name: "swarm_wait", args: {} }] } },
+				{ when: "^user: park-web-board$", reply: { tools: [{ name: "swarm_wait", args: { timeout_seconds: 60 } }] } },
 				// The interrupting submission follows the interrupted swarm_wait result in the request.
 				{ when: "draft\\s*$", whenAny: '"woke":"interrupted"', reply: { text: "INTERRUPTED-OK" } },
 				{ when: "my-draft-text", reply: { text: "DRAFT-RECEIVED" } },
+				{ when: "^user: web-status$", whenAny: "Read-only\\. Anyone who can reach the board can read it\\.", reply: { text: "BOARD-NOTICE-LEAKED" } },
+				{ when: "^user: web-status$", reply: { tools: [{ name: "swarm", args: { action: "status" } }] } },
+				{ when: '"open_board"', reply: { text: "STATUS-READ" } },
 			],
 			default: { text: "OK" },
 		},
@@ -45,7 +52,108 @@ async function submit(p: PtyOmp, text: string): Promise<void> {
 	p.write("\r");
 }
 
+function coordTurnRequests(p: PtyOmp) {
+	return p.mock.requests("coord").filter(r => r.rule !== -3 && !r.last.startsWith("user: <composer-prediction>"));
+}
+
+async function waitForWebBoard(p: PtyOmp): Promise<string> {
+	await p.waitFor(text => text.includes("Swarm web board") && /http:\/\/127\.0\.0\.1:\d+\//.test(text), 10_000, "persistent web board URL");
+	const port = /http:\/\/127\.0\.0\.1:(\d+)\//.exec(p.since())![1]!;
+	await p.waitFor(text =>
+		text.includes(`tailscale serve ${port}`) &&
+		text.includes(`ssh -L ${port}:127.0.0.1:${port} <host>`), 10_000, "copyable forwarding commands");
+	return port;
+}
+
+async function verifyOpenBoard(p: PtyOmp, url: string): Promise<void> {
+	const before = p.mock.requests("coord").length;
+	p.mark();
+	p.write("\x1b[200~web-status\x1b[201~");
+	await p.waitFor(text => text.includes("web-status"), 10_000, "status draft reaches the editor");
+	p.write("\r");
+	await p.waitFor(text => text.includes("STATUS-READ") || text.includes("BOARD-NOTICE-LEAKED"), 15_000, "status tool result");
+	expect(p.since()).not.toContain("BOARD-NOTICE-LEAKED");
+	expect(p.mock.requests("coord").slice(before).some(r => r.last.includes(`"open_board":${JSON.stringify(url)}`))).toBe(true);
+}
+
 describe("omp TUI with the swarm plugin", () => {
+	test("persisted Main's Agent Hub focuses the worker's native transcript without agent profiles", async () => {
+		const privateResponse = "LENS-PRIVATE-TRANSCRIPT-5d91";
+		t = new PtyOmp({
+			coord: {
+				rules: [
+					{ when: "^user:.*focus-worker$", reply: { tools: [{ name: "swarm", args: { action: "add", name: "lens", brief: "Return your observations privately.", model: "mock/worker-a" } }] } },
+					{ when: '"added"', reply: { text: "LENS-STARTED" } },
+				],
+			},
+			"worker-a": { rules: [{ when: "You are `lens`", reply: { text: privateResponse } }] },
+		}, 128, 36, {}, true);
+		const agents = join(t.root, "agent", "agents");
+		expect(existsSync(agents)).toBe(false);
+		await t.waitFor(text => text.includes("coord"), 20_000, "coordinator editor");
+		await submit(t, "focus-worker");
+		await t.waitFor(text => text.includes("LENS-STARTED"), 20_000, "swarm add returned to Main");
+		expect(existsSync(agents)).toBe(false);
+		expect(t.since()).not.toContain(privateResponse);
+
+		t.mark();
+		await submit(t, "/clear");
+		await t.waitFor(text => text.includes("Context reset") && text.includes("session continues"), 10_000, "in-place clear");
+
+		t.mark();
+		await submit(t, "/hub");
+		await t.waitFor(text => text.includes("Activity") && text.includes("Agents"), 10_000, "Agent Hub tabs");
+		t.mark();
+		t.write("1");
+		await t.waitFor(text => text.includes("swarm~lens"), 10_000, "live worker in the in-session Agents roster");
+		t.mark();
+		t.write("\r");
+		await t.waitFor(text => text.includes(privateResponse) && text.includes("swarm~lens"), 15_000, "focused worker transcript and status line");
+		expect(existsSync(agents)).toBe(false);
+
+		t.mark();
+		t.write("\x1b");
+		await t.waitFor(text => text.includes("Mock coord"), 5_000, "return to Main");
+		await submit(t, "/quit");
+		await t.waitFor(() => t?.proc.exitCode !== null, 10_000, "graceful shutdown");
+		expect(t.proc.exitCode).toBe(0);
+		expect(existsSync(agents)).toBe(false);
+	}, 90_000);
+
+	test("resumed symlinked Main lists its live worker in the native Tern Hub", async () => {
+		const id = "01a2046a-8e38-7599-87c0-a60158933f7b";
+		t = new PtyOmp({
+			coord: {
+				rules: [
+					{ when: "^user:.*start-native-hub$", reply: { tools: [{ name: "swarm", args: { action: "add", name: "lens", brief: "Wait on the board.", model: "mock/worker-a" } }] } },
+					{ when: '"added"', reply: { text: "NATIVE-HUB-STARTED" } },
+				],
+			},
+			"worker-a": { rules: [], default: { tools: [{ name: "swarm_wait" }] } },
+		}, 128, 36, {}, { id });
+		const resumeFile = t.resumeFile!;
+		const root = resumeFile.slice(0, -".jsonl".length);
+		expect(realpathSync(resumeFile)).not.toBe(resumeFile);
+		await t.waitForNative(doc => JSON.stringify(doc ?? "").includes("Seeded resumed Main transcript"), "resumed Main");
+		await submit(t, "start-native-hub");
+		await t.waitForNative(doc => {
+			const text = JSON.stringify(doc ?? "");
+			return text.includes("NATIVE-HUB-STARTED") && text.includes('"ref":"swarm~lens"') && text.includes("waiting on board");
+		}, "worker parked in the native Tray");
+		const roster = JSON.parse(readFileSync(join(root, "swarm", "members.json"), "utf8")) as RosterFile;
+		expect(roster.id).toBe(id);
+		expect(roster.members.lens?.agent_id).toBe("swarm~lens");
+		await submit(t, "/hub");
+		await t.waitForNative(doc => JSON.stringify(doc ?? "").includes('"tab":"activity"'), "native Agent Hub Activity tab");
+		t.write("1");
+		await t.waitForNative(doc => {
+			const text = JSON.stringify(doc ?? "");
+			return text.includes('"tab":"agents"') && text.includes('"id":"swarm~lens"');
+		}, "native Agent Hub Agents roster");
+		t.write("\r");
+		await t.waitForNative(doc => JSON.stringify(doc ?? "").includes("Message swarm~lens"), "native worker focus");
+	}, 60_000);
+
 	test("/swarm with no swarm, then an idle coordinator woken by a worker; widget; overlay at 80×24 → 40×12; escapes sanitized", async () => {
 		t = new PtyOmp(script());
 		await ready(t);
@@ -131,7 +239,7 @@ describe("omp TUI with the swarm plugin", () => {
 		await t.waitFor(text => text.includes("INTERRUPTED-OK"), 20_000, "submission interrupted the wait");
 	}, 90_000);
 
-	test("no socket listens until /swarm-ui start; stop closes it", async () => {
+	test("manual web board start, status and stop show the persistent URL and update the widget without a turn", async () => {
 		t = new PtyOmp(script());
 		await ready(t);
 		await submit(t, "start-swarm");
@@ -142,12 +250,63 @@ describe("omp TUI with the swarm plugin", () => {
 		await t.waitFor(text => text.includes("Web board is off"), 10_000, "status");
 		expect(t.listeners()).toBe(0);
 		t.mark();
+		const before = coordTurnRequests(t).length;
 		await submit(t, "/swarm-ui start");
-		await t.waitFor(text => text.includes("#token="), 10_000, "link shown to the user");
+		const port = await waitForWebBoard(t);
+		await t.waitFor(text => text.includes(`swarm · http://127.0.0.1:${port}/`), 10_000, "widget URL");
 		expect(t.listeners()).toBe(1);
+		await t.type("/swarm-ui status");
+		await t.waitFor(text => text.includes("/swarm-ui status"), 10_000, "status command typed");
+		t.mark();
+		t.write("\r");
+		expect(await waitForWebBoard(t)).toBe(port);
 		t.mark();
 		await submit(t, "/swarm-ui stop");
 		await t.waitFor(text => text.includes("Web board stopped"), 10_000, "stopped");
+		await t.waitFor(text => /swarm · ●.*\/swarm/.test(text), 10_000, "widget without the stopped URL");
 		expect(t.listeners()).toBe(0);
+		await verifyOpenBoard(t, "/swarm");
+		// Only the explicitly requested status round trip reached the model.
+		expect(coordTurnRequests(t)).toHaveLength(before + 2);
+	}, 90_000);
+
+	test("/swarm-ui start shows the URL while the coordinator is parked, then persists it when the turn ends", async () => {
+		t = new PtyOmp(script());
+		await ready(t);
+		await submit(t, "start-swarm");
+		await t.waitFor(text => text.includes("WOKE-BY-WORKER"), 20_000, "swarm");
+		t.mark();
+		await submit(t, "park-web-board");
+		// The earlier wake row also says "swarm_wait" and can repaint while we type.
+		// The timeout suffix is emitted only by this tool call's renderer.
+		await t.waitFor(text => text.includes("swarm_wait ≤60s"), 10_000, "coordinator wait in flight");
+		const requests = coordTurnRequests(t);
+		expect(requests.at(-1)?.last).toBe("user: park-web-board");
+		t.mark();
+		await submit(t, "/swarm-ui start");
+		await t.waitFor(text => /Web board: http:\/\/127\.0\.0\.1:\d+\//.test(text), 10_000, "immediate URL notification");
+		const port = /Web board: http:\/\/127\.0\.0\.1:(\d+)\//.exec(t.since())![1]!;
+		await t.waitFor(text => text.includes(`swarm · http://127.0.0.1:${port}/`), 10_000, "live widget URL");
+		// Host canary: the context-excluded transcript row currently waits for the run to end.
+		expect(t.since(), "OMP now renders context-excluded rows mid-run; the immediate URL toast may be redundant").not.toContain(`tailscale serve ${port}`);
+		expect(coordTurnRequests(t)).toEqual(requests);
+		expect(t.listeners()).toBe(1);
+		t.mark();
+		await submit(t, "draft");
+		await t.waitFor(text => text.includes("INTERRUPTED-OK"), 10_000, "submission interrupts park");
+		expect(await waitForWebBoard(t)).toBe(port);
+	}, 90_000);
+
+	test("OMP_SWARM_UI=1 announces the URL when a swarm first attaches", async () => {
+		t = new PtyOmp(script(), 80, 24, { OMP_SWARM_UI: "1" });
+		await ready(t);
+		expect(t.listeners()).toBe(0);
+		t.mark();
+		await submit(t, "start-swarm");
+		const port = await waitForWebBoard(t);
+		expect(t.mock.requests("coord").some(r => r.last.includes('"added"') && r.last.includes(`"open_board":"http://127.0.0.1:${port}/"`))).toBe(true);
+		await t.waitFor(text => text.includes("WOKE-BY-WORKER"), 20_000, "swarm idle");
+		expect(t.listeners()).toBe(1);
+		await verifyOpenBoard(t, `http://127.0.0.1:${port}/`);
 	}, 90_000);
 });

@@ -4,7 +4,7 @@
 import { LIMITS } from "../env.ts";
 import type { ContentBlock, HostMessage } from "./ports.ts";
 
-function oneLine(s: string, max: number): string {
+export function oneLine(s: string, max: number): string {
 	// Strip control characters (C0/C1, ESC) and bidi overrides; collapse whitespace.
 	const clean = s
 		.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, " ")
@@ -14,14 +14,16 @@ function oneLine(s: string, max: number): string {
 }
 
 const KEY_ARGS = ["command", "path", "file_path", "pattern", "query", "url", "text", "action", "name", "code"];
+const PREVIEW_ARGS = ["path", "file_path", "pattern", "query", "action", "name"];
 
 /** `<tool>: <key argument>` (≤ 96 characters, sanitized). */
-export function describeToolCall(toolName: string, args: unknown): string {
+export function describeToolCall(toolName: string, args: unknown, preview = false): string {
 	let key = "";
 	if (args && typeof args === "object") {
 		const a = args as Record<string, unknown>;
-		for (const k of KEY_ARGS) {
-			const v = a[k];
+		for (const k of preview ? PREVIEW_ARGS : KEY_ARGS) {
+			const value = a[k];
+			const v = preview && typeof value === "string" ? value.slice(0, LIMITS.activityChars) : value;
 			if (typeof v === "string" && v.trim()) {
 				key = v;
 				break;

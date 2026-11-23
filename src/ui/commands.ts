@@ -1,6 +1,6 @@
 // /swarm (the native TUI, primary surface) and /swarm-ui (the opt-in web board), plus the status
-// widget. The web server object is constructed only on /swarm-ui start (or OMP_SWARM_UI=1 in an
-// interactive session); no port is ever bound at load.
+// widget. The listener starts only on /swarm-ui start or open, or when an interactive swarm
+// attaches with OMP_SWARM_UI=1.
 
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
@@ -9,9 +9,9 @@ import type { CoordinatorBinding } from "../runtime/coordinator.ts";
 import { RuntimeReadModel } from "../runtime/read-model.ts";
 import type { SwarmRuntime } from "../runtime/runtime.ts";
 import { project, type SwarmReadModel } from "./model.ts";
+import { renderWakeMessage, renderWebBoardMessage } from "./tui/custom-message.ts";
 import { EmptyOverlay, SwarmOverlay } from "./tui/overlay.ts";
 import type { ViewId } from "./tui/view.ts";
-import { renderWakeMessage } from "./tui/wake-message.ts";
 import { widgetComponent, widgetLine } from "./tui/widget.ts";
 import { WebBoard } from "./web/server.ts";
 
@@ -41,9 +41,10 @@ function summary(model: SwarmReadModel): string {
 export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle {
 	const models = new Map<string, RuntimeReadModel>();
 	const boards = new Map<string, WebBoard>();
-	const widgets = new Set<string>();
+	const widgets = new Map<string, () => void>();
 
 	pi.registerMessageRenderer("swarm-wake", renderWakeMessage);
+	pi.registerMessageRenderer("swarm-ui", renderWebBoardMessage);
 
 	const modelOf = (rt: SwarmRuntime): RuntimeReadModel => {
 		let m = models.get(rt.sid);
@@ -70,16 +71,27 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 			} catch (err) {
 				return { error: `could not listen on 127.0.0.1:${port}: ${(err as Error).message}` };
 			}
+			widgets.get(rt.sid)?.();
 		}
 		return { board };
 	};
 
-	const announce = (b: CoordinatorBinding, board: WebBoard): void => {
+	const announce = (b: CoordinatorBinding, board: WebBoard): string | undefined => {
 		const port = board.port;
-		b.notify(
-			`Swarm web board (read-only; anyone with this link sees the board and every member's transcript until it expires in 5 minutes):\n${board.link()}\nRemote session? Forward the same port first: ssh -L ${port}:127.0.0.1:${port} <host>`,
-			"info",
+		const link = board.link();
+		if (port === undefined || link === undefined) return;
+		// The host queues context-excluded transcript rows until a live turn ends.
+		b.notify(`Web board: ${link}`, "info");
+		pi.sendMessage(
+			{
+				customType: "swarm-ui",
+				content: `${link}\ntailscale serve ${port}\nssh -L ${port}:127.0.0.1:${port} <host>\nRead-only. Anyone who can reach the board can read it.`,
+				display: true,
+				excludeFromContext: true,
+			},
+			{ triggerTurn: false },
 		);
+		return link;
 	};
 
 	const installWidget = (rt: SwarmRuntime): void => {
@@ -87,13 +99,19 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 		if (b.mode !== "tui" || widgets.has(rt.sid)) return;
 		const ctx = b.ctx;
 		try {
-			ctx.ui.setWidget("swarm", (tui: unknown) => widgetComponent(modelOf(rt), tui as { requestRender(): void }), { placement: "belowEditor" });
-			widgets.add(rt.sid);
+			ctx.ui.setWidget(
+				"swarm",
+				tui => {
+					widgets.set(rt.sid, () => tui.requestRender());
+					return widgetComponent(modelOf(rt), tui, () => boards.get(rt.sid)?.link());
+				},
+				{ placement: "belowEditor" },
+			);
 		} catch {}
 	};
 
 	pi.registerCommand("swarm", {
-		description: "Open the swarm board (overview | board | members | transcript [name])",
+		description: "Open the read-only swarm dashboard (overview | board | members | transcript [name])",
 		getArgumentCompletions: prefix =>
 			Object.keys(VIEWS)
 				.filter(v => v.startsWith(prefix))
@@ -109,6 +127,7 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 				return;
 			}
 			const options = {
+				// Fullscreen gives the overlay its own native screen on TSP peers; ANSI keeps the same cell overlay.
 				overlay: true,
 				overlayOptions: { width: "100%" as const, maxHeight: "100%" as const, margin: 0, fullscreen: true, mouseTracking: false },
 			};
@@ -136,17 +155,16 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 			const [sub = "status", portArg] = args.trim().split(/\s+/).filter(Boolean);
 			const existing = rt ? boards.get(rt.sid) : undefined;
 			if (sub === "status") {
-				if (existing?.running) ctx.ui.notify(`Web board is on 127.0.0.1:${existing.port}. /swarm-ui open shows a new private link; /swarm-ui stop closes it.`, "info");
-				else
-					ctx.ui.notify(
-						"Web board is off. `/swarm-ui start` binds 127.0.0.1 only and shows a private link. Over SSH forward the port first: ssh -L <port>:127.0.0.1:<port> <host>.",
-						"info",
-					);
+				if (existing?.running) announce(b, existing);
+				else ctx.ui.notify("Web board is off. /swarm-ui start starts a read-only board on 127.0.0.1.", "info");
 				return;
 			}
 			if (sub === "stop") {
-				existing?.stop();
-				ctx.ui.notify(existing ? "Web board stopped; its links no longer work." : "Web board is not running.", "info");
+				if (rt && existing?.running) {
+					existing.stop();
+					widgets.get(rt.sid)?.();
+					ctx.ui.notify("Web board stopped.", "info");
+				} else ctx.ui.notify("Web board is not running.", "info");
 				return;
 			}
 			if (sub !== "start" && sub !== "open") {
@@ -167,9 +185,8 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 				ctx.ui.notify(r.error ?? "could not start the web board", "error");
 				return;
 			}
-			announce(b, r.board);
-			if (sub === "open") {
-				const link = r.board.link();
+			const link = announce(b, r.board);
+			if (sub === "open" && link) {
 				try {
 					Bun.spawn([process.platform === "darwin" ? "open" : "xdg-open", link], { stdout: "ignore", stderr: "ignore" });
 				} catch {}
@@ -179,8 +196,10 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 
 	return {
 		onRuntime(rt: SwarmRuntime): void {
-			installWidget(rt);
 			const b = rt.binding as CoordinatorBinding;
+			if (b.pi !== pi) return; // The process-wide registry also reaches factories rebound into workers.
+			rt.webBoardLink = () => boards.get(rt.sid)?.link();
+			installWidget(rt);
 			const restored = modelOf(rt).restored();
 			if (restored) b.notify(`swarm restored: ${restored.stopped} members stopped, ${restored.owed} with unread posts — swarm{action:"revive"} brings them back`, "info");
 			if (host.env.ui && (b.mode === "tui" || b.mode === "rpc") && !boards.get(rt.sid)?.running) {

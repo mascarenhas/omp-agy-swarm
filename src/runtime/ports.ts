@@ -2,6 +2,8 @@
 // omp-adapter.ts (worker sessions, thinking caps) and coordinator.ts (the main binding); the
 // integration tests supply scripted ones.
 
+import type { ScoutOverride } from "../board/types.ts";
+
 /** A host model, identified by `provider/id`. The runtime never relies on object identity. */
 export interface ModelInfo {
 	provider: string;
@@ -44,14 +46,37 @@ export interface HostMessage {
 	isError?: boolean;
 	provider?: string;
 	model?: string;
-	usage?: { totalTokens?: number; input?: number; output?: number; cost?: { total?: number } };
+	usage?: RequestUsage;
 	timestamp?: number;
+}
+
+/** Direct bill for one model request (not the total inherited from a tool result). */
+export interface RequestUsage {
+	totalTokens?: number;
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+	cost?: { total?: number };
+}
+
+export interface RequestBill {
+	readonly provider?: string;
+	readonly model?: string;
+	readonly usage: RequestUsage;
+}
+
+export interface SpendRefusal {
+	readonly spent: number;
+	readonly cap: number;
+	readonly message: string;
 }
 
 /** Worker session events the runtime consumes (a subset of the host's AgentSessionEvent). */
 export type WorkerEvent =
 	| { type: "agent_start" }
 	| { type: "agent_end" }
+	| { type: "agent_pause"; yielded: boolean; awaiting: boolean }
 	| { type: "turn_end" }
 	| { type: "message_start"; message: HostMessage }
 	| { type: "message_end"; message: HostMessage }
@@ -99,12 +124,23 @@ export interface TranscriptEntry {
 	thinkingLevel?: string | null;
 }
 
+export interface WakeSources {
+	readonly jobs: readonly string[];
+	readonly agents: readonly string[];
+	readonly queued: boolean;
+}
+
 export interface WorkerSession {
+	readonly agentId: string;
 	readonly sessionId: string;
 	readonly sessionFile: string | undefined;
 	readonly model: ModelInfo | undefined;
 	readonly thinkingLevel: string | undefined;
 	readonly isStreaming: boolean;
+	readonly isRunActive: boolean;
+	readonly wakeSources: WakeSources | undefined;
+	/** Also includes owned jobs whose result will not wake the session. */
+	readonly hasBackgroundWork: boolean;
 	/** The latest model request the host's cost gate refused (a new object per refusal). */
 	readonly costCapRefusal: { readonly message: string } | undefined;
 	prompt(text: string): Promise<unknown>;
@@ -117,7 +153,9 @@ export interface WorkerSession {
 	getLastAssistantMessage(): HostMessage | undefined;
 	/** Current-branch entries (live transcript source). */
 	branchEntries(): readonly TranscriptEntry[];
-	beginDispose(): void;
+	setBoardWait(waitId: string, waiting: boolean): void;
+	/** Explicit swarm kill. Other disposal paths leave the member revivable. */
+	stop(): Promise<void>;
 	dispose(): Promise<void>;
 }
 
@@ -126,14 +164,40 @@ export type SessionMode =
 	| { kind: "revive"; file: string; conversationId: string }
 	| { kind: "fork"; sourceFile: string };
 
+export interface WorkerIdentity {
+	agentId: string;
+	sessionId: string;
+	sessionFile: string | undefined;
+}
+
+/** Startup failed and its raw session has not confirmed that it stopped. */
+export class WorkerStartupUnstopped extends Error {
+	constructor(cause: unknown, readonly disposal: Promise<void>) {
+		super(`session startup failed without confirming disposal: ${String(cause)}`, { cause });
+	}
+}
+
 export interface CreateWorkerOptions {
 	name: string;
 	role: "worker" | "narrator" | "monitor";
 	agentId: string;
+	brief: string;
+	signal: AbortSignal;
+	/** Synchronous fence from the owned, detached registry tombstone. */
+	onHostKill(identity: WorkerIdentity): void;
+	/** Disposal started without a tombstone. The barrier tracks the actual raw session teardown. */
+	onHostDispose(identity: WorkerIdentity, rootClosing: boolean, closed: Promise<void>): void;
+	/** Delivered after a native tombstone release, without waiting on worker construction. */
+	onHostRelease(confirmIdle: () => Promise<void>): void;
 	cwd: string;
 	sessionsDir: string;
 	model: ModelInfo | undefined;
 	effort: string | undefined;
+	scoutOverride?: ScoutOverride;
+	/** A shared, live limit, checked at native spawn and provider dispatch. */
+	checkSwarmSpend?: () => SpendRefusal | undefined;
+	/** Applies to this owned generation even while its turn or owner is being torn down. */
+	onOwnedUsage?(bill: RequestBill): void;
 	toolNames: string[];
 	customTools: unknown[];
 	appendSystemPrompt: string;
@@ -143,6 +207,9 @@ export interface CreateWorkerOptions {
 
 export interface SessionFactory {
 	create(options: CreateWorkerOptions): Promise<WorkerSession>;
+	setPrintWake(active: boolean): void;
+	observeCoordinatorUsage?(onUsage: (bill: RequestBill) => void): void;
+	dispose(deadlineAt: number): Promise<void>;
 }
 
 export interface UsageLimitView {

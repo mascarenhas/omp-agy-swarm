@@ -10,6 +10,7 @@ import type {
 	WakeMode,
 	WorkspaceRecord,
 } from "../board/types.ts";
+import type { DisposeResult } from "./workspace.ts";
 import { ActivityTracker } from "./activity.ts";
 import type { PendingSwitch, WorkerSession } from "./ports.ts";
 
@@ -21,12 +22,14 @@ export interface Op {
 	readonly kind: OpKind;
 	readonly gen: number;
 	cancelled: boolean;
+	disposal?: Promise<void>;
 	readonly abort: AbortController;
 }
 
 /** Canonical wait outcomes (SW-14); the elision table lives in tools/ops.ts. */
 export type ClaimReason =
 	| "post"
+	| "job"
 	| "timeout"
 	| "notice"
 	| "stall"
@@ -152,6 +155,7 @@ export class Member {
 	waiter: Waiter | undefined;
 	delivery: Delivery | undefined;
 	session: WorkerSession | undefined;
+	awaiting = false;
 	unsubscribe: (() => void) | undefined;
 	cycle: Cycle | undefined;
 	notices: Notice[] = [];
@@ -169,6 +173,7 @@ export class Member {
 	opSettled: Promise<unknown> | undefined;
 	reconcileTimer: Timer | undefined;
 	runId = 0;
+	postsAtLoopStart = 0;
 	settledRun = 0;
 	/** The session's cost-cap refusal when the current run started (a newer one ends the run as a cost failure). */
 	costRefusalSeen: unknown;
@@ -181,7 +186,9 @@ export class Member {
 	reviveNoticeSent = false;
 	/** The member's session finished stopping after a kill (workspace removal is allowed). */
 	stoppedCleanly = false;
-	stopPromise: Promise<boolean> | undefined;
+	killPromise: Promise<DisposeResult | null> | undefined;
+	/** Last detached generation's stop result; only pending disposal delays explicit revival. */
+	drain: { promise: Promise<void>; pending: boolean } | undefined;
 	readonly tracker = new ActivityTracker();
 	stats: LiveStats = { steps: 0, tokens: 0, cost: 0, runs: 0, posts: 0, wakes: 0, nudges: 0, failures: 0 };
 	/** Model/effort the runtime expects the session to run (out-of-band change detection). */
@@ -204,6 +211,12 @@ export class Member {
 		return this.role === "narrator" || this.role === "monitor";
 	}
 
+	/** Native work may start while a swarm operation still owns the phase. */
+	get hostWorking(): boolean {
+		const session = this.session;
+		return !!session && (session.isStreaming || (!this.awaiting && session.isRunActive));
+	}
+
 	/** Reported state (§6.1). */
 	get state(): "waiting" | "working" | "stopped" | "killed" {
 		switch (this.phase) {
@@ -222,7 +235,7 @@ export class Member {
 	get detail(): string {
 		switch (this.phase) {
 			case "parked":
-				return "in swarm_wait";
+				return this.session?.wakeSources ? "in swarm_wait, with background work" : "in swarm_wait";
 			case "starting":
 				return this.op?.kind === "revive" ? "reviving" : this.op ? "starting" : "wake arriving";
 			case "switching":
@@ -230,7 +243,7 @@ export class Member {
 			case "resuming":
 				return "waking";
 			case "idle":
-				return this.failure ? `failed (${this.failure.kind})` : "idle";
+				return this.awaiting ? "waiting on background work" : this.failure ? `failed (${this.failure.kind})` : "idle";
 			case "stopped":
 				return this.failure ? `stopped (${this.failure.kind})` : "stopped";
 			default:
@@ -271,8 +284,8 @@ export class Member {
 			r.last_park = this.lastPark;
 			r.killed_at = this.killedAt;
 			r.failure = this.failure;
-			r.stats = { steps: this.stats.steps, tokens: this.stats.tokens, cost: this.stats.cost };
 		}
+		r.stats = { steps: this.stats.steps, tokens: this.stats.tokens, cost: this.stats.cost };
 		if (this.wakeFloor > 0) r.wake_floor = this.wakeFloor;
 		if (this.addedSeq > 0) r.added_seq = this.addedSeq;
 		if (this.killedSeq !== undefined) r.killed_seq = this.killedSeq;
@@ -280,12 +293,18 @@ export class Member {
 	}
 }
 
+export function preferredAgentId(name: string): string {
+	return `swarm~${name}`;
+}
+
 /** Fields restored from a roster record (on attach). */
 export function memberFromRecord(name: string, rec: MemberRecord): Member {
 	const role: Role = rec.role === "coordinator" || rec.role === "narrator" || rec.role === "monitor" ? rec.role : "worker";
 	const m = new Member(name, role, rec.workspace ?? { mode: "inherit", path: "" }, rec.killed ? "killed" : "stopped");
 	m.conversationId = typeof rec.conversation_id === "string" ? rec.conversation_id : "";
-	m.agentId = rec.agent_id ?? "";
+	m.agentId = typeof rec.agent_id === "string" && rec.agent_id ? rec.agent_id : preferredAgentId(name);
+	// A loaded roster holds no live worker from the previous lease.
+	m.stoppedCleanly = m.killed;
 	m.gen = Number(rec.gen) || 1;
 	m.model = rec.model ?? "";
 	m.effort = rec.effort ?? "";

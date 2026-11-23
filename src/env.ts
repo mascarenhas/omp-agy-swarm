@@ -6,7 +6,6 @@ export const SUPPORTED_HOST: readonly string[] = ["19.1.0"];
 export const MEMBER_TOOL_NAMES = ["swarm", "post_message", "read_board", "swarm_wait"] as const;
 export type SwarmToolName = (typeof MEMBER_TOOL_NAMES)[number];
 export const HARD_EXCLUDED_TOOLS: Readonly<Record<string, true>> = {
-	task: true,
 	wait: true,
 	manage_skill: true,
 	new_context: true,
@@ -28,6 +27,7 @@ export const DEFAULT_WORKER_TOOLS = [
 	"glob",
 	"grep",
 	"eval",
+	"task",
 	"todo",
 	"web_search",
 	"lsp",
@@ -58,7 +58,6 @@ export const LIMITS = {
 	webFileBytes: 512 * 1024,
 	postedFrames: 24,
 	allowedFiles: 64,
-	webTabTokens: 8,
 	rosterFile: 16 * 1024 * 1024,
 	journalFile: 512 * 1024 * 1024,
 } as const;
@@ -85,7 +84,6 @@ export const TIMING = {
 	metricsDebounceMs: 2_000,
 	uiFilePollMs: 2_000,
 	uiRenderCoalesceMs: 100,
-	bootstrapTokenMs: 5 * 60_000,
 } as const;
 
 /**

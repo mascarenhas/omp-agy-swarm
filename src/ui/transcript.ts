@@ -1,7 +1,7 @@
 // TranscriptSource (§10.5 with SW-12): live current-branch entries, or a bounded indexed reader
 // over a member's JSONL. Pages cover the whole current branch in both directions; cursors are
 // (entryId, blockIndex, epoch) and never array indexes. A cursor from another epoch, or one whose
-// entry left the branch, restarts from the tail.
+// entry left the branch, restarts from the tail and marks that page as a cursor reset.
 
 import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -130,8 +130,9 @@ export function pageOf(list: EntryList, opts: TranscriptPageOptions): Transcript
 	const after = decodeCursor(opts.after);
 	const cursor = before ?? after;
 	let idx = cursor && cursor.epoch === epoch ? list.indexOf(cursor.entryId) : -1;
+	const reset = idx < 0 && (opts.before !== undefined || opts.after !== undefined);
 	let dir: "before" | "after" | "tail" = idx >= 0 ? (before ? "before" : "after") : "tail";
-	if (idx < 0 && opts.head) {
+	if (!reset && idx < 0 && opts.head) {
 		// The start of the branch: one page forward from the first entry (no walk over the rest).
 		idx = 0;
 		dir = "after";
@@ -140,7 +141,7 @@ export function pageOf(list: EntryList, opts: TranscriptPageOptions): Transcript
 	let firstIdx = list.length;
 	let lastIdx = -1;
 	if (dir === "after") {
-		const startBlock = (after?.block ?? -1) + 1;
+		const startBlock = cursor ? cursor.block + 1 : 0;
 		for (let i = idx; i < list.length && items.length < limit; i++) {
 			const e = list.entry(i);
 			if (!e) continue;
@@ -187,6 +188,7 @@ export function pageOf(list: EntryList, opts: TranscriptPageOptions): Transcript
 		more_before: moreBefore,
 		more_after: moreAfter,
 		epoch,
+		...(reset ? { cursor_reset: true } : {}),
 	};
 }
 

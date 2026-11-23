@@ -8,7 +8,7 @@ import { MEMBER_TOOL_NAMES, readEnv, SUPPORTED_HOST, TIMING } from "./env.ts";
 import { CoordinatorBinding } from "./runtime/coordinator.ts";
 import { stopGate } from "./runtime/gate.ts";
 import { applyPreSwarmSwitch } from "./runtime/models.ts";
-import { createSessionFactory, HOST_VERSION, scopedSettings, thinkingCaps } from "./runtime/omp-adapter.ts";
+import { createSessionFactory, HOST_VERSION, mainCanResume, scopedSettings, thinkingCaps } from "./runtime/omp-adapter.ts";
 import type { HostMessage } from "./runtime/ports.ts";
 import { registry } from "./runtime/registry.ts";
 import type { RuntimeDeps, SwarmRuntime } from "./runtime/runtime.ts";
@@ -42,7 +42,7 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 	};
 
 	const deps = (b: CoordinatorBinding): RuntimeDeps => ({
-		makeFactory: () => createSessionFactory(b, log),
+		makeFactory: () => createSessionFactory(b, pi.events, log),
 		caps: thinkingCaps,
 		makeMemberTools: (rt, m, gen) => makeMemberTools(rt, m, gen, { schemas, caps: thinkingCaps, binding: () => rt.binding }),
 		packageDir: PACKAGE_DIR,
@@ -89,6 +89,14 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 		if (refusal) b.notify(`omp-agy-swarm: ${refusal}`, "warning");
 	});
 
+	if (env.maxCostUsd > 0) pi.on("before_subagent_spawn", (_event, ctx) => {
+		const refusal = current(ctx)?.spendRefusal();
+		if (refusal) return {
+			block: true,
+			reason: `${refusal.message} To resume native delegation, restart without OMP_SWARM_MAX_COST_USD or switch to a session without this swarm.`,
+		};
+	});
+
 	pi.on("agent_start", (_e, ctx) => {
 		const rt = current(ctx);
 		if (!rt) return;
@@ -124,7 +132,12 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		rt.rebind(bind(ctx));
-		rt.onMainAgentEnd({ willContinue: e.willContinue, awaitingAsyncWork: e.awaitingAsyncWork });
+		const last = rt.binding.headless && !e.willContinue ? e.messages.findLast(message => message.role === "assistant") : undefined;
+		rt.onMainAgentEnd({
+			willContinue: e.willContinue,
+			awaitingAsyncWork: e.awaitingAsyncWork,
+			mayResume: last?.role === "assistant" && last.stopReason !== "aborted" && last.stopReason !== "error" && mainCanResume(rt.sid),
+		});
 	});
 
 	pi.on("session_stop", async (e, ctx) => {
@@ -141,6 +154,7 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 		}
 		rt.rebind(b);
 		if (!b.headless) return;
+		rt.onMainStopHook();
 		const last = e.last_assistant_message as unknown as HostMessage | undefined;
 		return stopGate(rt, { signal: e.signal, lastStopReason: last?.stopReason });
 	});

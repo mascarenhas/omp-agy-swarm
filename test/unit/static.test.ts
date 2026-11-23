@@ -61,17 +61,33 @@ describe("dependency rules (§2)", () => {
 		}
 	});
 
-	test("only the adapter has value imports from pi-coding-agent and pi-catalog; pi-tui only in the TUI and sanitize", () => {
+	test("host values and native selector parsing stay in the adapter; TUI rendering stays in UI or the observer bridge", () => {
 		for (const f of all) {
 			for (const i of imports(f)) {
 				if (i.typeOnly) continue;
-				if (i.spec.startsWith("@oh-my-pi/pi-coding-agent") || i.spec.startsWith("@oh-my-pi/pi-catalog"))
+				if (i.spec.startsWith("@oh-my-pi/pi-coding-agent") || i.spec.startsWith("@oh-my-pi/pi-catalog")
+					|| i.spec === "@oh-my-pi/pi-tui/overlays/model-selector")
 					expect(rel(f)).toBe("runtime/omp-adapter.ts");
-				if (i.spec.startsWith("@oh-my-pi/pi-tui")) expect(rel(f).startsWith("ui/tui/") || rel(f) === "ui/sanitize.ts").toBe(true);
+				if (i.spec === "@oh-my-pi/pi-tui/overlays/session-observer-registry") {
+					expect(rel(f)).toBe("runtime/hub-bridge.ts");
+				} else if (i.spec.startsWith("@oh-my-pi/pi-tui") && i.spec !== "@oh-my-pi/pi-tui/overlays/model-selector") {
+					expect(rel(f).startsWith("ui/tui/") || rel(f) === "ui/sanitize.ts").toBe(true);
+				}
 			}
 		}
 	});
 
+
+	test("native rendering uses type-only host internals, never deep native builders or wire values", () => {
+		for (const f of all) {
+			for (const i of imports(f)) {
+				if (i.spec.startsWith("@oh-my-pi/pi-tui/native") || i.spec.startsWith("@oh-my-pi/pi-wire")) {
+					expect([rel(f), i.spec, i.typeOnly]).toEqual([rel(f), i.spec, true]);
+				}
+				if (rel(f) === "ui/tui/native.ts" && i.spec.startsWith("@oh-my-pi/")) expect(i.typeOnly).toBe(true);
+			}
+		}
+	});
 	test("ui/web is imported only by ui/commands.ts; TUI/web/model never import the runtime by value", () => {
 		for (const f of all) {
 			for (const i of imports(f)) {

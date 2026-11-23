@@ -42,6 +42,7 @@ import { helperDepth, permitted } from "./permissions.ts";
 
 export const WOKE = [
 	"post",
+	"job",
 	"timeout",
 	"notice",
 	"stall",
@@ -60,6 +61,7 @@ export type Woke = (typeof WOKE)[number];
 /** Results that carry no information and are elided from context later (H18). */
 export const USELESS_WOKE: Readonly<Record<Woke, boolean>> = {
 	post: false,
+	job: false,
 	timeout: false,
 	notice: false,
 	stall: false,
@@ -170,8 +172,8 @@ function modeOf(binding: CoordinatorPort): "headless" | "interactive" {
 	return binding.headless ? "headless" : "interactive";
 }
 
-function openBoard(binding: CoordinatorPort): string {
-	return binding.mode === "tui" ? "/swarm" : "";
+function openBoard(rt: SwarmRuntime): string {
+	return rt.webBoardLink?.() ?? (rt.binding.mode === "tui" ? "/swarm" : "");
 }
 
 function callerModel(ctx: OpsContext, caller: Member): ModelInfo | undefined {
@@ -199,6 +201,8 @@ export async function swarmOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResu
 			return addOp(ctx, p);
 		case "model":
 			return modelOp(ctx, p);
+		case "scout":
+			return scoutOp(ctx, p);
 		case "kill":
 			return killOp(ctx, p);
 		case "revive":
@@ -218,7 +222,7 @@ export async function swarmOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResu
 		case "channel":
 			return channelOp(ctx, p);
 		default:
-			return fail(`unknown action ${JSON.stringify(p.action)}`, "status | models | add | model | kill | revive | finish | title | channel");
+			return fail(`unknown action ${JSON.stringify(p.action)}`, "status | models | add | model | scout | kill | revive | finish | title | channel");
 	}
 }
 
@@ -233,10 +237,11 @@ function statusOp(ctx: OpsContext): ToolResult {
 		mode: modeOf(rt.binding),
 		head: rt.board.head,
 		swarm_dir: rt.dir,
-		open_board: openBoard(rt.binding),
+		open_board: openBoard(rt),
 		completion: completionLabel(rt),
 		outcome: rt.outcome ? rt.outcome.value : null,
 		spend: rt.spendView(),
+		scout: rt.scoutOverride ?? null,
 		members: [...rt.members.values()].filter(m => m.role !== "coordinator").map(m => rt.memberStatus(m)),
 		attention: rt.attention(),
 		reminder: reminders.length ? reminders.join(" ") : undefined,
@@ -313,6 +318,27 @@ function resolveModelAndEffort(
 	const e = resolveEffort(ctx.caps, model, requested);
 	if (e.note) notes.push(e.note);
 	return { model, effort: e.effort, notes };
+}
+
+function scoutOp(ctx: OpsContext, p: SwarmParams): ToolResult {
+	if (ctx.caller) {
+		const denied = permitted("scout", ctx.caller);
+		if (denied) return fail(denied);
+	}
+	const spec = p.model?.trim() || undefined;
+	const effort = p.effort || undefined;
+	const resolved = resolveModelAndEffort(ctx, spec, effort, undefined, undefined);
+	if ("error" in resolved) return fail(resolved.error);
+	const override = spec || effort ? { model: modelKey(resolved.model) || undefined, effort: resolved.effort } : undefined;
+	// Bare action resets without creating an otherwise absent swarm.
+	const rt = ctx.rt ?? (override ? ctx.ensure() : null);
+	if (rt && "error" in rt) return fail(rt.error);
+	rt?.setScoutOverride(override);
+	return ok({
+		scout: override ?? null,
+		scope: "newly added or revived workers",
+		notes: resolved.notes.length ? resolved.notes : undefined,
+	});
 }
 
 async function addOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResult> {
@@ -424,6 +450,7 @@ async function addOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResult> {
 	return ok({
 		added: out.added.map(m => ({
 			name: m.name,
+			agent_id: m.agentId,
 			role: m.role,
 			model: m.model,
 			effort: m.effort,
@@ -437,7 +464,7 @@ async function addOp(ctx: OpsContext, p: SwarmParams): Promise<ToolResult> {
 		mode: modeOf(rt.binding),
 		hint: rt.binding.headless ? HEADLESS_HINT : undefined,
 		swarm_dir: rt.dir,
-		open_board: openBoard(rt.binding),
+		open_board: openBoard(rt),
 	});
 }
 
@@ -833,6 +860,8 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 			note: !pending.length && quiescentUnread.length ? QUIESCENT_NOTE : undefined,
 		});
 	}
+	if (!isCoord && m.session?.wakeSources?.queued)
+		return ok({ woke: "job", note: "Background work is ready; omp delivers it after this tool returns." });
 	closeCycle(m);
 	if (isCoord) rt.gate.refusals = 0;
 	const started = Date.now();
@@ -843,6 +872,7 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 	if (why === "interrupted" || why === "aborted" || why === "killed" || why === "closing") return ok({ woke: why }, true);
 	if (why === "switch") return ok({ woke: "switch", note: "Your model is being switched; you will be resumed on the new model." });
 	if (ctx.signal?.aborted) return ok({ woke: "aborted" }, true);
+	if (why === "job") return ok({ woke: "job", note: "Background work is ready; omp delivers it after this tool returns.", waited_seconds: waited });
 	if (why === "incomplete") return ok({ ...INCOMPLETE_RESULT });
 	const extra = waiter.extra ?? {};
 	const presented = presentToolResult(rt, m, ctx.toolCallId, why === "timeout" ? "timeout" : why === "stall" ? "stall" : why === "notice" ? "notice" : "post", {

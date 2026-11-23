@@ -1,15 +1,16 @@
-// D0–D12 (§12.3): deterministic scenarios against the real omp binary and the scripted mock.
+// D0–D13 (§12.3): deterministic scenarios against the real omp binary and the scripted mock.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { resolveOmpBin, stripNodeModulesBins } from "../../../scripts/omp-bin.ts";
+import { paddedAdd, paddedWait } from "../../fixtures/zero-filled.ts";
 import { board, type Ctx, metrics, requests, roster } from "../check.ts";
 import type { Rule, Script } from "../mock-llm/server.ts";
 import { REPO, type Scenario, tool } from "../scenario.ts";
 
 const SWARM_TOOLS = ["swarm", "post_message", "read_board", "swarm_wait"];
-const NEVER = ["task", "wait", "manage_skill", "new_context"];
+const NEVER = ["wait", "manage_skill", "new_context"];
 
 const all = (...markers: string[]) => `^${markers.map(m => `(?=.*${m})`).join("")}`;
 const finish = (summary: string): Rule["reply"] => ({ tools: [tool("swarm", { action: "finish", summary })] });
@@ -47,7 +48,7 @@ function basicCoordinator(add: Record<string, unknown>, markers: string[]): Scri
 
 const D0a: Scenario = {
 	id: "D0a",
-	title: "launch with --no-extensions -e <dir>: tools on turn 1, skills resolve, mock provider survives workers",
+	title: "launch with --no-extensions -e <dir>: tools on turn 1, skills resolve, no web listener in print mode",
 	script: () => ({
 		coord: {
 			rules: [
@@ -60,7 +61,7 @@ const D0a: Scenario = {
 		},
 		"worker-a": { rules: reporter("w", "@coordinator [done] DONE-w") },
 	}),
-	runs: [{ prompt: "start" }],
+	runs: [{ prompt: "start", env: { OMP_SWARM_UI: "1" } }],
 	check: (c, k) => {
 		const first = requests(c, "coord")[0];
 		for (const t of SWARM_TOOLS) k.ok(first?.tools.includes(t), `turn 1 offers ${t}`);
@@ -89,10 +90,10 @@ const D0b: Scenario = {
 
 const D0c: Scenario = {
 	id: "D0c",
-	title: "--no-session: private ephemeral swarm dir",
+	title: "--no-session: private ephemeral swarm dir, no web listener in JSON mode",
 	noSwarmDirEnv: true,
 	script: () => ({ coord: basicCoordinator({ name: "w", brief: "report", model: "mock/worker-a" }, ["DONE-w"]), "worker-a": { rules: reporter("w", "@coordinator [done] DONE-w") } }),
-	runs: [{ prompt: "start", args: ["--no-session"] }],
+	runs: [{ prompt: "start", args: ["--no-session", "--mode", "json"], env: { OMP_SWARM_UI: "1" } }],
 	check: (c, k) => {
 		const m = /omp-agy-swarm: swarm directory (\S+)/.exec(c.runs[0]?.stderr ?? "");
 		k.ok(m, "the ephemeral swarm dir is printed once on stderr");
@@ -127,7 +128,11 @@ const D1: Scenario = {
 				model,
 				{
 					rules: [
-						{ when: `You are \`${name}\``, reply: { tools: [tool("bash", { command: `printf ${name} > ${name}.txt && echo WROTE-${name}` })] } },
+						{ when: `You are \`${name}\``, reply: { tools: [tool("task", {
+							context: "Check native scaffold permissions.",
+							tasks: [{ name: "denied", agent: "task", task: "D1-UNAUTHORIZED-CHILD", solutionSpace: "No execution." }],
+						})] } },
+						{ when: "Cannot spawn 'task'. Allowed: scout", reply: { tools: [tool("bash", { command: `printf ${name} > ${name}.txt && echo WROTE-${name}` })] } },
 						{ when: `^tool: .*WROTE-${name}`, reply: { tools: [tool("post_message", { text: `@coordinator [done] DONE-${name} wrote ${name}.txt` })] } },
 						{ when: '^tool: \\{"seq":', reply: { tools: [tool("swarm_wait", {})] } },
 					],
@@ -152,8 +157,9 @@ const D1: Scenario = {
 		for (const model of ["worker-a", "worker-b", "plain"]) {
 			const tools = requests(c, model)[0]?.tools ?? [];
 			for (const t of SWARM_TOOLS) k.ok(tools.includes(t), `${model} worker has ${t}`);
-			for (const t of ["read", "bash", "edit", "write"]) k.ok(tools.includes(t), `${model} worker has ${t}`);
+			for (const t of ["read", "bash", "edit", "write", "task"]) k.ok(tools.includes(t), `${model} worker has ${t}`);
 			for (const t of NEVER) k.ok(!tools.includes(t), `${model} worker lacks ${t}`);
+			k.ok(requests(c, model).some(q => q.last.includes("Cannot spawn 'task'. Allowed: scout")), `${model} worker cannot spawn a native task agent`);
 		}
 	},
 };
@@ -443,7 +449,7 @@ const D9: Scenario = {
 			rules: [
 				{ when: '"added"', reply: { text: "Started; not waiting." } },
 				// Every gate refusal is answered by stopping again, never by waiting.
-				{ when: "Call swarm_wait now", reply: { text: "Still not waiting." } },
+				{ when: "The swarm still has outstanding work", reply: { text: "Still not waiting." } },
 			],
 			default: { tools: [tool("swarm", { action: "add", name: "w", brief: "wait a while", model: "mock/worker-a" })] },
 		},
@@ -496,7 +502,7 @@ const D10: Scenario = {
 				},
 				"worker-a": {
 					rules: [
-						{ when: "You were stopped by a restart", reply: { tools: [tool("post_message", { text: "@coordinator [done] GOT-NEXT" })] } },
+						{ when: "Background jobs from the previous session are not resumed", reply: { tools: [tool("post_message", { text: "@coordinator [done] GOT-NEXT" })] } },
 						{ when: '^tool: \\{"seq":', reply: { tools: [tool("swarm_wait", {})] } },
 					],
 				},
@@ -507,7 +513,7 @@ const D10: Scenario = {
 		k.eq(metrics(c)?.outcome?.value, "complete", "outcome of the resumed run");
 		const r = roster(c);
 		k.ok(r.w?.conversation_id, "same member");
-		const wakes = requests(c, "worker-a").filter(q => q.last.includes("You were stopped by a restart"));
+		const wakes = requests(c, "worker-a").filter(q => q.last.includes("Background jobs from the previous session are not resumed"));
 		k.eq(wakes.length, 1, "one revival wake");
 		k.ok(wakes[0]?.last.includes("NEXT-STEP"), "the owed post was delivered by the revival");
 		const files = readdirSync(join(c.swarm, "sessions")).filter(f => f.endsWith(".jsonl"));
@@ -585,4 +591,42 @@ const D12: Scenario = {
 	},
 };
 
-export const DETERMINISTIC: Scenario[] = [D0a, D0b, D0c, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12];
+const D13: Scenario = {
+	id: "D13",
+	title: "zero-filled add, member post and member wait behave like omitted arguments",
+	script: () => ({
+		coord: {
+			rules: [
+				accepted,
+				{ when: "^tool:.*DONE-PADDING", reply: finish("padding verified") },
+				{
+					when: "^tool:.*READY-PADDING",
+					times: 1,
+					reply: { tools: [tool("post_message", { text: "@probe CHALLENGE-PADDING", channel: "" })] },
+				},
+				{ when: "^tool:", reply: { tools: [tool("swarm_wait", paddedWait)] } },
+			],
+			default: { tools: [tool("swarm", { ...paddedAdd, model: "mock/worker-a" })] },
+		},
+		"worker-a": {
+			rules: [
+				{ when: "You are `probe`", reply: { tools: [tool("post_message", { text: "@coordinator READY-PADDING", channel: "" })] } },
+				{
+					when: '^tool:.*"woke":"post".*CHALLENGE-PADDING',
+					reply: { tools: [tool("post_message", { text: "@coordinator [done] DONE-PADDING", channel: "" })] },
+				},
+				{ when: '^tool: \\{"seq":', reply: { tools: [tool("swarm_wait", paddedWait)] } },
+			],
+		},
+	}),
+	runs: [{ prompt: "run padding probe" }],
+	check: (c, k) => {
+		k.eq(metrics(c)?.outcome?.value, "complete", "outcome");
+		const r = roster(c);
+		k.eq(Object.keys(r).filter(name => name !== "coordinator"), ["probe"], "one worker, not a group");
+		k.eq(r.probe?.effort, "high", "worker inherits coordinator effort");
+		k.ok(board(c).some(m => m.text === "@coordinator [done] DONE-PADDING"), "padded worker wait delivered the challenge");
+	},
+};
+
+export const DETERMINISTIC: Scenario[] = [D0a, D0b, D0c, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13];

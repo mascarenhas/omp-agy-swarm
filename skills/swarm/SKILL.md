@@ -18,7 +18,7 @@ Your hands are four tools:
 
 | Tool | What it is for |
 |---|---|
-| `swarm` | `status`, `models`, `add`, `model`, `kill`, `revive`, `finish`, `title`, `channel` — the swarm itself |
+| `swarm` | `status`, `models`, `add`, `model`, `scout`, `kill`, `revive`, `finish`, `title`, `channel` — the swarm itself |
 | `post_message` | say something on the board; this is how you assign work |
 | `read_board` | read posts after your cursor (or `since`); `status: true` for member states and cursors |
 | `swarm_wait` | sleep until something is posted for you or a timeout passes; costs nothing while asleep |
@@ -99,11 +99,11 @@ assumes context the worker has not got produces a worker that invents it.
    swarm with the `open_board` value of your latest `add` or `status` result,
    on its own line, exactly as given, and do the same whenever the user asks
    what the swarm is doing. If none is in view, call `swarm{action:"status"}`.
-   In a TUI session `open_board` is `/swarm` (the primary native terminal UI —
-   Overview, Board, Members, Transcript — which works over SSH with zero open
-   ports; `/swarm-ui start` is the optional local web board). In headless runs
-   `open_board` is `""`; if it is empty, offer none. Never invent a board URL
-   or token yourself.
+   `open_board` is the loopback URL (`http://127.0.0.1:<port>/`) while the
+   optional web board (`/swarm-ui start`) is running; otherwise `/swarm` in
+   TUI (the primary native terminal UI, zero open ports) and `""` in
+   RPC/headless. If `open_board` is empty, offer none. Never invent a board
+   URL yourself.
 
 Name workers for their job — `parser`, `verifier`, `docs` — never `agent-1`.
 Names match `^[a-z][a-z0-9_-]{0,31}$` and are unique for the lifetime of the
@@ -125,15 +125,19 @@ read_board{}                   # read unread posts (or pass since / channel)
 ```
 
 `swarm{action:"status"}` reports `mode`, `head`, `swarm_dir`, `open_board`,
-`completion`, `outcome`, `attention`, and each member's `state`, `detail`,
-`model`, `effort`, `channels`, `workspace`, `last_read_seq`, `unread`, `owed`
-(posts addressed to it that it has not read), `error`, and spend. Each worker
-is in one of four states:
+`completion`, `outcome`, `scout`, `attention`, and each member's `agent_id`
+(also returned by `add`), `state`, `detail`, `model`, `effort`, `channels`,
+`workspace`, `last_read_seq`, `unread`, `owed` (posts addressed to it that it
+has not read), `error`, and spend. Each worker is in one of four states:
 
-- `waiting`: asleep on the board (`in swarm_wait` or `idle`), costing nothing
-  until woken. It will not stir for anything that does not name it (unless
-  parked with `mentions_only: false`), so hand it work by name:
-  `@parser take the lexer tests`.
+- `waiting`: asleep on the board (`in swarm_wait` or `idle`), consuming no model
+  turns until woken. Besides directed mentions (or any visible post when parked
+  with `mentions_only: false`), timers, notices, and background job results can
+  wake a waiting worker. Hand idle workers work by name:
+  `@parser take the lexer tests`. A worker awaiting a native wake source also
+  reports `state: "waiting"` (`detail: "waiting on background work"` or
+  `"in swarm_wait, with background work"`) — it is still live and wakes when
+  job results arrive.
 - `working`: actively running (or `starting`, `reviving`, `switching model`, or
   `waking`). Post to it and it will see the post when free, but do not expect a
   reply immediately.
@@ -142,19 +146,23 @@ is in one of four states:
   `post_message` returns `stopped: […]` with a hint, and you receive a notice.
   Call `swarm{action:"revive"}` (or `swarm{action:"revive", name}`) — an
   exec-tier action — to start stopped members again and replay their owed posts.
-- `killed`: gone for good; names are never reused. If unfinished work remains,
-  `add` a fresh worker and brief it on the board.
+- `killed`: gone for good; names are never reused. The user can also stop a
+  worker from omp's Agent Hub or Tern Tray, which permanently kills it,
+  delivers a stop notice to you, and runs kill workspace/WIP rules. If
+  unfinished work remains, `add` a fresh worker and brief it on the board.
 
-Failures, stuck workers (10 minutes without activity while `working`), spend
-ceiling hits, revival requests, and retained workspaces reach you as `notices`
-inside wake messages and `swarm_wait` results, and under `attention` in
-`status`.
+Failures, stuck workers (10 minutes without activity while `working`), user
+stops from Hub/Tray, spend ceiling hits, revival requests, and retained
+workspaces reach you as `!`-prefixed notice lines in wake messages and in the
+`notices` field of `swarm_wait` results (`status` `attention` surfaces
+failures, stuck workers, retained workspaces, storage errors, and `incomplete`
+runs).
 
 The loop, until the goal is met:
 
-1. Check `swarm{action:"status"}`. Every `waiting` worker except the narrator
-   and the monitor (`narrator`, `monitor`, and their `-N` replacements) is idle
-   capacity.
+1. Check `swarm{action:"status"}`. Every `waiting` worker with no pending
+   background work (except `narrator`, `monitor`, and their `-N` replacements)
+   is idle capacity.
 2. Give each one something, **by name**, on the board: what to do, what it
    needs to know, and what to post when finished (tell workers to start their
    final completion post with `[done]` after the `@mention`, e.g.
@@ -172,37 +180,50 @@ The loop, until the goal is met:
    user asks).
 5. Report to the user, and go round again.
 
-If every worker is `waiting` (ignore the narrator and the monitor) and the job
-is not done, nobody is coming: the swarm is waiting on you.
+If every worker is `waiting` with no pending background work or armed timer
+(ignore the narrator and the monitor) and the job is not done, nobody is
+coming: the swarm is waiting on you.
 
 ## Headless runs
 
 When `add` or `status` reports `mode: "headless"` (for example `omp -p` or
-`--mode json`), there is no user to come back to and nothing wakes you after
-your turn ends.
+`--mode json`), there is no interactive user to come back to; only your own
+native background work (while print wake is active) or `swarm_wait` wakes you.
 
 - **Stay in `swarm_wait`.** After handing out work, call `swarm_wait` as the
   last tool call of your response. Do not end your turn while workers are live
   or posts/notices are unread — the stop-gate refuses premature exits (and
   after repeated refusals declares the run `incomplete`).
-- **Do not mix native background work.** Do not start omp background bash jobs
-  or `task` subagents of your own during a headless swarm run.
-- **Handle `woke: "stall"`.** Every task worker is waiting or stopped and
-  nothing is addressed to you (`final: true` warns that a second identical
-  stall will terminate the run as `incomplete`). Hand out the next step by
-  name, switch or revive a failed/stopped worker, or finish.
+- **Coordinator background work:** supported in headless runs (the swarm leases
+  omp's print wake while active unless already enabled, and restores it unless
+  overridden later); explicit `swarm_wait` and `finish` rules still apply.
+- **Handle `woke: "stall"`.** Every task worker is waiting or stopped with no
+  live background work or armed timer and nothing is addressed to you
+  (`final: true` warns that a second identical stall will terminate the run as
+  `incomplete`). Hand out the next step by name, switch or revive a
+  failed/stopped worker, or finish.
 - **Handle `woke: "incomplete"`.** The run hit a budget, deadline, spend cap,
   or repeated stall (`terminal: true`). Stop waiting, report what completed and
   what remains unfinished, and end your turn.
 - **Finish explicitly.** When the job is done, call
   `swarm{action:"finish", summary:"…"}` (≤ 2,000 characters; no `@mentions` and
   no `[abandoned]` line in `summary`) — or post `[done] <summary>` with no `@`
-  — then give your final answer. `finish` refuses while task workers are live
-  or you have unread posts or notices (including `workspace_retained` notices:
-  read them first). Pass `abandon: true` only when intentionally cancelling
-  remaining live/owed work; it fences launches/revivals/wakes while aborting
-  running workers, appends an `[abandoned]` record, and marks the outcome
-  `complete_with_abandonment`.
+  — then give your final answer. Normal `finish` is an immediate check and
+  refuses with the specific reason while task workers are live (working,
+  awaiting background work, or parked in a timed `swarm_wait`) or unread
+  posts/notices are owed:
+  - Timed `swarm_wait` (reports wake ETA): post
+    `@<name> end your turn without rearming the timer`, wait if the wake is
+    wanted, or pass `abandon: true` only to cancel intentionally.
+  - Posted while turn is still open: call `swarm_wait{}`, then retry `finish`
+    without `abandon: true`.
+  - Pending background work or unread posts/notices: wait in `swarm_wait{}` or
+    read them first (including retained-workspace notices).
+  Pass `abandon: true` only when intentionally cancelling remaining live/owed
+  work; it fences launches/revivals/wakes, waits for bounded cancellation and
+  reaping of worker background jobs (detaching async-bearing worker sessions so
+  nothing posts after `[done]`; Main's own jobs are not cancelled), appends an
+  `[abandoned]` record, and marks the outcome `complete_with_abandonment`.
 
 ## The narrator
 
@@ -282,6 +303,33 @@ assign it work, or kill it unless the user asks.
     be `waiting` or `stopped` (not `working`). Switching a failed member
     clears its failure and resumes it where it left off; switching a `stopped`
     member takes effect when it is revived.
+- **Scouts.** Ordinary workers may run native `task` restricted to
+  `agent:"scout"` (also enforced for eval `agent()`/`workpool()`): bundled
+  native `task` scouts run in the background by default as the worker's own
+  jobs and wake the worker with results (a custom shadow `scout` profile can
+  declare `blocking: true`); scouts are not board members. Bundled `scout`
+  defaults to `@smol` at `medium` (native precedence `project` > `user` >
+  `extension` > `bundled`; operator `task.agentModelOverrides.scout` applies).
+  - Use `swarm{action:"scout", model?, effort?}` (coordinator-only) when the
+    user asks to override scout model/effort: each call replaces the override,
+    `effort` alone keeps native model selection, and omitting both resets it.
+    Changes persist in `members.json` and apply only to newly added or revived
+    workers (running workers stay unchanged; your own native scouts keep Main's
+    native settings; per-call effort can still take precedence).
+  - Scout usage (by exact registry ancestry) and journaled eval
+    `completion()`/`judge()` calls count once toward `OMP_SWARM_MAX_COST_USD`
+    (unpriced token-bearing requests fail closed and persist across reopen; at
+    the ceiling, worker chat and other gated inference plus native spawn
+    admission are blocked, while omp's automatic compaction summaries, in-flight
+    requests, and your reporting turns can still add cost). Under a ceiling,
+    worker-owned scouts run on the main thread (`task.workerThreads=0`) so each
+    request checks a current ledger (otherwise omp's thread defaults apply);
+    Main keeps the operator's thread settings, so an already-running Main scout
+    on a worker thread can issue another auxiliary request before its prior bill
+    reaches the ledger. Your own native delegation (`task` / eval `agent()`)
+    stays blocked while the capped swarm is registered, including after `finish`
+    and reopen (resuming delegation requires restarting without
+    `OMP_SWARM_MAX_COST_USD` or switching to a session without that swarm).
 - **Stay lean.** Add a worker when work is queued and nobody is free; kill one
   when there is nothing left for it to pick up (never the narrator or monitor
   unless the user asks).
@@ -377,7 +425,7 @@ Naming a worker gets you its attention, not its agreement.
 
 ## Waiting
 
-Call `swarm_wait` rather than polling `read_board` in a loop. Waiting is free.
+Call `swarm_wait` rather than polling `read_board` in a loop. Waiting consumes no model turns.
 
 - **Call position:** in the coordinator (main session), `swarm_wait` must be
   the **last** tool call of its response. In workers, `swarm_wait` must be the
@@ -388,12 +436,16 @@ Call `swarm_wait` rather than polling `read_board` in a loop. Waiting is free.
   passing a value ahead of your cursor never skips unread posts.
 - **Options:** `mentions_only: false` wakes for any visible post (default
   `true`); `timeout_seconds` (1..86,400) bounds the sleep and returns
-  `remaining_seconds` if woken early.
+  `remaining_seconds` on early board/notice/stall wakes (not on `woke: "job"`).
+  Use **untimed `swarm_wait{}`** for ordinary standby — any armed task-worker
+  timeout counts as live work and blocks normal `finish`.
 - **Wake reasons (`woke`):**
   - `post`: new matching posts arrived (or quiescent unaddressed posts); check
     `more` and call `read_board` if `true`.
-  - `notice`: system notices arrived (failure, stuck, `revive_needed`,
-    `workspace_retained`, cost ceiling, storage).
+  - `job` (workers only): omp has background work ready to deliver after
+    `swarm_wait` returns (omits `remaining_seconds`); do not poll.
+  - `notice`: system notices arrived (failure, stuck, user stop, revival
+    needed, retained workspace, cost ceiling, storage).
   - `timeout`: `timeout_seconds` elapsed.
   - `stall`: every task worker is waiting or stopped and nothing is addressed
     to you (`final: true` on the second identical stall).
@@ -437,9 +489,11 @@ Call `swarm_wait` rather than polling `read_board` in a loop. Waiting is free.
   Check `swarm{action:"models"}` for per-provider `quota`. Do not `kill` and
   re-`add` a worker just because its model failed.
 - **Restart leaves members `stopped`.** After a restart, non-killed members are
-  loaded as `stopped` and board posts do not auto-revive them. Call
-  `swarm{action:"revive"}` to revive every stopped member with owed posts, or
-  `swarm{action:"revive", name}` for a specific member or group. If a member's
+  loaded as `stopped`, previous background jobs are lost, and board posts do
+  not auto-revive them. Call `swarm{action:"revive"}` to revive every stopped
+  member with owed posts, or `swarm{action:"revive", name}` for a specific
+  member or group (revived workers are reminded to check outputs before
+  restarting work). If a member's
   transcript is `lost` or it never started (`start`), `kill` it and `add` a
   replacement citing its brief `#seq`. If revival fails with
   `model_unavailable`, switch its model with `swarm{action:"model"}` first and

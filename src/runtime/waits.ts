@@ -16,9 +16,16 @@ export function claim(rt: SwarmRuntime, m: Member, waitId: string, reason: Claim
 	if (w.signal && w.onAbort) w.signal.removeEventListener("abort", w.onAbort);
 	if (extra) w.extra = extra;
 	m.waiter = undefined;
-	if (m.phase === "parked") m.phase = "resuming";
+	if (m.phase === "parked") {
+		m.phase = reason === "job" ? "working" : "resuming";
+		// The park can outlast the stuck interval. A successful claim starts
+		// a new activity interval even before the host emits its tool receipt.
+		m.tracker.touch();
+		m.stuckNotified = false;
+	}
 	m.wakeMode = "working";
 	m.waitUntil = null;
+	m.session?.setBoardWait(w.id, false);
 	w.resolve(reason);
 	rt.keepAlive();
 	rt.changed();
@@ -56,6 +63,7 @@ export function arm(rt: SwarmRuntime, m: Member, o: ArmOptions): { waiter: Waite
 	m.wakeMode = o.mode;
 	m.waitSince = m.lastReadSeq;
 	m.waitUntil = waiter.deadline ?? null;
+	m.session?.setBoardWait(waiter.id, true);
 	if (o.timeoutSeconds !== undefined) {
 		waiter.timer = setTimeout(() => claim(rt, m, waiter.id, "timeout"), o.timeoutSeconds * 1000);
 	}

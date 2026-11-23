@@ -103,6 +103,7 @@ export interface MemberStats {
 export interface MemberRecord {
 	role: Role;
 	conversation_id: string;
+	/** Native registry id, independent of conversation_id; absent in older v1 rosters. */
 	agent_id?: string;
 	gen?: number;
 	model: string;
@@ -133,6 +134,12 @@ export interface MemberRecord {
 	killed_seq?: number;
 }
 
+/** Absent fields keep the native scout model selection or effort. */
+export interface ScoutOverride {
+	model?: string;
+	effort?: string;
+}
+
 export interface RosterFile {
 	version: 1;
 	id: string;
@@ -140,6 +147,8 @@ export interface RosterFile {
 	created_at: string;
 	board_head: number;
 	channels: ChannelRecord[];
+	scout?: ScoutOverride;
+	spend_unknown?: string;
 	members: Record<string, MemberRecord>;
 }
 

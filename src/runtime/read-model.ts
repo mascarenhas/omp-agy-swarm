@@ -7,6 +7,7 @@ import type { AttentionItem, MemberView, SwarmReadModel, TranscriptSource, ViewF
 import { FileTranscript, LiveTranscript } from "../ui/transcript.ts";
 import { ViewFilesReader } from "../ui/view-files.ts";
 import { wakePendingFor } from "./delivery.ts";
+import { completionLabel } from "./gate.ts";
 import type { Member } from "./member.ts";
 import type { SwarmRuntime } from "./runtime.ts";
 
@@ -14,6 +15,8 @@ export class RuntimeReadModel implements SwarmReadModel {
 	readonly rt: SwarmRuntime;
 	readonly #files: ViewFilesReader;
 	readonly #fileTranscripts = new Map<string, FileTranscript>();
+	readonly #liveTranscripts = new WeakMap<NonNullable<Member["session"]>, LiveTranscript>();
+	#coordinatorTranscript: LiveTranscript | undefined;
 	#membersKey = -1;
 	#members: MemberView[] = [];
 
@@ -83,6 +86,7 @@ export class RuntimeReadModel implements SwarmReadModel {
 			killed: m.killed,
 			conversationId: m.conversationId,
 			sessionFile: m.sessionFile ?? undefined,
+			liveAgentId: m.role !== "coordinator" && !m.killed && m.phase !== "stopped" && m.phase !== "killed" ? m.session?.agentId : undefined,
 			briefSeq: m.briefSeq,
 			task: m.task,
 			lastEventAt: m.tracker.lastEventAt,
@@ -105,12 +109,16 @@ export class RuntimeReadModel implements SwarmReadModel {
 		return this.rt.attention();
 	}
 
-	completion(): string {
-		return this.rt.completion();
+	completion(absoluteTime?: { hour12?: boolean }): string {
+		return completionLabel(this.rt, absoluteTime);
 	}
 
 	outcome(): { value: string; reason: string } | null {
 		return this.rt.outcome ? { value: this.rt.outcome.value, reason: this.rt.outcome.reason } : null;
+	}
+
+	spend() {
+		return this.rt.spendView();
 	}
 
 	files(): ViewFiles {
@@ -120,10 +128,19 @@ export class RuntimeReadModel implements SwarmReadModel {
 	transcript(name: string): TranscriptSource | undefined {
 		const m = this.rt.members.get(name);
 		if (!m) return undefined;
-		// rt.epoch moves on session_clear: every outstanding coordinator transcript cursor expires.
-		if (m.role === "coordinator") return new LiveTranscript(this.rt.sid, () => this.rt.binding.branchEntries(), () => this.rt.epoch);
+		if (m.role === "coordinator") {
+			// rt.epoch moves on session_clear: outstanding coordinator cursors expire.
+			return this.#coordinatorTranscript ??= new LiveTranscript(this.rt.sid, () => this.rt.binding.branchEntries(), () => this.rt.epoch);
+		}
 		const session = m.session;
-		if (session && !m.killed) return new LiveTranscript(m.conversationId, () => session.branchEntries());
+		if (session && !m.killed && m.phase !== "stopped" && m.phase !== "killed") {
+			let src = this.#liveTranscripts.get(session);
+			if (!src) {
+				src = new LiveTranscript(session.sessionId, () => session.branchEntries());
+				this.#liveTranscripts.set(session, src);
+			}
+			return src;
+		}
 		if (!m.sessionFile) return undefined;
 		const path = join(this.rt.dir, "sessions", basename(m.sessionFile));
 		let src = this.#fileTranscripts.get(path);

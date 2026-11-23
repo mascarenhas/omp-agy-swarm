@@ -2,9 +2,9 @@
 
 An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.1.0**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
 
-- **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances in a per-swarm private `AgentRegistry` (`~/.omp/agent/agents/` is never touched; worker transcripts stay under `<swarm_dir>/sessions/`).
+- **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances registered in omp's global `AgentRegistry`—making live workers inspectable via `/hub`, native transcript focus, and (in tray-capable hosts like Tern) Tray cards without touching `~/.omp/agent/agents/` (worker transcripts stay under `<swarm_dir>/sessions/`).
 - **Full per-worker model and exact reasoning effort control:** inherit the coordinator's model and effort by default, or pin any runnable `provider/id` and exact effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — never `auto`) with live boundary model switching, immediate effort-only switching, and no silent fallback downgrades.
-- **SSH-first native TUI (`/swarm`) + opt-in local web board (`/swarm-ui`):** `/swarm` provides four keyboard-driven views (Overview, Board, Members, Transcript) plus a live status widget under the editor with **zero open network ports**. `/swarm-ui` starts a read-only loopback web board only when explicitly requested.
+- **Native Tern & ANSI TUI (`/swarm`) + opt-in local web board (`/swarm-ui`):** `/swarm` provides four read-only, keyboard-driven views (Overview, Board, Members, Transcript) plus a live status widget under the editor with **zero open network ports**—rendering natively with pointer support on terminals that negotiate TSP (such as Tern) and falling back to ANSI where TSP is not negotiated (plain terminals and ordinary SSH). `/swarm-ui` starts a separate optional read-only loopback web board only when explicitly requested.
 - **First-class headless (`omp -p`) execution:** stop-gate, stall/quiescence detection, spend ceilings, monotonic deadlines, and durable `metrics.json` outcomes.
 - **Private personal repository:** `"private": true` in `package.json`; see [`NOTICE.md`](./NOTICE.md) for the provenance and SHA-256 verification of the vendored Antigravity web frontend files.
 
@@ -42,9 +42,10 @@ Start `omp` in your project directory and ask it to run a swarm (or prompt it to
 Read skill://swarm and split the parser rewrite across two authors (lexer and parser) plus one verifier.
 ```
 
-- A single-line status widget appears below the editor (`swarm · <title> · ●2 ○1 · #12 · /swarm`).
+- A status widget appears below the editor (ANSI: `swarm · <title> · ●2 ○1 · #12 · /swarm`; native TSP: wrapping text with word counts such as `2 working · 1 waiting`).
 - Run `/swarm` at any time to open the full-screen terminal board (or `/swarm board`, `/swarm members`, `/swarm transcript <name>`).
-- Optionally run `/swarm-ui start` to spin up the loopback web board and get a one-time private link.
+- Open omp's **Agent Hub** (`/hub` → `1` Agents → select → `Enter`)—or click a **Tern Tray** card in a tray-capable host—to focus a live member's native omp transcript.
+- Optionally run `/swarm-ui start` to start the read-only loopback web board: in TUI the status widget immediately shows `http://127.0.0.1:<port>/` (even mid-turn; native wraps the full URL, while ANSI clips it only if the URL alone exceeds the terminal width), and a copyable transcript notice appears immediately when idle or when the active run ends (a brief toast is also sent, though it may not appear when idle—notably in Tern—and neither display depends on it).
 
 ### Headless (`omp -p`)
 
@@ -57,6 +58,7 @@ omp -p "Read skill://swarm. Add two workers to implement and test feature X, ver
 In headless runs (`print` and `json` modes):
 - `swarm{action:"add"}` and `swarm{action:"status"}` report `mode: "headless"` and `open_board: ""`.
 - The coordinator stays in `swarm_wait` while workers run; premature turn stops while task workers are live or posts/notices are unread are refused by the stop-gate.
+- Coordinator background work is supported: while a headless swarm is active, the plugin leases omp's print wake (`async.printWake = true`) if it is not already enabled, and restores the prior override on completion or close unless a later operator override or clear changed it.
 - The coordinator finishes via `swarm{action:"finish", summary:"…"}` (or posting `[done] <summary>` with no `@mentions`) and then prints its final answer.
 - Outcomes (`complete`, `complete_with_abandonment`, `quiescent_no_done`, `incomplete`, `coordinator_failed`, `aborted`), swarm-level `spend` (`{ tokens, cost, ceiling, unknown? }`), and per-member token/USD spend are written atomically to `<swarm_dir>/metrics.json`.
 
@@ -68,13 +70,14 @@ In headless runs (`print` and `json` modes):
 
 | Action | Key parameters | Purpose | Approval tier | Who can call |
 |---|---|---|---|---|
-| `status` | — | Swarm state, mode, `swarm_dir`, `open_board`, `completion`, `outcome`, swarm-level `spend` (`{ tokens, cost, ceiling, unknown? }`), `attention`, and per-member status/cursors/owed/spend | `read` | Coordinator, workers |
+| `status` | — | Swarm state, mode, `swarm_dir`, `open_board`, `completion`, `outcome`, swarm-level `spend` (`{ tokens, cost, ceiling, unknown? }`), `scout` override, `attention`, and per-member `agent_id`/status/cursors/owed/spend | `read` | Coordinator, workers |
 | `models` | `query?`, `provider?`, `limit?` (1..100, default 40) | Lists runnable models, supported `efforts`, context window, and per-provider `quota` summary | `read` | Coordinator, workers |
-| `add` | `name?`, `brief?`, `model?`, `effort?`, `tasks?` (1..16), `n?` (2..16), `fork?`, `workspace?`, `channels?`, `role?` (`worker`\|`narrator`\|`monitor`) | Starts a worker, numbered group (`<name>-1..k`), or singleton role worker (`narrator`/`monitor`) and posts its brief | `exec` | Coordinator (any role); workers (`worker` helpers up to depth 2) |
+| `add` | `name?`, `brief?`, `model?`, `effort?`, `tasks?` (1..16), `n?` (2..16), `fork?`, `workspace?`, `channels?`, `role?` (`worker`\|`narrator`\|`monitor`) | Starts a worker, numbered group (`<name>-1..k`), or singleton role worker (`narrator`/`monitor`), returns its `agent_id`, and posts its brief | `exec` | Coordinator (any role); workers (`worker` helpers up to depth 2) |
 | `model` | `name?`, `model?`, `effort?` | Changes a member's (or caller's) model and/or reasoning effort while keeping its conversation | `write` | Coordinator (anyone); workers (self or own helpers) |
+| `scout` | `model?`, `effort?` | Replaces the swarm's scout override (`effort` alone keeps native model selection; omitting both resets); applies to newly added or revived workers only (Main keeps its native scout settings) | `write` | Coordinator only |
 | `kill` | `name`, `discard_ignored?`, `keep_workspace?` | Permanently stops a member (or group) and runs preservation-first worktree cleanup | `exec` | Coordinator (any non-coordinator); workers (own helpers) |
 | `revive` | `name?` | Revives stopped members after a restart (omit `name` to revive all stopped members with owed posts) and replays owed posts | `exec` | Coordinator (any non-coordinator); workers (own helpers) |
-| `finish` | `summary` (≤ 2,000 chars, no `@`), `abandon?` | Marks the swarm `[done]`; refuses while work is live or unread unless `abandon: true` cancels remaining work | `exec` | Coordinator only |
+| `finish` | `summary` (≤ 2,000 chars, no `@`), `abandon?` | Marks the swarm `[done]`; normal `finish` is an immediate state check that refuses with a specific reason while task workers are live (including background jobs and timed waits) or unread; `abandon: true` fences workers and waits for bounded cleanup (without cancelling Main's own jobs) | `exec` | Coordinator only |
 | `title` | `title` (≤ 80 chars) | Sets the swarm's title | `write` | Coordinator only |
 | `channel` | `op` (`create`\|`list`\|`subscribe`\|`unsubscribe`\|`archive`), `channel?`, `topic?`, `name?` | Manages topic channels (`main` is always visible to everyone) | `read` (`list`), `write` (others) | `list`: coordinator & workers; `create`/`archive`: coordinator only; `(un)subscribe`: coordinator (anyone) or worker (self/own helpers) |
 
@@ -82,17 +85,28 @@ In headless runs (`print` and `json` modes):
 
 - **`post_message{text, channel?}`** (`write`): posts 1..8,000 characters to `channel` (default: caller's first channel, else `main`). Begin with `@name`, `@group-prefix`, `@#channel`, or `@all` (`@#main` is refused). Returns `seq`, `channel`, `mentions`, `all`, `channel_mentions`, `woke`, plus `unknown_mentions` and `stopped` (with a `revive` hint) when relevant. Disabled for `narrator`.
 - **`read_board{since?, limit?, channel?, status?}`** (`read`): reads up to `limit` posts (1..200, default 50, capped at 48 KB per page) after `since` (default: caller's read cursor; own-view reads never skip unread posts). Pass `channel: "<name>"` for one channel or `"*"` for all. Pass `status: true` to return member states, `detail`, `wake_mode`, `wait_since`, `wait_until`, `last_read_seq`, `channels`, `last_post_seq`/`last_post_time`, and `error` instead of posts.
-- **`swarm_wait{since?, mentions_only?, timeout_seconds?}`** (`read`, interruptible, exclusive): sleeps for free until a matching post (`mentions_only: true` default; `false` for any visible post), a notice, a stall/incomplete signal, or `timeout_seconds` (1..86,400) arrives.
+- **`swarm_wait{since?, mentions_only?, timeout_seconds?}`** (`read`; host `interruptible`/`exclusive` flags on Main only — workers enforce the sole-call rule plus the job-ready check): parks without consuming model turns until a matching post (`mentions_only: true` default; `false` for any visible post), a notice, ready worker background work (`woke: "job"`, which omits `remaining_seconds`), a stall/incomplete signal, or `timeout_seconds` (1..86,400) arrives. Omit `timeout_seconds` for ordinary standby; any armed task-worker timer counts as live work and blocks normal `finish`.
   - **Call position:** must be the **last** tool call of a response in the coordinator (main session), and the **only** tool call of a response in workers (otherwise returns `woke: "not_parked"`).
   - **Server-side cursor:** `since` is advisory; the runtime advances a member's read cursor only after the host confirms receipt of the delivered message or tool result.
-  - **Wake reasons (`woke`):** `post`, `notice`, `timeout`, `stall`, `incomplete`, `nudge`, `switch`, `not_parked`, `interrupted`, `aborted`, `killed`, `closing`, `no_swarm`.
+  - **Wake reasons (`woke`):** `post`, `job`, `notice`, `timeout`, `stall`, `incomplete`, `nudge`, `switch`, `not_parked`, `interrupted`, `aborted`, `killed`, `closing`, `no_swarm`.
 
 ### Role tool sets & permissions
 
 - **Coordinator (main session):** full access to all 4 swarm tools (with main-session approval tiers above) and all main-session tools.
-- **Task worker (`role: "worker"`):** all 4 swarm tools + `OMP_SWARM_WORKER_TOOLS` (default: `read, bash, edit, write, glob, grep, eval, todo, web_search, lsp, ast_grep, ast_edit`), intersected with the main session's active tools. Hard-excluded tools (`task`, `wait`, `manage_skill`, `new_context`, `yield`, `irc`, `async`, `job`) are always stripped, and auto-backgrounding is disabled inside worker sessions.
-- **Narrator (`role: "narrator"`):** `read_board`, `swarm_wait`, plus `read, write, edit, bash, glob, grep` (intersected with active tools). Has no `post_message` and no `swarm` tool.
-- **Monitor (`role: "monitor"`):** `read_board`, `swarm_wait`, `post_message` only (no `swarm`, no filesystem/shell/cron tools).
+- **Task worker (`role: "worker"`):** all 4 swarm tools + `OMP_SWARM_WORKER_TOOLS` (default: `read, bash, edit, write, glob, grep, eval, task, todo, web_search, lsp, ast_grep, ast_edit`), intersected with the main session's active tools. Hard-excluded tools (`wait`, `manage_skill`, `new_context`, `yield`, `irc`, `async`, `job`) are always stripped. Task workers get omp-managed background jobs (`async.enabled: true`, following omp's `bash`/`eval` auto-background defaults) and, when `task` is active, native `task` (and eval `agent()`/`workpool()`) restricted by the SDK to the `scout` agent.
+- **Narrator (`role: "narrator"`):** `read_board`, `swarm_wait`, plus `read, write, edit, bash, glob, grep` (intersected with active tools). Has no `post_message`, no `swarm` tool, cannot spawn subagents, and has async/auto-backgrounding disabled.
+- **Monitor (`role: "monitor"`):** `read_board`, `swarm_wait`, `post_message` only (no `swarm`, no filesystem/shell/cron tools, cannot spawn subagents, and has async/auto-backgrounding disabled).
+
+### Worker background jobs, scouts & liveness
+
+- **Managed background jobs:** task workers (`role: "worker"`) share a per-swarm `AsyncJobManager` (`async.enabled: true`, inheriting omp's `bash`/`eval` auto-background defaults). Long or noisy commands should run in the background (`bash` with `async: true`) rather than blocking, since 10 minutes without activity while `working` trips the stuck check. Background jobs share the worker's working copy/worktree while it edits.
+- **Parking & wakeups:** when a worker ends its turn awaiting a native wake source (`agent_pause{awaiting: true}`), it becomes `waiting` (`detail: "waiting on background work"` — idle on the board, still live, not flagged stuck, and not prematurely nudged). Both job results and directed board posts wake it. Calling untimed `swarm_wait{}` while jobs run shows `detail: "in swarm_wait, with background work"` and returns `woke: "job"` when omp has background work ready to deliver next; do not poll.
+- **Owner-scoped job control (`proc://`):** workers inspect and cancel only their own jobs via native `proc://` (`read proc://`, `read proc://<id>`, `write proc://<id>/kill` with empty content). There is no `job` tool, and worker jobs do not appear in Main's jobs sheet.
+- **Teardown & restart:** `swarm{action:"kill"}`, Hub/Tray stop, `finish{abandon:true}`, and shutdown attempt bounded cancellation and reaping of the member's jobs (`finish{abandon:true}` detaches async-bearing worker sessions so late results cannot reopen turns or post after `[done]`, without cancelling Main's own jobs). If stop is not confirmed within the teardown bound, the worktree is retained; detached members remain `stopped` and `swarm{action:"revive"}` waits until any pending disposal finishes. Background jobs are lost on restart; `revive` reminds the worker to check outputs before restarting work.
+- **Liveness & `finish` refusals:** a task worker awaiting background work or parked in a timed `swarm_wait` counts as live work (use untimed `swarm_wait{}` for ordinary standby). Normal `swarm{action:"finish"}` stays an immediate state check and refuses with the specific reason — timed wait with wake ETA and options, pending background work, or `"<name> posted, but its turn is still open. Call swarm_wait{}; when it wakes, retry finish without abandon:true."` (plus unread posts/notices only when actually owed).
+- **Native scouts (`agent: "scout"`):** ordinary workers (`role: "worker"` with `task` active) can spawn native `scout` subagents via `task` — enforced by the SDK for `task` as well as eval `agent()` and `workpool()` (`narrator` and `monitor` cannot spawn, and `wait` stays excluded). Bundled native `task` scouts run in the background by default as the worker's own jobs and wake the worker with their results (a custom shadow `scout` profile can declare `blocking: true`); scouts are not swarm board members and are not resumed on restart. Native profile precedence is `project` > `user` > `extension` > `bundled` (the bundled `scout` defaults to `@smol` at `medium`, and the operator's `task.agentModelOverrides.scout` applies).
+- **Swarm scout override (`swarm{action:"scout", model?, effort?}`):** coordinator-only (`write` tier). Each call replaces the swarm override: `effort` alone keeps native model selection, and omitting both fields resets to native policy (without creating an absent swarm). The setting persists in `members.json` and applies only to workers added or revived afterwards (running workers are unchanged, and Main's own scouts keep their native settings; native per-call effort can still take precedence).
+- **Spend attribution:** scouts are attributed once to the owning member by exact registry ancestry (no double-billing from Hub progress or task-result totals); stateless eval `completion()`/`judge()` calls are billed through the calling session's journal (Main's other journaled auxiliary calls, such as composer predictions and labels, also count toward swarm spend). Any token-bearing request without a usable price fails closed under `OMP_SWARM_MAX_COST_USD`.
 
 ### Model & effort resolution
 
@@ -107,7 +121,14 @@ In headless runs (`print` and `json` modes):
 
 ### Primary UI: Native TUI (`/swarm`)
 
-Works directly over SSH and in any terminal (`≥ 24×6`), binds no network ports, and is strictly read-only (nothing in `/swarm` moves any agent's read cursor).
+Binds no network ports, is strictly read-only (nothing in `/swarm` moves any agent's read cursor), and stays keyboard-driven. `/swarm-ui` remains the separate optional web board.
+
+- **Tern (TSP) vs. ANSI/SSH:** in Tern (terminals that negotiate the Tern Surface Protocol), `/swarm` (a fullscreen `omp.swarm` page with a shared header showing title, mode, `#seq`, directory basename—full path in the coordinator's Members details—spend, and worker counts, plus a dock), the below-editor status widget, wake messages (`swarm-wake`), and web-board notices (`swarm-ui`) render as native UI with pointer support for tabs, lists, filters, paging, help, and dock search/jump inputs. Plain terminals and ordinary SSH sessions (non-TSP peers) keep the ANSI UI (`≥ 24×6`). For debugging (with debug logging enabled), `PI_TUI_NATIVE_STATS=1` emits a debug-level `{sf, ops, rows}` total per reconciled surface (a full TSP swarm screen has `rows: 0`, while unrelated inline host nodes can still fall back).
+- **Tabs:**
+  - **1 Overview:** goal and outcome work threads, attention items, recent flagged screenshot captions (up to 8), and jump actions to the selected member or board post (Overview/header file info refreshes every 2 s).
+  - **2 Board:** in native mode, selected post detail above the feed (with expand/collapse and sender link), filter toolbar, bounded 50-post feed with unread divider (leaving follow keeps the current window and slides at its edges; Older/Newer page explicitly), plus dock search (`/`) and `#seq` jump; in ANSI mode, visible post blocks lay out by available rows and expose filters via keys and the status line.
+  - **3 Members:** grouped roster (coordinator, task workers/groups/helpers, narrator/monitor) with killed toggle (`K`), selected member facts, and **View transcript** (`Enter` / `t` in native; `t` in ANSI).
+  - **4 Transcript:** read-only conversation history for live and historical members (newest-first, content-budgeted right after the member line in native, with paging moving the window; search typing/`Esc` keep your place), plus member cycling and follow. To watch a live worker in omp's native transcript instead: close `/swarm`, open `/hub`, press `1`, select the displayed registry ID (e.g., `swarm~parser`), and press `Enter`—or click its Tern Tray card (stopped, killed, and coordinator entries show no live-focus hint).
 
 ```text
 /swarm [overview | board | members | transcript [name]]
@@ -120,44 +141,64 @@ In `rpc` mode, `/swarm` prints a compact text summary notification.
 | **Global** | `1`–`4`, `Tab` / `Shift-Tab` | Switch between Overview, Board, Members, Transcript |
 | | `?` | Toggle keybindings help |
 | | `q`, `Esc` | Close overlay (`Esc` first pops navigation back-stack or closes detail/search) |
-| **1 Overview** | `↑` / `↓`, `Enter` | Select row; open member in Members or jump to post in Board |
+| **1 Overview** | `↑` / `↓`, `Enter` | Select row; open member in Members (if a member) or jump to post in Board |
 | **2 Board** | `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Navigate posts |
 | | `/`, `n` / `N` | Filter/search (`Enter` keeps, `Esc` clears); next/previous |
-| | `#` `<digits>` `Enter`, `b` | Jump to `#seq` (temporarily suspends filters); `b` restores filters |
-| | `a` / `A`, `m`, `c`, `x` | Cycle author (`A` clears), cycle mention filter, cycle channel, clear all filters |
-| | `f`, `u`, `Enter`, `o` | Toggle follow tail, jump to first unread past coordinator cursor, expand/collapse long post, open author in Members |
-| **3 Members** | `↑` / `↓`, `PgUp` / `PgDn` | Select member (detail renders side-by-side at terminal width ≥ 110 cols) |
-| | `Enter`, `t`, `K` | Toggle detail view, open transcript, toggle killed members |
+| | `#` `<digits>` `Enter`, `b` | Jump to `#seq` (suspends filters only if they exclude the target); `b` restores the snapshot taken at the first suspending jump |
+| | `a` / `A`, `m`, `c`, `x` | Cycle author (`A` clears), cycle mention filter, cycle unique channels, clear all filters |
+| | `f`, `u`, `Enter`, `o` | Toggle follow tail, select first post past coordinator cursor in the current filtered list, expand/collapse long post, open author in Members (if a member) |
+| **3 Members** | `↑` / `↓`, `PgUp` / `PgDn` | Select member (native places the roster and selected card in a wrapping row that stacks on narrow panes; ANSI renders side-by-side at width ≥ 110 cols) |
+| | `Enter`, `t`, `K` | Open transcript (native) or toggle detail view (ANSI), open transcript, toggle killed members |
 | **4 Transcript** | `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Page backwards/forwards across the full conversation branch |
 | | `f`, `[` / `]`, `/`, `Esc` | Toggle follow, cycle member, search loaded items, go back |
 
+### Native omp Agent Hub & Tern Tray (`/hub`)
+
+Live workers (including `narrator` and `monitor`) register in omp's global `AgentRegistry` without writing any agent profiles (`~/.omp/agent/agents/` is never touched). In interactive sessions, they appear in `/hub` (subject to the persisted-root filter below) and in Tray on tray-capable native hosts such as Tern with agent display enabled (which may group settled members).
+
+- **Native transcript focus & input:** open `/hub` → `1` (Agents) → select a member → `Enter` (or click its Tray card) to view the worker's live native omp transcript (`Esc` returns to Main when the composer is empty; otherwise it clears the draft first). Submitting sends live human input to the focused worker—steering an active run or starting an idle one.
+- **Live activity:** Tray cards and Hub rows show live tool/activity updates; a worker parked in `swarm_wait` shows `waiting on board`.
+- **Registry IDs:** new allocations and collision fallbacks use `swarm~<name>` (adding `~2`, `~3`, … only on collision), persisted in `members.json` and preferred on `revive` (an available persisted legacy ID is reused verbatim). The assigned ID is shown in Tray and Hub and returned as `agent_id` in `swarm{action:"add"}` and `swarm{action:"status"}` results.
+- **Stop, exit, and `/clear`:**
+  - Stopping a member from Hub (`x`) or Tray permanently **kills** it in the swarm: the fence engages at the native tombstone transition (Hub/Tray may await abort first), the coordinator receives one stop notice (unlike explicit `swarm{action:"kill"}`, which emits no stop notice), and preservation-first workspace WIP cleanup runs once stop is confirmed.
+  - Normal session exit reloads non-killed members as `stopped`; `swarm{action:"revive"}` restarts members that have a valid recorded transcript and workspace (an interrupted launch that never recorded a session cannot be revived).
+  - `/clear` keeps live workers running and preserves their registry refs and existing Hub/Tray visibility.
+- **Limitations:**
+  - A custom `OMP_SWARM_DIR` outside a persisted root session's artifact tree hides workers from the in-session Hub filter and excludes them from native subagent tree cost (durable swarm spend in `status`/`metrics.json` is unaffected; when the default `<Main artifacts>/swarm/sessions` directory is reached through a symlink such as `/home` → `/var/home`, worker transcript paths use Main's spelling when both resolve to that same physical directory, while custom paths keep their own spelling and stay subject to Hub's lexical filter). With `--no-session` (which falls back to a temp dir only when `OMP_SWARM_DIR` is unset), the Hub's root-file filter is disabled so workers remain visible, though file-backed worker refs do not contribute to native tree cost without a matching root.
+  - After a restart, stopped workers stay hidden from Hub and Tray until revived with `swarm{action:"revive"}`.
+  - Creating, forking, and reviving workers never overwrites the terminal's resume breadcrumb, so `omp --continue` (and auto-resume) follows omp's normal breadcrumb and recent-session rules rather than jumping to a worker transcript. If an older plugin version left the terminal's resume pointer on a worker transcript, resume the coordinator session once explicitly (`omp --resume <session id prefix>`) to reset it.
+  - Live swarm workers are among the global registry's visible peers and can appear in `agent://all` broadcast receipts (worker IRC remains disabled).
+  - Headless (`print`/`json`) runs register globally too, but have no Hub or Tray UI.
+
 ### Optional Web Board (`/swarm-ui`)
 
-No HTTP server is created or port bound until you opt in via `/swarm-ui start` (or `OMP_SWARM_UI=1` in an interactive `tui`/`rpc` session).
+Opt-in, read-only (`GET`-only; non-`GET` returns `405` with `Allow: GET`), and bound strictly to `127.0.0.1`. No HTTP server is created or port bound at load; start it with `/swarm-ui start` or `/swarm-ui open` (or `OMP_SWARM_UI=1`, which auto-starts once when a new or restored swarm attaches in interactive `tui`/`rpc` sessions, never in headless `print`/`json`).
 
 ```text
 /swarm-ui [status | start [port] | open | stop]
 ```
 
-- `status` (default): reports whether the server is running and on which port.
-- `start [port]`: starts the read-only server on `127.0.0.1` (`port` defaults to `OMP_SWARM_UI_PORT`, or an ephemeral port if `0`) and displays a one-time private link.
-- `open`: starts if needed, prints a fresh private link, and launches the local browser (`xdg-open` / `open`).
-- `stop`: closes the server immediately and invalidates all active tokens and links.
+- `status` (default): if running, triggers a brief toast (which may not show when idle) and re-posts the copyable transcript notice (immediately when idle, or when the active run ends); otherwise notifies that the web board is off.
+- `start [port]`: starts the server on `127.0.0.1` (`port` defaults to `OMP_SWARM_UI_PORT`, or an ephemeral port if `0`), updates the TUI status widget below the editor immediately with the live `http://127.0.0.1:<port>/` URL (even mid-turn; native renders the full URL in a wrapping text node, while ANSI clips it only if the URL alone cannot fit; RPC has no widget), sends a brief toast (which may not appear when idle), and posts a persistent, copyable transcript notice (`customType: "swarm-ui"`, excluded from model context, no turn triggered; appears immediately when idle or when the active run ends) with the URL and remote-access commands. Auto-start via `OMP_SWARM_UI=1` announces the same way.
+- `open`: starts if needed, announces the URL the same way, and makes a best-effort attempt to launch the host browser (`xdg-open` / `open`).
+- `stop`: closes the listener and removes the URL from the status widget immediately (earlier transcript notices remain in history).
+
+Because the URL is plain (`http://127.0.0.1:<port>/`, with no credentials), page reloads and bookmarks work while that address is listening. While running, the TUI status widget shows the full live URL (ANSI: `swarm · http://127.0.0.1:<port>/ · <title> · ●2 ○1 · #12 · /swarm`, dropping other segments before clipping the URL; native: wrapping text node with word counts such as `2 working · 1 waiting`; RPC has no widget), and `open_board` in `swarm{action:"add"}` and `swarm{action:"status"}` returns `http://127.0.0.1:<port>/` (otherwise `/swarm` in TUI and `""` in RPC/headless; `/swarm` remains available independently).
 
 **Security model:**
-- Binds strictly to `127.0.0.1` (never `0.0.0.0`).
-- Rejects mismatched `Host` (`421`) and cross-origin `Origin` (`403`) headers; sends strict CSP (`frame-ancestors 'none'; connect-src 'self'`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on API routes.
-- **No cookies and no URL-query tokens:** the one-time 5-minute `#token=` fragment is stripped immediately by `web/preload.js` (`history.replaceState`) and exchanged via `POST /api/session` for an in-memory per-tab `Authorization: Bearer` token (up to 8 concurrent tabs). Frame images are fetched with the bearer header and rendered via revoked `blob:` URLs.
-- **Confined file serving:** `/api/frame` and `/api/file` serve only allowlisted paths verified against `<swarm_dir>` (plus up to 4 optional `OMP_SWARM_UI_ROOTS`).
+There is no authentication: anyone who can reach the loopback port or a Tailscale Serve proxy exposing it can read the board, transcripts, and allowlisted files under `<swarm_dir>` (plus up to 4 optional `OMP_SWARM_UI_ROOTS`); use tailnet-only `tailscale serve`, never `tailscale funnel` (marked `Tailscale-Funnel-Request` `GET` requests return `403`, while non-`GET` requests return `405` first). To block DNS rebinding and cross-site reads, the server accepts only `GET` requests with a `Host` of `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` (a bare loopback `Host` is accepted only when listening on `http` port `80` or forwarded `https` port `443`), or `*.ts.net` (optional `:<port>`) (`421` otherwise) and, when `Origin` is present, a matching origin using `http` for direct loopback and `https` for MagicDNS hosts or `X-Forwarded-Proto: https` (`403` otherwise), serves no CORS headers, and sets strict CSP (`frame-ancestors 'none'; connect-src 'self'`), `Cross-Origin-Resource-Policy: same-origin`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on `/api/*`.
 
-**Remote SSH / Tailscale access:**
-Because the server binds `127.0.0.1` and enforces `Host: 127.0.0.1:<port>`, forward the **same** port locally over SSH (or over a Tailscale SSH tunnel):
-
-```sh
-ssh -L <port>:127.0.0.1:<port> <host>
-```
-
-Pinning `OMP_SWARM_UI_PORT=43123` makes the local port-forward reusable across sessions. Then open the printed `http://127.0.0.1:<port>/#token=…` link in your local browser.
+**Remote access (Tailscale Serve or SSH):**
+- **Tailscale Serve** (tailnet-only — never `tailscale funnel`, whose marked `Tailscale-Funnel-Request` `GET` requests return `403` and non-`GET` requests `405`; requires HTTPS enabled in your tailnet; `*.ts.net` hosts are accepted):
+  ```sh
+  tailscale serve <port>
+  ```
+  Runs in the foreground (`Ctrl+C` stops serving) and proxies `http://127.0.0.1:<port>` on default HTTPS port `443` at `https://<machine>.<tailnet>.ts.net`. Add `--bg` to persist in the background (`tailscale serve --bg <port>`) and optional `--https=<https-port>` to serve on another HTTPS port; to stop only that background serve without resetting other Serve entries, run `tailscale serve --https=443 off` (or `tailscale serve --https=<https-port> off`).
+- **SSH port forwarding:**
+  ```sh
+  ssh -L <port>:127.0.0.1:<port> <host>
+  ```
+  Forward the **same** port locally (pinning `OMP_SWARM_UI_PORT=43123` makes the forward reusable across sessions), then open `http://127.0.0.1:<port>/` in your local browser.
 
 ---
 
@@ -206,17 +247,17 @@ All plugin tunables are read from `src/env.ts` at runtime startup:
 | Variable | Default | Range / Format | Behavior |
 |---|---|---|---|
 | `OMP_SWARM_DIR` | `<session artifacts>/swarm` (or private temp dir with `--no-session`) | Absolute/relative directory path | Overrides where `board.jsonl`, `members.json`, `metrics.json`, `plan.json`, `view.json`, `sessions/`, `workspaces/`, `shots/`, and `owner.lock` live |
-| `OMP_SWARM_UI` | unset (`off`) | `1` to enable | Auto-starts the loopback web board on swarm creation in `tui`/`rpc` sessions (never in headless `print`/`json`) |
-| `OMP_SWARM_UI_PORT` | `0` (ephemeral) | Integer `0..65535` | Default port on `127.0.0.1` for `/swarm-ui start` and `OMP_SWARM_UI=1` |
+| `OMP_SWARM_UI` | unset (`off`) | `1` to enable | Auto-starts the loopback web board when a new or restored swarm attaches in `tui`/`rpc` sessions (never in headless `print`/`json`) |
+| `OMP_SWARM_UI_PORT` | `0` (ephemeral) | Integer `0..65535` | Default port on `127.0.0.1` when `/swarm-ui start`, `/swarm-ui open`, or `OMP_SWARM_UI=1` starts the listener |
 | `OMP_SWARM_UI_ROOTS` | unset | Colon-separated absolute paths (up to 4) | Extra canonical root directories permitted for web `/api/frame` and `/api/file` reads in addition to `<swarm_dir>` |
 | `OMP_SWARM_MAX_WORKERS` | `24` | Integer `1..256` | Maximum concurrent non-killed members (excluding coordinator) |
-| `OMP_SWARM_WORKER_TOOLS` | `read,bash,edit,write,glob,grep,eval,todo,web_search,lsp,ast_grep,ast_edit` | Comma-separated tool names | Built-in tool allowlist for task workers (intersected with main session's active tools; hard-excluded tools are always stripped) |
+| `OMP_SWARM_WORKER_TOOLS` | `read,bash,edit,write,glob,grep,eval,task,todo,web_search,lsp,ast_grep,ast_edit` | Comma-separated tool names | Built-in tool allowlist for task workers (intersected with main session's active tools; hard-excluded tools are always stripped) |
 | `OMP_SWARM_GATE_MAX_REFUSALS` | `8` | Integer `1..1000` | Maximum headless stop-gate refusals without progress before declaring the run `incomplete` |
 | `OMP_SWARM_GATE_WAIT_SECONDS` | `20` | Integer `1..25` | Seconds one headless `session_stop` call may wait for live workers before refusing and prompting `swarm_wait` |
 | `OMP_SWARM_NO_PROGRESS_SECONDS` | `3600` | Integer `0..604800` (`0` disables) | Headless inactivity budget (seconds without worker progress while parked/gated) before declaring `incomplete` |
 | `OMP_SWARM_DEADLINE_SECONDS` | `0` (disabled) | Integer `0..604800` | Headless monotonic wall-clock deadline across the entire run before declaring `incomplete` |
 | `OMP_SWARM_SHARE_MAX_MB` | `200` | Integer `1..100000` | Maximum MB of untracked files copied into a `workspace: "share"` snapshot (file count cap: 20,000) |
-| `OMP_SWARM_MAX_COST_USD` | `0` (disabled) | Non-negative number | Soft USD spend ceiling across all members; once reached (or if token usage arrives without a usable price, failing closed with `spend.unknown`), no new members or wakes are admitted and headless runs become `incomplete` (in-flight requests may finish). A host cost-cap refusal records a `cost` failure with no automatic retry |
+| `OMP_SWARM_MAX_COST_USD` | `0` (disabled) | Non-negative number | Soft USD spend ceiling across all members (including native scouts, eval `completion()`/`judge()`, and Main's other journaled auxiliary calls). Once reached (or if token usage arrives without a usable price, failing closed with `spend.unknown`), no new members or wakes are admitted, worker chat and other gated inference (including native result wakes and eval inference) plus native spawn admission are blocked, and headless runs become `incomplete`; omp's automatic compaction summaries, in-flight requests, and Main's reporting turns can still add cost. Main's native delegation (`task` / eval `agent()`) stays blocked while that capped swarm is registered, including after `finish` and after reopen; to resume delegation, restart without `OMP_SWARM_MAX_COST_USD` or switch to a session without that swarm. Under a ceiling, worker-owned scouts run on the main thread (session-scoped `task.workerThreads=0`) so each scout request checks an up-to-date ledger (without a ceiling, thread placement follows omp's defaults); Main keeps the operator's thread settings, so while new Main scout launches are blocked, an already-running Main scout on a worker thread can issue another auxiliary request before its prior bill reaches the ledger. Unknown spend persists across reopen; disabling the ceiling lets work continue without erasing the unknown-spend marker, and a fresh swarm starts a fresh capped ledger. A host cost-cap refusal records a `cost` failure with no automatic retry |
 
 ---
 
@@ -261,6 +302,5 @@ OMP_SWARM_PAID=1 bun run test:paid
 
 - **omp `19.1.0` target:** pinned and tested against `@oh-my-pi/pi-coding-agent` `19.1.0`; loading under another host version logs a warning on stderr.
 - **Linux `/proc/self/fd` file containment:** `safeRead` (`src/ui/view-files.ts`) verifies opened regular-file descriptors via `/proc/self/fd/<fd>` after `O_NOFOLLOW` open so symlink swaps cannot escape `<swarm_dir>` or `OMP_SWARM_UI_ROOTS`. On non-Linux platforms this check fails closed (`unverifiable`), so `plan.json`, `view.json`, `view.html`, `/api/frame`, and `/api/file` reads are refused.
-- **Explicit revival after restart:** after a process restart, non-killed members attach in `stopped` state. Board posts never auto-revive unattended agents; the coordinator must invoke `swarm{action:"revive"}` (exec-tier) to restart them and replay owed posts.
-- **Headless native-async exclusion:** do not mix native omp background jobs or `task` subagents with a headless swarm run. The swarm stop-gate cannot coordinate with native async work and records `native_async_mix: true` in `metrics.json`.
+- **Explicit revival after restart:** after a process restart, non-killed members attach in `stopped` state and previous background jobs are not resumed. Board posts never auto-revive unattended agents; the coordinator must invoke `swarm{action:"revive"}` (exec-tier) to restart them and replay owed posts.
 - **Private package & vendored frontend:** `web/vendor/` holds verbatim copies of Antigravity's swarm board frontend (`NOTICE.md`). `test/unit/static.test.ts` enforces both SHA-256 integrity and `"private": true` in `package.json`.

@@ -218,7 +218,7 @@ export async function switchMember(
 		return { kind: "switched", entry: entry(resumed) };
 	}
 
-	if (target.phase !== "idle" && target.phase !== "parked")
+	if (target.phase !== "parked" && (target.phase !== "idle" || target.hostWorking))
 		return { kind: "error", error: `\`${target.name}\` is working; switch it when it is waiting` };
 	if (!rt.binding.hasAuth(model)) return { kind: "error", error: `no credentials are configured for ${targetKey}` };
 
@@ -238,6 +238,7 @@ export async function switchMember(
 			await session.waitForIdle();
 		}
 		if (!rt.opValid(target, op)) return { kind: "error", error: `the switch of ${target.name} was cancelled` };
+		if (session.isStreaming || (!prior && target.hostWorking)) throw new Error("the worker resumed while switching; try again when it is waiting");
 		target.expectedModel = targetKey;
 		target.expectedEffort = effort ?? "";
 		await session.setModelTemporary(model, effort);
@@ -245,12 +246,15 @@ export async function switchMember(
 	} catch (err) {
 		failure = err instanceof Error ? err.message : String(err);
 	} finally {
-		// Read back on every path: the host may have switched before a later step failed.
-		readBack(target);
-		if (target.op === op) target.op = undefined;
-		if (!target.killed && target.phase === "switching") target.phase = "idle";
-		rt.flushStructural();
-		rt.changed();
+		if (target.op === op) {
+			// Reconciliation can await while a native result starts a loop.
+			// Preserve the host's phase on both success and failure.
+			readBack(target);
+			target.op = undefined;
+			if (target.phase === "switching") target.phase = target.hostWorking ? "working" : "idle";
+			rt.flushStructural();
+			rt.changed();
+		}
 	}
 	if (!rt.opValid(target, op, true)) return { kind: "error", error: `the switch of ${target.name} was cancelled` };
 	const now = `${target.model} (${target.effort || "default"})`;
@@ -265,7 +269,7 @@ export async function switchMember(
 	if (prior || (target.failure && !failure)) resumed = resumeAfterChange(rt, target, text);
 	else {
 		reconcile(rt, target);
-		resumed = !!target.delivery;
+		resumed = target.hostWorking || !!target.delivery;
 	}
 	if (failure) return { kind: "error", error: `switch failed: ${failure}; ${target.name} is on ${now}` };
 	return { kind: "switched", entry: entry(resumed) };
@@ -282,10 +286,18 @@ export function startBoundarySwitch(rt: SwarmRuntime, m: Member): void {
 		reconcile(rt, m);
 		return;
 	}
+	const gen = m.gen;
 	void switchMember(rt, rt.coordinator, m, model, sw.effort).then(out => {
-		if (out.kind === "switched" && !m.delivery && !m.killed) {
+		if (rt.closing || m.gen !== gen || m.killed) return;
+		if (out.kind === "switched" && !m.delivery) {
 			m.reminders.resume = `Your model is now ${m.model} (${m.effort || "default"}); continue.`;
 			reconcile(rt, m);
+		} else if (out.kind === "error") {
+			if (m.hostWorking) m.pendingSwitch ??= sw;
+			else {
+				m.reminders.resume = out.error;
+				reconcile(rt, m);
+			}
 		}
 	});
 }

@@ -23,6 +23,7 @@ export function nudgeDue(rt: SwarmRuntime, m: Member): boolean {
 	const c = m.cycle;
 	return (
 		!rt.closing && m.role === "worker" && !!c && (c.cause === "brief" || c.direct) && !c.posted && !c.nudged
+		&& !m.awaiting && !m.session?.wakeSources
 	);
 }
 
@@ -44,6 +45,8 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 	m.stuckNotified = false;
 	switch (ev.type) {
 		case "agent_start":
+			m.awaiting = false;
+			m.postsAtLoopStart = m.stats.posts;
 			// A run's first loop records the cost-cap refusal it starts with (19.0.1 emits agent_start
 			// per model loop; later loops of the same run keep the first record).
 			if (m.runId === m.settledRun) m.costRefusalSeen = m.session?.costCapRefusal;
@@ -58,7 +61,6 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 			if (!msg) return;
 			if (msg.role === "assistant") {
 				m.tracker.onAssistant(msg);
-				rt.recordUsage(m, msg);
 				rt.changedActivity();
 				return;
 			}
@@ -88,7 +90,36 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 			m.stats.steps++;
 			rt.changedActivity();
 			return;
+		case "agent_pause":
+			if (!("awaiting" in ev) || !ev.awaiting || m.awaiting || m.session?.isStreaming) return;
+			m.awaiting = true;
+			m.nudgePending = false;
+			m.tracker.onRunEnd();
+			const stop = m.session?.getLastAssistantMessage()?.stopReason;
+			const refusal = m.session?.costCapRefusal;
+			if (stop !== "error" && stop !== "aborted" && (!refusal || refusal === m.costRefusalSeen)) {
+				m.failure = null;
+				m.retryToken = false;
+			}
+			if (m.delivery) release(rt, m, "the loop paused before the wake was received");
+			if (m.op?.kind !== "switch" && !m.waiter) {
+				m.phase = "idle";
+				m.wakeMode = roleDefaultMode(m.role);
+				m.waitSince = m.lastReadSeq;
+			}
+			rt.changed();
+			if (m.pendingSwitch && !m.op && m.phase === "idle") {
+				startBoundarySwitch(rt, m);
+				return;
+			}
+			reconcile(rt, m);
+			return;
 		case "agent_end":
+			if (m.session?.isStreaming) return;
+			if (m.awaiting) {
+				m.awaiting = false;
+				rt.changed();
+			}
 			settleRun(rt, m);
 			return;
 		case "auto_retry_start":

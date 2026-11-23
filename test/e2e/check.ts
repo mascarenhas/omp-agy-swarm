@@ -25,6 +25,9 @@ export interface Ctx {
 	runs: RunResult[];
 }
 
+/** On-disk evidence shared by deterministic and paid runs. */
+type SwarmFiles = Pick<Ctx, "swarm">;
+
 export class Checks {
 	readonly failures: string[] = [];
 	ok(cond: unknown, what: string): void {
@@ -47,12 +50,12 @@ export function readJson<T = Record<string, unknown>>(path: string): T | undefin
 
 export interface Metrics {
 	outcome: { value: string; reason: string } | null;
-	members: Record<string, { model: string; effort: string; state: string; failures: number; nudges: number; killed: boolean }>;
-	spend: { tokens: number; cost: number };
-	coordinator?: { gate_refusals?: number; stall_wakes?: number };
+	members: Record<string, { model: string; effort: string; state: string; failures: number; nudges: number; wakes: number; killed: boolean; tokens: number; cost: number }>;
+	spend: { tokens: number; cost: number; ceiling?: number | null; unknown?: string };
+	coordinator?: { gate_refusals?: number; stall_wakes?: number; tokens?: number; cost?: number };
 }
 
-export function metrics(c: Ctx): Metrics | undefined {
+export function metrics(c: SwarmFiles): Metrics | undefined {
 	return readJson<Metrics>(join(c.swarm, "metrics.json"));
 }
 
@@ -61,14 +64,19 @@ export interface RosterMember {
 	model: string;
 	effort: string;
 	conversation_id: string;
+	agent_id?: string;
+	gen?: number;
 	session_file: string | null;
 	killed: boolean;
+	killed_at?: string | null;
+	killed_seq?: number;
+	last_park?: { until: number | null } | null;
 	failure?: { kind: string } | null;
 	last_read_seq: number;
 	workspace: { mode: string; path: string; root?: string; branch?: string; state?: string; retained_reason?: string };
 }
 
-export function roster(c: Ctx): Record<string, RosterMember> {
+export function roster(c: SwarmFiles): Record<string, RosterMember> {
 	return readJson<{ members: Record<string, RosterMember> }>(join(c.swarm, "members.json"))?.members ?? {};
 }
 
@@ -76,11 +84,13 @@ export interface BoardLine {
 	seq: number;
 	agent: string;
 	text: string;
+	ts?: number;
+	finish?: { abandon: boolean; abandoned: { name: string; was: string }[] };
 	channel?: string;
 	control?: unknown;
 }
 
-export function board(c: Ctx): BoardLine[] {
+export function board(c: SwarmFiles): BoardLine[] {
 	const p = join(c.swarm, "board.jsonl");
 	if (!existsSync(p)) return [];
 	return readFileSync(p, "utf8")

@@ -10,7 +10,7 @@ const C1_CSI = /\u009b[0-?]*[ -/]*[@-~]/g;
 const CONTROLS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const BIDI = /[\u202a-\u202e\u2066-\u2069\u200e\u200f\u061c]/g;
 
-/** Removes control sequences and characters; tabs become spaces. Newlines are kept. */
+/** Removes control sequences, control characters, and lone surrogates. Tabs become spaces; newlines stay. */
 export function sanitize(text: unknown): string {
 	return String(text ?? "")
 		.replace(ESC_SEQ, "")
@@ -18,7 +18,8 @@ export function sanitize(text: unknown): string {
 		.replace(/\r\n?/g, "\n")
 		.replace(/\t/g, "  ")
 		.replace(CONTROLS, "")
-		.replace(BIDI, "");
+		.replace(BIDI, "")
+		.replace(/\p{Surrogate}/gu, "");
 }
 
 /** sanitize() and fold to one line. */

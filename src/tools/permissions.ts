@@ -13,6 +13,7 @@ export type Operation =
 	| "kill"
 	| "revive"
 	| "model"
+	| "scout"
 	| "finish"
 	| "title"
 	| "channel_create"
@@ -69,6 +70,8 @@ export function permitted(op: Operation, actor: Actor, target?: Target): string 
 			if (coordinator) return null;
 			if (target.role === "coordinator") return deny("only the coordinator changes its own model");
 			return self || ownHelper ? null : deny(`${actor.name} can change only its own model or a helper's, not ${target.name}'s`);
+		case "scout":
+			return coordinator ? null : deny("only the coordinator can configure scouts");
 		case "finish":
 		case "title":
 		case "channel_create":
