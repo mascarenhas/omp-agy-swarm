@@ -50,17 +50,34 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		await until(() => h.member("ui").phase === "parked", 2000, "parked");
 		board = new WebBoard(new RuntimeReadModel(h.rt), { webDir: join(REPO, "web"), swarmDir: h.dir, extraRoots: [] });
 		url = `http://127.0.0.1:${board.start()}/`;
-		browser = await chromium.launch({ executablePath: CHROME, headless: true });
-		page = await browser.newPage();
-		await page.goto(url);
-		await page.waitForSelector("#board:not(.hidden)", { timeout: 15_000 });
-	});
+		try {
+			browser = await chromium.launch({
+				executablePath: CHROME,
+				headless: true,
+				chromiumSandbox: process.env.CHROME_CI_SANDBOX === "1",
+				timeout: 30_000,
+			});
+		} catch (error) {
+			// Playwright's launch error includes the command and browser stderr.
+			throw new Error(`Headless Chrome failed to launch (${CHROME}): ${error}`, { cause: error });
+		}
+		try {
+			page = await browser.newPage();
+			await page.goto(url, { timeout: 15_000 });
+			await page.waitForSelector("#board:not(.hidden)", { timeout: 15_000 });
+		} catch (error) {
+			throw new Error(`Chrome launched but the web board did not become ready (${url}): ${error}`, { cause: error });
+		}
+	}, 75_000);
 
 	afterAll(async () => {
-		await browser?.close();
-		board?.stop();
-		await h?.close();
-	});
+		try {
+			await browser?.close();
+		} finally {
+			board?.stop();
+			await h?.close();
+		}
+	}, 30_000);
 
 	test("all five tabs render from the runtime", async () => {
 		for (const tab of ["overview", "feed", "members", "graph", "raw"]) {

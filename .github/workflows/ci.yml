@@ -97,10 +97,39 @@ jobs:
           [[ "$actual" == "omp/$version" ]]
           printf 'OMP_BIN=%s/omp\n' "$bin" >> "$GITHUB_ENV"
 
+      - name: Check sandboxed headless Chrome
+        run: |
+          probe_chrome() {
+            local profile
+            profile=$(mktemp -d "$RUNNER_TEMP/swarm-chrome.XXXXXX")
+            timeout --kill-after=5s 30s "$CHROME_PATH" --headless=new --no-first-run \
+              --no-default-browser-check --disable-background-networking \
+              --user-data-dir="$profile" --dump-dom about:blank > "$profile/dom" 2> "$log" &&
+              grep -Fq '<body></body>' "$profile/dom"
+          }
+          log="$RUNNER_TEMP/swarm-chrome-launch.log"
+          if ! probe_chrome; then
+            cat "$log" >&2
+            # Ubuntu normally allows the packaged Chrome binary to use userns.
+            # Relax the restriction only on this disposable runner if it blocks launch:
+            # https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md
+            if grep -Eiq 'No usable sandbox|Failed to move to new namespace|namespace.*Operation not permitted' "$log" &&
+              [[ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null)" == 1 ]]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+              probe_chrome || { cat "$log" >&2; exit 1; }
+            else
+              echo '::error::Sandboxed headless Chrome did not render about:blank'
+              exit 1
+            fi
+          fi
+
       - name: Typecheck
         run: bun run typecheck
 
       - name: Unit and integration tests
+        env:
+          CHROME_CI_SANDBOX: '1'
+          DEBUG: 'pw:browser'
         run: bun test test/unit test/integration
 
       - name: PTY tests
