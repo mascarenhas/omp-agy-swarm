@@ -13,7 +13,7 @@ const OMIT_UNUSED = " Omit unused optional arguments; use null if your tool-call
 export const DESCRIPTIONS = {
 	swarm:
 		"Manage the swarm: parallel worker agents sharing one message board. Actions: status | models | add | model | scout | kill | revive | finish | title | channel. add{name, brief, model?, effort?, tasks?|n?, fork?, workspace?, channels?, role?} starts a worker and posts its brief as `@name brief`; without model/effort it runs on yours. model{name?, model?, effort?} changes a waiting member's (or your own) model or effort; it keeps its conversation. scout{model?, effort?} configures scouts for newly added or revived workers. Effort alone retains native model selection; neither argument resets to native policy. kill{name} is permanent. workspace: inherit = your working copy; share = its own git worktree starting from your working copy as it stands (uncommitted changes included, ignored files not); branch = its own worktree from your last commit. models{query?, provider?} lists runnable models with their effort levels. Coordinators: read skill://swarm before the first add." +
-		' Omit unused parameters; use "" for unused enum fields, [] for arrays, or null for other optional fields.',
+		' Omit unused parameters; use "omit" for unused enum fields, [] for arrays, or null for other optional fields.',
 	post_message:
 		"Post to the swarm's message board. Start with the @name of whoever must act on it (@all for everyone, @#channel for a channel's members); a mention wakes that member. Refer to earlier posts as #seq." +
 		OMIT_UNUSED,
@@ -46,7 +46,7 @@ export function buildSchemas(z: Zod): Schemas {
 	const count = (schema: ZodLikeSchema<number>) =>
 		schema.nullable().transform(value => value === 0 ? undefined : value ?? undefined).optional();
 	const choice = (values: readonly [string, ...string[]]) =>
-		z.enum(["", ...values]).transform(value => value === "" ? undefined : value).optional();
+		z.enum(["omit", ...values]).transform(value => value === "omit" ? undefined : value).optional();
 	return {
 		swarm: z.object({
 			action: z
@@ -55,19 +55,19 @@ export function buildSchemas(z: Zod): Schemas {
 			name: text.describe("add: worker name or group prefix; model/kill/revive: member or group prefix; channel (un)subscribe: member"),
 			brief: text.describe("add: what the worker owns (≤ 6000 characters); optional for role narrator|monitor"),
 			model: text.describe('add, model, scout: "provider/id" | bare id | "@role", optional ":effort" suffix'),
-			effort: choice(EFFORTS).describe('"" uses the model suffix or, for add/model, inherited/current effort; "off" explicitly disables reasoning'),
+			effort: choice(EFFORTS).describe('When omitted, use the model suffix or, for add/model, inherited/current effort; "off" explicitly disables reasoning'),
 			tasks: array.describe("add: 1..16 slices, each ≤ 1500 characters → <name>-1..<name>-k; [] omits"),
 			n: count(integer).describe("add: 2..16 homogeneous copies (not with tasks); 0 or null omits"),
 			fork: text.describe('add: member name or "coordinator" whose conversation the worker starts from'),
-			workspace: choice(["inherit", "share", "branch"]).describe('add: where the worker works ("" defaults to inherit)'),
+			workspace: choice(["inherit", "share", "branch"]).describe("add: where the worker works (defaults to inherit)"),
 			channels: array.describe('add: initial subscriptions; first is the brief channel; [] omits; ["main"] selects only main'),
-			role: choice(["worker", "narrator", "monitor"]).describe('add: "" defaults to worker'),
+			role: choice(["worker", "narrator", "monitor"]).describe("add: defaults to worker"),
 			discard_ignored: bool.describe("kill: also remove ignored files in the worktree"),
 			keep_workspace: bool.describe("kill: keep the worktree"),
 			summary: text.describe("finish: the [done] summary (no @mentions)"),
 			abandon: bool.describe("finish: cancel what is still running and record it"),
 			title: text.describe("title: ≤ 80 characters"),
-			op: choice(["create", "list", "subscribe", "unsubscribe", "archive"]).describe('channel: operation; use "" for other actions'),
+			op: choice(["create", "list", "subscribe", "unsubscribe", "archive"]).describe("channel: operation; omit for other actions"),
 			channel: text.describe("channel: channel name"),
 			topic: text.describe("channel create: topic"),
 			query: text.describe("models: terms that must all match provider/id or name"),

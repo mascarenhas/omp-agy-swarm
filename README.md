@@ -68,6 +68,8 @@ In headless runs (`print` and `json` modes):
 
 ### `swarm` actions
 
+Omit unused `effort`, `workspace`, `role`, and `op` fields. If a caller must send every field, use `"omit"` for these enums; it has the same effect as leaving the field out. Gemini rejects tool declarations that offer `""` as an enum value.
+
 | Action | Key parameters | Purpose | Approval tier | Who can call |
 |---|---|---|---|---|
 | `status` | — | Swarm state, mode, `swarm_dir`, `open_board`, `completion`, `outcome`, swarm-level `spend` (`{ tokens, cost, ceiling, unknown? }`), `scout` override, `attention`, and per-member `agent_id`/status/cursors/owed/spend | `read` | Coordinator, workers |

@@ -22,15 +22,16 @@ export function callLine(tool: string, args: Record<string, unknown>): string {
 	switch (tool) {
 		case "swarm": {
 			const a = String(args.action ?? "");
+			const effort = args.effort === "omit" ? undefined : args.effort;
 			if (a === "add") {
-				const bits = [shortModel(args.model), args.effort, args.workspace && args.workspace !== "inherit" ? args.workspace : ""]
+				const bits = [shortModel(args.model), effort, args.workspace !== "inherit" && args.workspace !== "omit" && args.workspace]
 					.filter(Boolean)
 					.join(" · ");
-				const who = args.role && args.role !== "worker" ? String(args.role) : name;
+				const who = args.role && args.role !== "worker" && args.role !== "omit" ? String(args.role) : name;
 				return `swarm add ${who}${bits ? ` (${bits})` : ""}`;
 			}
-			if (a === "model") return `swarm model ${name || "self"} → ${shortModel(args.model) || ""}${args.effort ? ` · ${args.effort}` : ""}`;
-			if (a === "channel") return `swarm channel ${args.op ?? ""} ${channel ? `#${channel}` : ""}`;
+			if (a === "model") return `swarm model ${name || "self"} → ${shortModel(args.model) || ""}${effort ? ` · ${effort}` : ""}`;
+			if (a === "channel") return `swarm channel ${args.op === "omit" ? "" : args.op ?? ""} ${channel ? `#${channel}` : ""}`;
 			return `swarm ${a}${name ? ` ${name}` : ""}`;
 		}
 		case "post_message": {

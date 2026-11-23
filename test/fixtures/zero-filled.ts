@@ -1,4 +1,4 @@
-// The reported Codex call, before the schema offered an empty effort/operation.
+// The reported Codex call, before the schema offered an omission choice.
 export const legacyAdd = {
 	action: "add",
 	name: "probe",
@@ -25,6 +25,6 @@ export const legacyAdd = {
 };
 
 // Keep the original field set and padding, with the new schema's omission choices.
-export const paddedAdd = { ...legacyAdd, effort: "", op: "" };
+export const paddedAdd = { ...legacyAdd, effort: "omit", op: "omit" };
 export const paddedRead = { since: null, limit: 0, channel: "", status: false };
 export const paddedWait = { since: null, mentions_only: null, timeout_seconds: 0 };

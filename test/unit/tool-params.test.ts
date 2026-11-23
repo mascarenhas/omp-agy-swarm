@@ -29,8 +29,8 @@ const swarmEmpty = {
 	name: "\t ",
 	brief: "",
 	model: "",
-	workspace: "",
-	role: "",
+	workspace: "omit",
+	role: "omit",
 	discard_ignored: null,
 	keep_workspace: null,
 	abandon: null,
@@ -39,8 +39,8 @@ const swarmEmpty = {
 const cases: [string, Tool, Record<string, unknown>, Record<string, unknown>][] = [
 	["status", "swarm", { ...swarmEmpty, action: "status" }, { action: "status" }],
 	["models", "swarm", { ...swarmEmpty, action: "models" }, { action: "models" }],
-	["model", "swarm", { ...swarmEmpty, action: "model", effort: " \t", model: "mock/coord" }, { action: "model", model: "mock/coord" }],
-	["scout set", "swarm", { ...swarmEmpty, action: "scout", effort: " \t", model: "mock/worker-b:low" }, { action: "scout", model: "mock/worker-b:low" }],
+	["model", "swarm", { ...swarmEmpty, action: "model", effort: " omit\t", model: "mock/coord" }, { action: "model", model: "mock/coord" }],
+	["scout set", "swarm", { ...swarmEmpty, action: "scout", effort: " omit\t", model: "mock/worker-b:low" }, { action: "scout", model: "mock/worker-b:low" }],
 	["scout reset", "swarm", { ...swarmEmpty, action: "scout" }, { action: "scout" }],
 	["kill", "swarm", { ...swarmEmpty, action: "kill", name: "probe" }, { action: "kill", name: "probe" }],
 	["revive", "swarm", { ...swarmEmpty, action: "revive" }, { action: "revive" }],
@@ -91,14 +91,14 @@ test("false, zero cursor, and nonempty values are still explicit choices", () =>
 	expect(() => validate("swarm", { action: "add", effort: "bogus" })).toThrow();
 });
 
-test("Codex advertises the empty enum choice first and strict mode adds null", () => {
+test("Codex can pad optional enums without selecting an operation or effort", () => {
 	const tool = { name: "swarm", description: "", parameters: schemas.swarm };
 	const model = {} as Parameters<typeof convertOpenAICodexResponsesTools>[1];
 	const [normal] = convertOpenAICodexResponsesTools([tool], model);
 	if (normal?.type !== "function") throw new Error("swarm is not a Codex function tool");
 	expect(normal.parameters.required).toEqual(["action"]);
 	const properties = normal.parameters.properties as Record<string, { enum?: string[] }>;
-	for (const name of ["effort", "workspace", "role", "op"]) expect(properties[name]?.enum?.[0]).toBe("");
+	for (const name of ["effort", "workspace", "role", "op"]) expect(properties[name]?.enum?.[0]).toBe("omit");
 	expect(properties.effort?.enum).toContain("off");
 	// Exercise explicit strictification without depending on the host's PI_NO_STRICT setting.
 	const strict = adaptSchemaForStrict(normal.parameters, true);
@@ -113,10 +113,10 @@ test("Codex advertises the empty enum choice first and strict mode adds null", (
 
 const enums = {
 	action: ["status", "models", "add", "model", "scout", "kill", "revive", "finish", "title", "channel"],
-	effort: ["", ...EFFORTS],
-	workspace: ["", "inherit", "share", "branch"],
-	role: ["", "worker", "narrator", "monitor"],
-	op: ["", "create", "list", "subscribe", "unsubscribe", "archive"],
+	effort: ["omit", ...EFFORTS],
+	workspace: ["omit", "inherit", "share", "branch"],
+	role: ["omit", "worker", "narrator", "monitor"],
+	op: ["omit", "create", "list", "subscribe", "unsubscribe", "archive"],
 };
 
 const fields: Record<Tool, Record<string, string>> = {
@@ -164,6 +164,7 @@ test("main and member schemas survive Claude CCA, Cursor and Antigravity CLI con
 					for (const [key, type] of Object.entries(fields[name])) {
 						const prop = schema.properties[key];
 						expect(Array.isArray(prop?.type) ? prop.type.filter(t => t !== "null") : [prop?.type]).toEqual([type]);
+						expect(prop?.enum ?? []).not.toContain(""); // Gemini rejects empty enum members before generation.
 						if (name === "swarm" && Object.hasOwn(enums, key)) expect(prop?.enum).toEqual(enums[key as keyof typeof enums]);
 					}
 				}
@@ -193,5 +194,6 @@ test("renderers omit raw null or blank placeholders but show an explicit zero cu
 	expect(callLine("read_board", { since: 0 })).toBe("read_board after #0");
 	expect(callLine("post_message", { text: "hello", channel: " " })).toBe("post");
 	expect(callLine("swarm", { action: "model", name: "" })).toBe(callLine("swarm", { action: "model" }));
+	expect(callLine("swarm", { action: "add", name: "probe", effort: "omit", role: "omit", workspace: "omit" })).toBe("swarm add probe");
 	expect(callLine("swarm_wait", { timeout_seconds: 0 })).toBe("swarm_wait");
 });
