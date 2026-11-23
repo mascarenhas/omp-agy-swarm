@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Deterministic tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUN_VERSION: '1.4.4'
+      OMP_SKIP_SETUP: '1'
+      OMP_SWARM_PAID: '0'
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Cache Bun packages
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/bun-install-cache
+          key: bun-packages-${{ runner.os }}-${{ runner.arch }}-${{ env.BUN_VERSION }}-${{ hashFiles('bun.lock') }}
+
+      - name: Install locked dependencies
+        env:
+          BUN_INSTALL_CACHE_DIR: ${{ runner.temp }}/bun-install-cache
+        run: bun install --frozen-lockfile
+
+      - name: Prepare isolated test environment
+        run: |
+          home=$(mktemp -d "$RUNNER_TEMP/swarm-home.XXXXXX")
+          git config --file "$home/.gitconfig" user.name "Swarm CI"
+          git config --file "$home/.gitconfig" user.email "swarm-ci@example.invalid"
+          {
+            printf 'HOME=%s\n' "$home"
+            printf 'XDG_CONFIG_HOME=%s/config\n' "$home"
+            printf 'XDG_DATA_HOME=%s/data\n' "$home"
+            printf 'XDG_STATE_HOME=%s/state\n' "$home"
+            printf 'XDG_CACHE_HOME=%s/cache\n' "$home"
+          } >> "$GITHUB_ENV"
+
+          # Require the image's Chrome so the browser tests cannot silently skip.
+          chrome=$(command -v google-chrome) || { echo '::error::Google Chrome is missing from the runner image'; exit 1; }
+          test -x "$chrome"
+          "$chrome" --version
+          printf 'CHROME_PATH=%s\n' "$chrome" >> "$GITHUB_ENV"
+          test -x /usr/bin/python3
+          test -x /usr/bin/sleep
+          test -r /proc/self/stat
+          test -c /dev/ptmx
+
+      - name: Install the matching compiled omp release
+        run: |
+          # bump-omp keeps the peer dependency and SUPPORTED_HOST in lockstep.
+          version=$(bun -e '
+            import pkg from "./package.json";
+            import { SEMVER_RE } from "./scripts/bump-omp.ts";
+            import { SUPPORTED_HOST } from "./src/env.ts";
+            const version = pkg.peerDependencies["@oh-my-pi/pi-coding-agent"];
+            if (!SEMVER_RE.test(version) || !SUPPORTED_HOST.includes(version)) {
+              throw new Error(`Expected an exact supported omp version, got ${version}`);
+            }
+            console.log(version);
+          ')
+          release="https://github.com/can1357/oh-my-pi/releases/download/v$version"
+          bin=$(mktemp -d "$RUNNER_TEMP/swarm-omp.XXXXXX")
+          asset=omp-linux-x64
+          curl --fail --silent --show-error --location --retry 3 -o "$bin/$asset" "$release/$asset"
+          curl --fail --silent --show-error --location --retry 3 -o "$bin/SHA256SUMS.txt" "$release/SHA256SUMS.txt"
+          (
+            cd "$bin"
+            awk -v asset="$asset" '$2 == asset' SHA256SUMS.txt | sha256sum --check --strict
+          )
+          mv "$bin/$asset" "$bin/omp"
+          chmod +x "$bin/omp"
+          actual=$("$bin/omp" --version)
+          echo "$actual ($bin/omp)"
+          [[ "$actual" == "omp/$version" ]]
+          printf 'OMP_BIN=%s/omp\n' "$bin" >> "$GITHUB_ENV"
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit and integration tests
+        run: bun test test/unit test/integration
+
+      - name: PTY tests
+        run: bun test test/pty
+
+      - name: Deterministic end-to-end tests
+        run: bun run test:e2e
+
+      - name: Paid-harness self-tests (loopback only)
+        run: bun test test/e2e/paid-loopback.test.ts
