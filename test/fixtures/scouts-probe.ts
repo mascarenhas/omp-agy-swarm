@@ -8,16 +8,25 @@ import { SessionObserverRegistry, TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT
 import { progressMetrics } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 import { z } from "@oh-my-pi/omptype/zod";
 
+const spendDetails = z.object({ spend: z.object({ cost: z.number(), tokens: z.number(), unknown: z.string().optional() }) });
+
 export default function scoutProbe(pi: ExtensionAPI): void {
 	const registry = AgentRegistry.global();
 	const observer = new SessionObserverRegistry();
 	observer.subscribeToEventBus(pi.events, pi.events);
+	// Wide batches must wait for actual registry/stream readiness, including a
+	// worker thread boot. Leave time for that even on a busy single CPU.
+	const fanoutWaitMs = 35_000;
 	const log = (stage: string, fields: Record<string, unknown> = {}): void => {
 		appendFileSync(process.env.SWARM_SCOUT_LOG!, `${JSON.stringify({ stage, ...fields })}\n`);
 	};
 	const childIds = new Set<string>();
 	const mainScouts = new Set<string>();
 	let chainResult = "";
+	const threadJobs = new Map<string, Set<string>>();
+	const consumedThreads = new Set<string>();
+	const consumed = Promise.withResolvers<void>();
+	let stopWatchingResults: (() => void) | undefined;
 	let lastWorker: AgentSession | undefined;
 	const offStart = pi.events.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, value => {
 		const frame = value as SubagentLifecyclePayload;
@@ -56,32 +65,45 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 		pi.events.emit(TASK_SUBAGENT_EVENT_CHANNEL, { id, event });
 	});
 	pi.on("session_shutdown", (_event, ctx) => {
+		stopWatchingResults?.();
 		offStart(); offRegistry(); offRaw(); observer.dispose();
 		if (ctx.agent.kind !== "main") return;
-		const entries = ctx.sessionManager.getEntries();
-		const first = entries.findIndex(e => e.type === "message" && e.message.role === "assistant");
-		const mainUsage = entries.slice(first + 1).flatMap(e => {
-			if (e.type === "model_usage") return [{ purpose: e.purpose, usage: e.usage }];
-			if (e.type === "message" && e.message.role === "assistant") return [{ purpose: "assistant", usage: e.message.usage }];
-			return [];
-		});
-		log("main-bill", { direct: mainUsage.map(e => ({ purpose: e.purpose, price: e.usage.cost.total, tokens: e.usage.totalTokens })) });
 		if (lastWorker) log("shutdown", { refs: [...childIds].filter(id => registry.get(id)), disposed: lastWorker.isDisposed });
 	});
+	pi.on("message_end", (event, ctx) => {
+		const message = event.message;
+		if (ctx.agent.kind === "main" && message.role === "custom" && message.customType === "session-stop-continuation"
+			&& typeof message.content === "string" && message.content.includes("The swarm still has outstanding work: worker is waiting on background work."))
+			log("remote-stop-blocked");
+	});
+	pi.on("session_stop", (_event, ctx) => {
+		if (ctx.agent.kind === "main" && threadJobs.has(MAIN_AGENT_ID))
+			log("remote-main-receipts", { received: consumedThreads.size });
+	});
 	pi.on("tool_execution_end", (event, ctx) => {
-		if (ctx.agent.kind === "main" && event.toolName === "swarm" && JSON.stringify(event.result)?.includes("mock-remote/worker-b"))
-			log("remote-status");
+		if (ctx.agent.kind !== "main" || event.toolName !== "swarm") return;
+		const result = event.result;
+		if (!result || typeof result !== "object" || !("details" in result)) return;
+		const parsed = spendDetails.safeParse(result.details);
+		if (parsed.success && parsed.data.spend.unknown?.includes("mock-remote/worker-b")) log("remote-status", parsed.data.spend);
 	});
 
 	async function injectRemoteUsage(parentId: string): Promise<void> {
 		const count = parentId === MAIN_AGENT_ID ? 10 : 9;
-		const deadline = Date.now() + 10_000;
+		const deadline = Date.now() + fanoutWaitMs;
 		for (;;) {
 			const refs = registry.list().filter(ref => ref.parentId === parentId && ref.session);
 			const remote = refs.find(ref => isRemoteScoutSession(ref.session) && ref.session.isStreaming
 				&& observer.getSession(ref.id)?.status === "active");
 			const session = remote?.session;
 			if (refs.length === count && remote && isRemoteScoutSession(session)) {
+				const parent = registry.get(parentId)?.session;
+				const main = registry.get(MAIN_AGENT_ID)?.session;
+				if (!(parent instanceof AgentSession) || !(main instanceof AgentSession)) throw new Error(`remote fanout parent ${parentId} missing`);
+				const status = main.getToolByName("swarm");
+				if (!status) throw new Error("swarm status is unavailable");
+				const before = await status.execute("remote-bill-baseline", { action: "status" });
+				const beforeDirect = parent.sessionManager.getUsageStatistics();
 				const manager = session.sessionManager;
 				const owner = { sessionId: manager.getSessionId(), parentId: null };
 				const usage = { input: 5, output: 2, totalTokens: 7, cacheRead: 0, cacheWrite: 0 };
@@ -91,12 +113,28 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 						stopReason: "stop" }, owner);
 					await manager.flush();
 				}
+				const ids = new Set(refs.map(ref => ref.id));
+				threadJobs.set(parentId, ids);
+				stopWatchingResults = parent.subscribe(event => {
+					if (event.type !== "message_end" || event.message.role !== "custom" || event.message.customType !== "async-result") return;
+					const content = JSON.stringify(event.message.content);
+					for (const id of ids) if (content.includes(`<task-result id=\\"${id}\\"`)) consumedThreads.add(id);
+					if (consumedThreads.size === ids.size) consumed.resolve();
+				});
 				const entries = manager.getEntries();
 				const matched = entries.filter(entry => entry.type === "model_usage" && entry.purpose.startsWith("probe-"));
 				// Mirror rewrites may carry already seen entries again.
 				session.applyEntries({ kind: "replace", entries });
+				// Compare live deltas while the scouts are still held; Main's
+				// setup and teardown requests are outside the billing window.
+				const after = await status.execute("remote-bill-check", { action: "status" });
+				const first = spendDetails.parse(before.details).spend;
+				const last = spendDetails.parse(after.details).spend;
+				const afterDirect = parent.sessionManager.getUsageStatistics();
+				const chargedCost = last.cost - first.cost - (afterDirect.cost - beforeDirect.cost);
+				const chargedTokens = last.tokens - first.tokens - (afterDirect.totalTokens - beforeDirect.totalTokens);
 				log("remote-billed", { parentId, id: remote.id, home: session.home, populated: matched.length,
-					local: refs.filter(ref => ref.session instanceof AgentSession).length, live: session.isStreaming });
+					local: refs.filter(ref => ref.session instanceof AgentSession).length, live: session.isStreaming, chargedCost, chargedTokens });
 				return;
 			}
 			if (Date.now() >= deadline) throw new Error(`remote scout absent from ${refs.length} child refs for ${parentId}`);
@@ -107,7 +145,7 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "scouts_probe", label: "Scouts probe", description: "Observe real native scout state and accounting in the compiled host.",
 		parameters: z.object({ action: z.enum(["held", "one", "settled", "settings", "inject", "retired", "park", "burn", "denied", "user-stop",
-			"revive-child", "cold-child", "remote-worker", "remote-main", "chain-placement", "chain-result"]) }),
+			"revive-child", "cold-child", "remote-worker", "remote-main", "remote-drain", "chain-placement", "chain-result", "main-bill-start"]) }),
 		async execute(_id, { action }, signal) {
 			const worker = registry.get("swarm~worker");
 			const raw = worker?.session;
@@ -115,12 +153,54 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 				log("retired", { remainingRefs: [...childIds].filter(id => registry.get(id)) });
 			} else if (action === "user-stop") {
 				process.kill(process.pid, "SIGTERM");
+			} else if (action === "main-bill-start") {
+				const main = registry.get(MAIN_AGENT_ID)?.session;
+				if (!(main instanceof AgentSession)) throw new Error("Main not attached");
+				await main.settleInFlightMessagePersistence();
+				const status = main.getToolByName("swarm");
+				if (!status) throw new Error("swarm status unavailable");
+				const result = await status.execute("scoped-billing-baseline", { action: "status" });
+				const spend = spendDetails.parse(result.details).spend;
+				const stats = main.sessionManager.getUsageStatistics();
+				log("main-untracked", { cost: stats.cost - spend.cost, tokens: stats.totalTokens - spend.tokens });
 			} else if (action === "remote-worker" || action === "remote-main") {
 				await injectRemoteUsage(action === "remote-main" ? MAIN_AGENT_ID : "swarm~worker");
+			} else if (action === "remote-drain") {
+				const parentId = threadJobs.has(MAIN_AGENT_ID) ? MAIN_AGENT_ID : "swarm~worker";
+				const parent = registry.get(parentId)?.session;
+				const ids = threadJobs.get(parentId);
+				if (!(parent instanceof AgentSession) || !ids) throw new Error(`remote fanout parent ${parentId} missing`);
+				const jobs = parent.asyncJobManager?.getAllJobs({ ownerId: parentId }).filter(job => job.type === "task" && job.agentId && ids.has(job.agentId)) ?? [];
+				if (jobs.length !== ids.size) throw new Error(`expected ${ids.size} scout jobs for ${parentId}, found ${jobs.length}`);
+				// Release after job completion, and after delivery for the worker.
+				// Main cannot consume queued results while this tool is running.
+				const lifecycle = AgentLifecycleManager.global();
+				const ready = Promise.withResolvers<void>();
+				const timer = setTimeout(() => ready.reject(new Error(`${parentId} scout jobs did not drain`)), fanoutWaitMs);
+				try {
+					await Promise.race([ready.promise, (async () => {
+						await Promise.all(jobs.map(job => job.promise));
+						if (parentId !== MAIN_AGENT_ID) {
+							await consumed.promise;
+							await parent.waitForIdle();
+						}
+						await Promise.all([...ids].map(async id => {
+							const ref = registry.get(id);
+							if (ref) await lifecycle.release(id, ref);
+						}));
+					})()]);
+				} finally {
+					clearTimeout(timer);
+				}
+				log("remote-drained", {
+					parentId, received: consumedThreads.size,
+					completed: jobs.filter(job => job.status === "completed").length,
+					remaining: [...ids].filter(id => registry.get(id)),
+				});
 			} else if (action === "chain-placement") {
 				const main = registry.get(MAIN_AGENT_ID)?.session;
 				if (!(main instanceof AgentSession) || !(raw instanceof AgentSession)) throw new Error("test parents not attached");
-				const deadline = Date.now() + 8_000;
+				const deadline = Date.now() + fanoutWaitMs;
 				for (;;) {
 					const live = registry.list().filter(ref => ref.parentId === worker?.id && ref.session?.isStreaming
 						&& observer.getSession(ref.id)?.status === "active");
@@ -134,7 +214,7 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 					await Bun.sleep(10);
 				}
 			} else if (action === "chain-result") {
-				const deadline = Date.now() + 8_000;
+				const deadline = Date.now() + fanoutWaitMs;
 				while (!chainResult) {
 					if (Date.now() >= deadline) throw new Error("scout eval did not finish its chain");
 					await Bun.sleep(10);
@@ -179,6 +259,7 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 				await AgentLifecycleManager.global().park(worker.id);
 				log("park", { disposed: raw.isDisposed, missing: !registry.get(worker.id) });
 			} else if (action === "revive-child") {
+				if (!(raw instanceof AgentSession)) throw new Error("test worker not attached");
 				const id = "swarm~worker.Warm";
 				const ref = registry.get(id);
 				const original = ref?.session;
@@ -189,8 +270,24 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 				const parked = original.isDisposed && ref?.status === "parked" && ref.session === null;
 				const revived = await lifecycle.ensureLive(id);
 				if (!(revived instanceof AgentSession)) throw new Error("native scout missing after operator revive");
-				await revived.prompt("SCOUT-WARM-SECOND");
-				await revived.waitForIdle();
+				// Focused scout turns can deliver a native result back to the
+				// worker after the scout itself has stopped streaming.
+				const result = Promise.withResolvers<void>();
+				const timer = setTimeout(() => result.reject(new Error("revived scout result did not reach worker")), 8_000);
+				const off = raw.subscribe(event => {
+					if (event.type === "message_end" && event.message.role === "custom" && event.message.customType === "async-result"
+						&& JSON.stringify(event.message.content).includes("WARM-SCOUT-REVIVED")) result.resolve();
+				});
+				try {
+					await Promise.all([
+						revived.prompt("SCOUT-WARM-SECOND").then(() => revived.waitForIdle()),
+						result.promise,
+					]);
+					await raw.waitForIdle();
+				} finally {
+					clearTimeout(timer);
+					off();
+				}
 				log("revived-child", {
 					parked, freshSession: revived !== original, sameRef: registry.get(id) === ref,
 					sameTranscript: revived.sessionManager.getSessionId() === sid,
@@ -200,7 +297,7 @@ export default function scoutProbe(pi: ExtensionAPI): void {
 				lastWorker = raw;
 				if (action === "held" || action === "one") {
 					const count = action === "held" ? 3 : 1;
-					const deadline = Date.now() + 8_000;
+					const deadline = Date.now() + (action === "held" ? fanoutWaitMs : 8_000);
 					const jobs = () => raw.asyncJobManager?.getAllJobs({ ownerId: worker.id }).filter(job => job.type === "task") ?? [];
 					while (raw.isStreaming || !raw.isRunActive || !raw.wakeSources?.jobs.length || jobs().length !== count
 						|| childIds.size !== Math.min(count, 2)

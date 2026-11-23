@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RosterFile } from "../../src/board/types.ts";
@@ -19,6 +19,21 @@ const batch = (...tasks: TaskItem[]) => tool("task", { context: "Independent rea
 const readRows = (log: string): Record<string, unknown>[] => existsSync(log)
 	? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 
+function readEntries(file: string): SessionEntry[] {
+	return readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line) as SessionEntry);
+}
+
+function modelBills(entries: readonly SessionEntry[]) {
+	return entries.flatMap(entry => {
+		if (entry.type === "model_usage" && entry.purpose !== "discarded-turn") return [{ purpose: entry.purpose, usage: entry.usage }];
+		return entry.type === "message" && entry.message.role === "assistant" ? [{ purpose: "assistant", usage: entry.message.usage }] : [];
+	});
+}
+
+function directLedger(file: string) {
+	return modelBills(readEntries(file)).map(bill => bill.usage);
+}
+
 async function compiled(script: Script, options: {
 	config: string;
 	ceiling?: string;
@@ -29,6 +44,9 @@ async function compiled(script: Script, options: {
 	exitCode?: number;
 	captureWorkerLedger?: boolean;
 	highCostModel?: boolean;
+	wideFanout?: boolean;
+	gateWaitSeconds?: number;
+	captureMainLedger?: boolean;
 }) {
 	const root = mkdtempSync(join(tmpdir(), "omp-native-scouts-"));
 	const log = join(root, "scouts.log");
@@ -44,9 +62,10 @@ async function compiled(script: Script, options: {
 		const run = runOmp(c, {
 			prompt: "start-native-scouts",
 			pluginArgs: ["--no-extensions", "-e", join(REPO, "test/fixtures/scouts-probe.ts"), "-e", REPO],
-			args: ["--max-time", "23", "--approval-mode", "yolo"],
+			args: ["--max-time", options.wideFanout ? "80" : "23", "--approval-mode", "yolo"],
 			env: {
 				SWARM_SCOUT_LOG: log, HOME: home, PI_CONFIG_DIR: ".omp", OMP_PROFILE: "", PI_PROFILE: "",
+				OMP_SWARM_GATE_WAIT_SECONDS: options.gateWaitSeconds?.toString(),
 				OMP_SWARM_MAX_COST_USD: options.ceiling, OMP_SWARM_WORKER_TOOLS: undefined,
 				SWARM_SCOUT_EARLY_BILL: options.earlyBill ? "1" : undefined,
 				SWARM_SCOUT_HIGH_COST: options.highCostModel ? "1" : undefined,
@@ -65,7 +84,7 @@ async function compiled(script: Script, options: {
 						writeFileSync(requestMark, "");
 					}
 					return readRows(log).some(r => r.stage === (options.releaseAt ?? "held"));
-				}, 10_000, "compiled scout barrier");
+				}, options.wideFanout ? 45_000 : 10_000, "compiled scout barrier");
 			}
 			catch (error) { barrierError = error; }
 			finally { options.held.resolve(); }
@@ -78,14 +97,11 @@ async function compiled(script: Script, options: {
 		expect(result.code, diagnostic).toBe(options.exitCode ?? 0);
 		const roster = readJson<RosterFile>(join(c.swarm, "members.json"));
 		const file = roster?.members.worker?.session_file;
-		const workerLedger = options.captureWorkerLedger && file
-			? readFileSync(join(c.swarm, "sessions", file), "utf8").trim().split("\n").flatMap(line => {
-				const entry = JSON.parse(line) as SessionEntry;
-				if (entry.type === "model_usage" && entry.purpose !== "discarded-turn") return [entry.usage];
-				return entry.type === "message" && entry.message.role === "assistant" ? [entry.message.usage] : [];
-			})
+		const workerLedger = options.captureWorkerLedger && file ? directLedger(join(c.swarm, "sessions", file)) : [];
+		const mainLedger = options.captureMainLedger
+			? readdirSync(c.sessions).filter(name => name.endsWith(".jsonl")).flatMap(name => modelBills(readEntries(join(c.sessions, name))))
 			: [];
-		return { ...result, rows, requests, diagnostic, roster, workerLedger,
+		return { ...result, rows, requests, diagnostic, roster, workerLedger, mainLedger,
 			metrics: readJson<{ spend: { cost: number; unknown?: string }; outcome: { value: string } }>(join(c.swarm, "metrics.json")),
 			config: readFileSync(join(c.agent, "config.yml"), "utf8") };
 	} finally {
@@ -154,6 +170,7 @@ console.log("JUDGE-AUX-RESULT", judgement.ok.bool);
 		] },
 	}, {
 		config: concurrentConfig, held, ceiling: "1", earlyBill: true,
+		wideFanout: true,
 		prep: c => {
 			mkdirSync(join(c.repo, ".omp", "agents"), { recursive: true });
 			writeFileSync(join(c.repo, ".omp", "agents", "extra.md"), "---\nname: extra\ndescription: A valid non-scout project profile\nmodel: mock/plain\n---\nExtra project profile.\n");
@@ -216,10 +233,11 @@ test("compiled scout billing follows exact nested parents, deduplicates old gene
 }, 60_000);
 
 test("compiled scoped scout overrides preserve native profile discovery, settings snapshots, and non-spawning roles", async () => {
-	const { diagnostic, rows, requests, config, roster, stdout } = await compiled({
+	const { diagnostic, rows, requests, config, roster, stdout, mainLedger } = await compiled({
 		coord: { rules: [
 			{ when: "^user:.*start-native-scouts$", reply: { tools: [tool("swarm", { ...paddedAdd, action: "scout", model: "mock/worker-b:low" })] } },
-			{ when: '"scout":\\{"model":"mock/worker-b","effort":"low"', reply: { tools: [add("worker", "Wait for the existing-worker assignment.")] } },
+			{ when: '"scout":\\{"model":"mock/worker-b","effort":"low"', reply: { tools: [probe("main-bill-start")] } },
+			{ when: "^tool: SCOUTS-PROBE-main-bill-start$", reply: { tools: [add("worker", "Wait for the existing-worker assignment.")] } },
 			{ when: '"added":\\[\\{"name":"worker"', reply: { tools: [tool("swarm", { action: "scout", effort: "high" })] } },
 			{ when: '"scout":\\{"effort":"high"', reply: { tools: [add("fresh", "Run a new-worker scout."),
 				tool("swarm", { action: "add", role: "narrator", model: "mock/worker-a" }), tool("swarm", { action: "add", role: "monitor", model: "mock/worker-a" })] } },
@@ -254,6 +272,7 @@ test("compiled scoped scout overrides preserve native profile discovery, setting
 		] },
 	}, {
 		config: concurrentConfig,
+		captureMainLedger: true,
 		prep: c => {
 			for (const [root, tools] of [[join(c.repo, ".omp"), "read"], [c.agent, "grep"]] as const) {
 				mkdirSync(join(root, "agents"), { recursive: true });
@@ -274,14 +293,17 @@ test("compiled scoped scout overrides preserve native profile discovery, setting
 	expect(requests.some(r => r.model === "plain" && r.rule === 0), diagnostic).toBe(true);
 	expect(served.every(r => r.tools.includes("read") && !r.tools.includes("grep")), diagnostic).toBe(true);
 	expect(roster?.scout, diagnostic).toEqual({ effort: "high" });
-	const mainDirect = rows.find(r => r.stage === "main-bill")?.direct as { purpose: string; price: number; tokens: number }[];
 	const mainScouts = rows.filter(r => r.stage === "main-scout-bill");
 	expect(mainScouts, diagnostic).toHaveLength(1);
-	expect(mainDirect.filter(row => row.purpose === "completion"), diagnostic).toHaveLength(1);
+	expect(mainLedger.filter(row => row.purpose === "completion"), diagnostic).toHaveLength(1);
+	const prior = rows.find(row => row.stage === "main-untracked");
+	expect(Number.isFinite(prior?.cost) && Number.isFinite(prior?.tokens), diagnostic).toBe(true);
+	const mainCost = mainLedger.reduce((sum, bill) => sum + (bill.usage.cost.total ?? 0), -Number(prior?.cost));
+	const mainTokens = mainLedger.reduce((sum, bill) => sum + (bill.usage.totalTokens ?? 0), -Number(prior?.tokens));
 	expect(roster?.members.coordinator?.stats?.cost, diagnostic)
-		.toBeCloseTo([...mainDirect, ...mainScouts].reduce((sum, bill) => sum + Number(bill.price), 0), 10);
+		.toBeCloseTo(mainScouts.reduce((sum, bill) => sum + Number(bill.price), mainCost), 10);
 	expect(roster?.members.coordinator?.stats?.tokens, diagnostic)
-		.toBe([...mainDirect, ...mainScouts].reduce((sum, bill) => sum + Number(bill.tokens), 0));
+		.toBe(mainScouts.reduce((sum, bill) => sum + Number(bill.tokens), mainTokens));
 	expect(config, diagnostic).toBe(concurrentConfig);
 	expect(stdout, diagnostic).toContain("ROUTING-FINISHED");
 }, 60_000);
@@ -333,7 +355,7 @@ console.log(await pinned.wait());` })] } },
 }, 60_000);
 
 test("compiled operator revive bills only new scout journal entries from the reopened transcript", async () => {
-	const { diagnostic, rows, roster, metrics } = await compiled({
+	const { diagnostic, rows, roster, workerLedger, metrics } = await compiled({
 		coord: { rules: [
 			{ when: "^user:.*start-native-scouts$", reply: { tools: [add("worker", "Run a native scout.")] } },
 			{ when: "WARM-SCOUT-DONE", times: 1, reply: { tools: [probe("revive-child")] } },
@@ -350,7 +372,7 @@ test("compiled operator revive bills only new scout journal entries from the reo
 			{ when: "SCOUT-WARM-FIRST", reply: { text: "WARM-SCOUT-RESULT" } },
 			{ when: "SCOUT-WARM-SECOND", reply: { text: "WARM-SCOUT-REVIVED" } },
 		] },
-	}, { config: concurrentConfig, earlyBill: true, ceiling: "1" });
+	}, { config: concurrentConfig, earlyBill: true, ceiling: "1", captureWorkerLedger: true });
 	expect(rows.find(row => row.stage === "revived-child"), diagnostic).toMatchObject({
 		parked: true, freshSession: true, sameRef: true, sameTranscript: true,
 	});
@@ -358,9 +380,12 @@ test("compiled operator revive bills only new scout journal entries from the reo
 	const chat = rows.filter(row => row.stage === "scout-bill");
 	expect(early, diagnostic).toHaveLength(2);
 	expect(chat, diagnostic).toHaveLength(2);
-	const direct = rows.find(row => row.stage === "settled");
-	expect(roster?.members.worker?.stats?.cost, diagnostic)
-		.toBeCloseTo(Number(direct?.directCost) + [...early, ...chat].reduce((sum, bill) => sum + Number(bill.price), 0), 10);
+	const scoutBills = [...early, ...chat];
+	const finalDirectCost = workerLedger.reduce((sum, usage) => sum + usage.cost.total, 0);
+	const finalDirectTokens = workerLedger.reduce((sum, usage) => sum + usage.totalTokens, 0);
+	const stats = roster?.members.worker?.stats;
+	expect(stats?.cost, diagnostic).toBeCloseTo(finalDirectCost + scoutBills.reduce((sum, bill) => sum + Number(bill.price), 0), 10);
+	expect(stats?.tokens, diagnostic).toBe(finalDirectTokens + scoutBills.reduce((sum, bill) => sum + Number(bill.tokens), 0));
 	expect(metrics?.outcome.value, diagnostic).toBe("complete");
 }, 60_000);
 
@@ -396,34 +421,54 @@ for (const parent of ["worker", "main"] as const) {
 			coord: { rules: [
 				{ when: "^user:.*start-native-scouts$", reply: { tools: [parent === "main"
 					? tool("swarm", { action: "title", title: "Remote Main scouts" }) : add("worker", "Run the threaded fanout.")] } },
-				{ when: '"title":"Remote Main scouts"', reply: { tools: [fanout] } },
+				{ when: '^tool: \\{"title":"Remote Main scouts"\\}$', reply: { tools: [fanout] } },
 				{ when: "Spawned 10 background agents|\"added\"", reply: { tools: [collect] } },
-				{ when: "SCOUTS-PROBE-remote-", reply: { tools: [tool("swarm", { action: "status" })] } },
+				{ when: "^tool: SCOUTS-PROBE-remote-(worker|main)$", reply: { tools: [tool("swarm", { action: "status" })] } },
+				{ when: "The swarm still has outstanding work: worker is waiting on background work.", times: 1, reply: { tools: [probe("remote-drain")] } },
+				{ whenAny: '"unknown":"coordinator.s mock-remote/worker-b', times: 1, reply: { tools: [probe("remote-drain")] } },
 			], default: { text: "Threaded billing checked." } },
 			"worker-a": { rules: [{ when: "You are `worker`", reply: { tools: [fanout] } }], default: { text: "Waiting for scouts." } },
 			"worker-b": { rules: [{ when: "REMOTE-HELD-", reply: { text: "THREADED-SCOUT-RESULT", wait: held.promise } }] },
 		}, {
 			config: threadedConfig, held,
-			releaseAt: parent === "main" ? "remote-status" : "remote-billed",
+			wideFanout: true,
+			releaseAt: parent === "main" ? "remote-status" : "remote-stop-blocked",
+			gateWaitSeconds: parent === "worker" ? 1 : undefined,
 			ceiling: parent === "main" ? "1" : undefined, captureWorkerLedger: parent === "worker",
 		});
-		expect(rows.find(row => row.stage === "remote-billed"), diagnostic).toMatchObject({
+		const bill = rows.find(row => row.stage === "remote-billed");
+		expect(bill, diagnostic).toMatchObject({
 			parentId: parent === "main" ? "Main" : "swarm~worker",
-			home: expect.stringMatching(/^w\d+$/), populated: 2, live: true,
+			home: expect.stringMatching(/^w\d+$/), populated: 2, live: true, chargedTokens: 14,
 		});
-		if (parent === "worker") expect(rows.find(row => row.stage === "remote-billed")?.local, diagnostic).toBe(8);
+		expect(Number(bill?.chargedCost), diagnostic).toBeCloseTo(0.1, 10);
+		if (parent === "worker") expect(bill?.local, diagnostic).toBe(8);
+		expect(rows.find(row => row.stage === "remote-drained"), diagnostic).toMatchObject({
+			parentId: parent === "main" ? "Main" : "swarm~worker", completed: count, remaining: [],
+		});
 		const raw = rows.filter(row => row.stage === (parent === "main" ? "main-scout-bill" : "scout-bill"));
-		const direct = parent === "main" ? rows.find(row => row.stage === "main-bill")?.direct as { price: number; tokens: number }[]
-			: workerLedger.map(usage => ({ price: usage.cost.total, tokens: usage.totalTokens }));
-		const stats = roster?.members[parent === "main" ? "coordinator" : "worker"]?.stats;
-		expect(stats?.cost, diagnostic).toBeCloseTo([...raw, ...direct].reduce((sum, row) => sum + Number(row.price), 0.1), 10);
-		expect(stats?.tokens, diagnostic).toBe([...raw, ...direct].reduce((sum, row) => sum + Number(row.tokens), 14));
+		expect(raw, diagnostic).toHaveLength(count);
 		if (parent === "main") {
+			expect(rows.findLast(row => row.stage === "remote-main-receipts"), diagnostic).toMatchObject({ received: count });
+			expect(rows.find(row => row.stage === "remote-status"), diagnostic).toMatchObject({
+				unknown: expect.stringContaining("mock-remote/worker-b"),
+			});
+			expect(Number(rows.find(row => row.stage === "remote-status")?.cost), diagnostic).toBeGreaterThanOrEqual(0.1);
 			expect(metrics?.outcome.value, diagnostic).toBe("incomplete");
 			expect(metrics?.spend.unknown, diagnostic).toMatch(/mock-remote\/worker-b reported 7 tokens without a price/);
-		} else expect(metrics?.spend.unknown, diagnostic).toBeUndefined();
+		} else {
+			const stats = roster?.members.worker?.stats;
+			expect(stats?.cost, diagnostic).toBeCloseTo(
+				raw.reduce((sum, row) => sum + Number(row.price), 0.1) + workerLedger.reduce((sum, usage) => sum + usage.cost.total, 0), 10);
+			expect(stats?.tokens, diagnostic).toBe(
+				raw.reduce((sum, row) => sum + Number(row.tokens), 14) + workerLedger.reduce((sum, usage) => sum + usage.totalTokens, 0));
+			expect(rows.find(row => row.stage === "remote-drained")?.received, diagnostic).toBe(count);
+			expect(rows.filter(row => row.stage === "remote-stop-blocked"), diagnostic).toHaveLength(1);
+			expect(metrics?.outcome.value, diagnostic).toBe("quiescent_no_done");
+			expect(metrics?.spend.unknown, diagnostic).toBeUndefined();
+		}
 		expect(config, diagnostic).toContain("workerThreads: 1");
-	}, 60_000);
+	}, 100_000);
 }
 
 test("compiled capped worker scouts deny the second paid completion inside one eval cell", async () => {
@@ -461,6 +506,7 @@ try {
 	}, {
 		config: threadedConfig.replace("modelRoles:\n", "modelRoles:\n  slow: mock/expensive\n"),
 		ceiling: "1", highCostModel: true, held, releaseAt: "chain-placed",
+		wideFanout: true,
 		prep: c => {
 			mkdirSync(join(c.repo, ".omp", "agents"), { recursive: true });
 			writeFileSync(join(c.repo, ".omp", "agents", "scout.md"), "---\nname: scout\ndescription: Loopback accounting profile\ntools: eval\n---\nRun the assigned check.\n");
@@ -475,7 +521,7 @@ try {
 	expect(metrics?.outcome.value, diagnostic).toBe("incomplete");
 	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeGreaterThanOrEqual(15);
 	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeLessThan(16);
-}, 60_000);
+}, 100_000);
 
 test("compiled cap blocks further worker spawns and native scout-result model turns", async () => {
 	const held = Promise.withResolvers<void>();
