@@ -1,20 +1,24 @@
 // The status widget: one width-aware line under the editor, coalesced to ≤ 4 updates per second.
 
-import { project, type SwarmReadModel } from "../model.ts";
+import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui/native/node";
+import { countMembers, type SwarmReadModel } from "../model.ts";
 import { fit, sanitizeLine, width } from "../sanitize.ts";
+import { NativeCache, span, text } from "./native.ts";
 import type { TuiLike } from "./overlay.ts";
 
-function widgetDetail(model: SwarmReadModel, budget?: number): string {
+function widgetDetail(model: SwarmReadModel, budget?: number, native = false): string {
 	if (model.stalled()) return "stalled — waiting for you · /swarm";
 	const outcome = model.outcome();
 	if (outcome?.value === "complete" || outcome?.value === "complete_with_abandonment") return `complete · #${model.head} · /swarm`;
 	if (outcome?.value === "incomplete") return `incomplete · #${model.head} · /swarm`;
 	const restored = model.restored();
-	const v = project(model);
-	if (restored && v.counts.working === 0) return `restored: ${restored.stopped} stopped, ${restored.owed} owed · /swarm`;
-	const c = v.counts;
-	const counts = [`●${c.working}`, `○${c.waiting}`, c.stopped ? `◌${c.stopped}` : "", c.failed ? `✗${c.failed}` : ""].filter(Boolean).join(" ");
-	const unread = model.members().find(m => m.role === "coordinator")?.unread ?? 0;
+	const members = model.members();
+	const c = countMembers(members);
+	if (restored && c.working === 0) return `restored: ${restored.stopped} stopped, ${restored.owed} owed · /swarm`;
+	const counts = native
+		? [`${c.working} working`, `${c.waiting} waiting`, c.stopped ? `${c.stopped} stopped` : "", c.failed ? `${c.failed} failed` : ""].filter(Boolean).join(" · ")
+		: [`●${c.working}`, `○${c.waiting}`, c.stopped ? `◌${c.stopped}` : "", c.failed ? `✗${c.failed}` : ""].filter(Boolean).join(" ");
+	const unread = members.find(m => m.role === "coordinator")?.unread ?? 0;
 	const state = `${counts} · #${model.head}${unread ? ` · ${unread} unread` : ""} · /swarm`;
 	let title = sanitizeLine(model.title);
 	if (title && budget !== undefined) {
@@ -41,6 +45,7 @@ export function widgetLine(model: SwarmReadModel, webUrl?: string, columns?: num
 
 export function widgetComponent(model: SwarmReadModel, tui: TuiLike, webUrl: () => string | undefined) {
 	let timer: Timer | undefined;
+	const native = new NativeCache();
 	const unsubscribe = model.onChange(() => {
 		if (timer) return;
 		timer = setTimeout(() => {
@@ -52,6 +57,13 @@ export function widgetComponent(model: SwarmReadModel, tui: TuiLike, webUrl: () 
 	return {
 		render(width: number): string[] {
 			return [widgetLine(model, webUrl(), width)];
+		},
+		describe(cx: DescribeContext): NativeNode | null {
+			if (!cx.supports("text")) return null;
+			const link = webUrl();
+			return native.get(`${model.version}|${link ?? ""}`, () => text("widget", [
+				span("Swarm", "strong"), ...(link ? [span(` · ${link}`, "mono")] : []), span(` · ${widgetDetail(model, undefined, true)}`, "muted"),
+			], undefined, "omp.swarm.widget"));
 		},
 		dispose(): void {
 			unsubscribe();

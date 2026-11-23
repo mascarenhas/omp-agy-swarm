@@ -4,7 +4,7 @@ An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.
 
 - **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances registered in omp's global `AgentRegistry`—making live workers inspectable via `/hub`, native transcript focus, and (in tray-capable hosts like Tern) Tray cards without touching `~/.omp/agent/agents/` (worker transcripts stay under `<swarm_dir>/sessions/`).
 - **Full per-worker model and exact reasoning effort control:** inherit the coordinator's model and effort by default, or pin any runnable `provider/id` and exact effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — never `auto`) with live boundary model switching, immediate effort-only switching, and no silent fallback downgrades.
-- **SSH-first native TUI (`/swarm`) + opt-in local web board (`/swarm-ui`):** `/swarm` provides four keyboard-driven views (Overview, Board, Members, Transcript) plus a live status widget under the editor with **zero open network ports**. `/swarm-ui` starts a read-only loopback web board only when explicitly requested.
+- **Native Tern & ANSI TUI (`/swarm`) + opt-in local web board (`/swarm-ui`):** `/swarm` provides four read-only, keyboard-driven views (Overview, Board, Members, Transcript) plus a live status widget under the editor with **zero open network ports**—rendering natively with pointer support on terminals that negotiate TSP (such as Tern) and falling back to ANSI where TSP is not negotiated (plain terminals and ordinary SSH). `/swarm-ui` starts a separate optional read-only loopback web board only when explicitly requested.
 - **First-class headless (`omp -p`) execution:** stop-gate, stall/quiescence detection, spend ceilings, monotonic deadlines, and durable `metrics.json` outcomes.
 - **Private personal repository:** `"private": true` in `package.json`; see [`NOTICE.md`](./NOTICE.md) for the provenance and SHA-256 verification of the vendored Antigravity web frontend files.
 
@@ -42,10 +42,10 @@ Start `omp` in your project directory and ask it to run a swarm (or prompt it to
 Read skill://swarm and split the parser rewrite across two authors (lexer and parser) plus one verifier.
 ```
 
-- A single-line status widget appears below the editor (`swarm · <title> · ●2 ○1 · #12 · /swarm`).
+- A status widget appears below the editor (ANSI: `swarm · <title> · ●2 ○1 · #12 · /swarm`; native TSP: wrapping text with word counts such as `2 working · 1 waiting`).
 - Run `/swarm` at any time to open the full-screen terminal board (or `/swarm board`, `/swarm members`, `/swarm transcript <name>`).
 - Open omp's **Agent Hub** (`/hub` → `1` Agents → select → `Enter`)—or click a **Tern Tray** card in a tray-capable host—to focus a live member's native omp transcript.
-- Optionally run `/swarm-ui start` to start the read-only loopback web board: in TUI the status widget immediately shows `http://127.0.0.1:<port>/` (even mid-turn, clipping the URL only if it alone exceeds the terminal width), and a copyable transcript notice appears immediately when idle or when the active run ends (a brief toast is also sent, though it may not appear when idle—notably in Tern—and neither display depends on it).
+- Optionally run `/swarm-ui start` to start the read-only loopback web board: in TUI the status widget immediately shows `http://127.0.0.1:<port>/` (even mid-turn; native wraps the full URL, while ANSI clips it only if the URL alone exceeds the terminal width), and a copyable transcript notice appears immediately when idle or when the active run ends (a brief toast is also sent, though it may not appear when idle—notably in Tern—and neither display depends on it).
 
 ### Headless (`omp -p`)
 
@@ -121,7 +121,14 @@ In headless runs (`print` and `json` modes):
 
 ### Primary UI: Native TUI (`/swarm`)
 
-Works directly over SSH and in any terminal (`≥ 24×6`), binds no network ports, and is strictly read-only (nothing in `/swarm` moves any agent's read cursor).
+Binds no network ports, is strictly read-only (nothing in `/swarm` moves any agent's read cursor), and stays keyboard-driven. `/swarm-ui` remains the separate optional web board.
+
+- **Tern (TSP) vs. ANSI/SSH:** in Tern (terminals that negotiate the Tern Surface Protocol), `/swarm` (a fullscreen `omp.swarm` page with a shared header showing title, mode, `#seq`, directory basename—full path in the coordinator's Members details—spend, and worker counts, plus a dock), the below-editor status widget, wake messages (`swarm-wake`), and web-board notices (`swarm-ui`) render as native UI with pointer support for tabs, lists, filters, paging, help, and dock search/jump inputs. Plain terminals and ordinary SSH sessions (non-TSP peers) keep the ANSI UI (`≥ 24×6`). For debugging (with debug logging enabled), `PI_TUI_NATIVE_STATS=1` emits a debug-level `{sf, ops, rows}` total per reconciled surface (a full TSP swarm screen has `rows: 0`, while unrelated inline host nodes can still fall back).
+- **Tabs:**
+  - **1 Overview:** goal and outcome work threads, attention items, recent flagged screenshot captions (up to 8), and jump actions to the selected member or board post (Overview/header file info refreshes every 2 s).
+  - **2 Board:** in native mode, selected post detail above the feed (with expand/collapse and sender link), filter toolbar, bounded 50-post feed with unread divider (leaving follow keeps the current window and slides at its edges; Older/Newer page explicitly), plus dock search (`/`) and `#seq` jump; in ANSI mode, visible post blocks lay out by available rows and expose filters via keys and the status line.
+  - **3 Members:** grouped roster (coordinator, task workers/groups/helpers, narrator/monitor) with killed toggle (`K`), selected member facts, and **View transcript** (`Enter` / `t` in native; `t` in ANSI).
+  - **4 Transcript:** read-only conversation history for live and historical members (newest-first, content-budgeted right after the member line in native, with paging moving the window; search typing/`Esc` keep your place), plus member cycling and follow. To watch a live worker in omp's native transcript instead: close `/swarm`, open `/hub`, press `1`, select the displayed registry ID (e.g., `swarm~parser`), and press `Enter`—or click its Tern Tray card (stopped, killed, and coordinator entries show no live-focus hint).
 
 ```text
 /swarm [overview | board | members | transcript [name]]
@@ -134,14 +141,14 @@ In `rpc` mode, `/swarm` prints a compact text summary notification.
 | **Global** | `1`–`4`, `Tab` / `Shift-Tab` | Switch between Overview, Board, Members, Transcript |
 | | `?` | Toggle keybindings help |
 | | `q`, `Esc` | Close overlay (`Esc` first pops navigation back-stack or closes detail/search) |
-| **1 Overview** | `↑` / `↓`, `Enter` | Select row; open member in Members or jump to post in Board |
+| **1 Overview** | `↑` / `↓`, `Enter` | Select row; open member in Members (if a member) or jump to post in Board |
 | **2 Board** | `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Navigate posts |
 | | `/`, `n` / `N` | Filter/search (`Enter` keeps, `Esc` clears); next/previous |
-| | `#` `<digits>` `Enter`, `b` | Jump to `#seq` (temporarily suspends filters); `b` restores filters |
-| | `a` / `A`, `m`, `c`, `x` | Cycle author (`A` clears), cycle mention filter, cycle channel, clear all filters |
-| | `f`, `u`, `Enter`, `o` | Toggle follow tail, jump to first unread past coordinator cursor, expand/collapse long post, open author in Members |
-| **3 Members** | `↑` / `↓`, `PgUp` / `PgDn` | Select member (detail renders side-by-side at terminal width ≥ 110 cols) |
-| | `Enter`, `t`, `K` | Toggle detail view, open transcript, toggle killed members |
+| | `#` `<digits>` `Enter`, `b` | Jump to `#seq` (suspends filters only if they exclude the target); `b` restores the snapshot taken at the first suspending jump |
+| | `a` / `A`, `m`, `c`, `x` | Cycle author (`A` clears), cycle mention filter, cycle unique channels, clear all filters |
+| | `f`, `u`, `Enter`, `o` | Toggle follow tail, select first post past coordinator cursor in the current filtered list, expand/collapse long post, open author in Members (if a member) |
+| **3 Members** | `↑` / `↓`, `PgUp` / `PgDn` | Select member (native places the roster and selected card in a wrapping row that stacks on narrow panes; ANSI renders side-by-side at width ≥ 110 cols) |
+| | `Enter`, `t`, `K` | Open transcript (native) or toggle detail view (ANSI), open transcript, toggle killed members |
 | **4 Transcript** | `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Page backwards/forwards across the full conversation branch |
 | | `f`, `[` / `]`, `/`, `Esc` | Toggle follow, cycle member, search loaded items, go back |
 
@@ -172,11 +179,11 @@ Opt-in, read-only (`GET`-only; non-`GET` returns `405` with `Allow: GET`), and b
 ```
 
 - `status` (default): if running, triggers a brief toast (which may not show when idle) and re-posts the copyable transcript notice (immediately when idle, or when the active run ends); otherwise notifies that the web board is off.
-- `start [port]`: starts the server on `127.0.0.1` (`port` defaults to `OMP_SWARM_UI_PORT`, or an ephemeral port if `0`), updates the TUI status widget below the editor immediately with the live `http://127.0.0.1:<port>/` URL (even mid-turn, clipping the URL only if it alone cannot fit; RPC has no widget), sends a brief toast (which may not appear when idle), and posts a persistent, copyable transcript notice (`customType: "swarm-ui"`, excluded from model context, no turn triggered; appears immediately when idle or when the active run ends) with the URL and remote-access commands. Auto-start via `OMP_SWARM_UI=1` announces the same way.
+- `start [port]`: starts the server on `127.0.0.1` (`port` defaults to `OMP_SWARM_UI_PORT`, or an ephemeral port if `0`), updates the TUI status widget below the editor immediately with the live `http://127.0.0.1:<port>/` URL (even mid-turn; native renders the full URL in a wrapping text node, while ANSI clips it only if the URL alone cannot fit; RPC has no widget), sends a brief toast (which may not appear when idle), and posts a persistent, copyable transcript notice (`customType: "swarm-ui"`, excluded from model context, no turn triggered; appears immediately when idle or when the active run ends) with the URL and remote-access commands. Auto-start via `OMP_SWARM_UI=1` announces the same way.
 - `open`: starts if needed, announces the URL the same way, and makes a best-effort attempt to launch the host browser (`xdg-open` / `open`).
 - `stop`: closes the listener and removes the URL from the status widget immediately (earlier transcript notices remain in history).
 
-Because the URL is plain (`http://127.0.0.1:<port>/`, with no credentials), page reloads and bookmarks work while that address is listening. While running, the TUI status widget shows the full live URL (`swarm · http://127.0.0.1:<port>/ · <title> · ●2 ○1 · #12 · /swarm`, dropping other segments before clipping the URL; RPC has no widget), and `open_board` in `swarm{action:"add"}` and `swarm{action:"status"}` returns `http://127.0.0.1:<port>/` (otherwise `/swarm` in TUI and `""` in RPC/headless; `/swarm` remains available independently).
+Because the URL is plain (`http://127.0.0.1:<port>/`, with no credentials), page reloads and bookmarks work while that address is listening. While running, the TUI status widget shows the full live URL (ANSI: `swarm · http://127.0.0.1:<port>/ · <title> · ●2 ○1 · #12 · /swarm`, dropping other segments before clipping the URL; native: wrapping text node with word counts such as `2 working · 1 waiting`; RPC has no widget), and `open_board` in `swarm{action:"add"}` and `swarm{action:"status"}` returns `http://127.0.0.1:<port>/` (otherwise `/swarm` in TUI and `""` in RPC/headless; `/swarm` remains available independently).
 
 **Security model:**
 There is no authentication: anyone who can reach the loopback port or a Tailscale Serve proxy exposing it can read the board, transcripts, and allowlisted files under `<swarm_dir>` (plus up to 4 optional `OMP_SWARM_UI_ROOTS`); use tailnet-only `tailscale serve`, never `tailscale funnel` (marked `Tailscale-Funnel-Request` `GET` requests return `403`, while non-`GET` requests return `405` first). To block DNS rebinding and cross-site reads, the server accepts only `GET` requests with a `Host` of `127.0.0.1:<port>`, `localhost:<port>`, `[::1]:<port>` (a bare loopback `Host` is accepted only when listening on `http` port `80` or forwarded `https` port `443`), or `*.ts.net` (optional `:<port>`) (`421` otherwise) and, when `Origin` is present, a matching origin using `http` for direct loopback and `https` for MagicDNS hosts or `X-Forwarded-Proto: https` (`403` otherwise), serves no CORS headers, and sets strict CSP (`frame-ancestors 'none'; connect-src 'self'`), `Cross-Origin-Resource-Policy: same-origin`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and `Cache-Control: no-store` on `/api/*`.

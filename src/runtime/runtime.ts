@@ -454,6 +454,7 @@ export class SwarmRuntime {
 			this.#lateUsage = true;
 			return;
 		}
+		if (this.binding.mode === "tui") this.changedActivity();
 		this.scheduleFlush();
 		this.writeMetricsSoon();
 		if (this.spendExceeded() && !this.#spendNotified) {

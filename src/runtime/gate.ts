@@ -36,9 +36,13 @@ export function liveTaskWork(rt: SwarmRuntime): Member[] {
 	return out;
 }
 
-export function liveWorkReason(m: Member, finish = false): string {
+export function liveWorkReason(m: Member, finish = false, absoluteTime?: { hour12?: boolean }): string {
 	const deadline = m.waiter?.deadline;
 	if (m.phase === "parked" && deadline !== undefined) {
+		if (absoluteTime) {
+			const time = new Date(deadline).toLocaleTimeString(undefined, { hour12: absoluteTime.hour12, hour: "numeric", minute: "2-digit", second: "2-digit" });
+			return `${m.name} is parked in a timed swarm_wait (wakes at ${time}).`;
+		}
 		const seconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
 		const eta = seconds >= 3600 ? `${Math.ceil(seconds / 3600)}h` : seconds >= 60 ? `${Math.ceil(seconds / 60)}m` : `${seconds}s`;
 		const reason = `${m.name} is parked in a timed swarm_wait (wakes in ~${eta}).`;
@@ -104,14 +108,18 @@ export function completionCurrent(rt: SwarmRuntime): boolean {
 }
 
 /** "accepted" or "pending: parser working; unread #41, #44; notices: 1". */
-export function completionLabel(rt: SwarmRuntime): string {
+export function completionLabel(rt: SwarmRuntime, absoluteTime?: { hour12?: boolean }): string {
 	if (completionCurrent(rt)) return "accepted";
 	const parts: string[] = [];
 	const live = liveTaskWork(rt);
-	if (live.length) parts.push(live.map(m => liveWorkReason(m)).join(" "));
+	if (live.length) {
+		if (!absoluteTime) parts.push(live.map(m => liveWorkReason(m)).join(" "));
+		else if (live.length === 1) parts.push(liveWorkReason(live[0]!, false, absoluteTime));
+		else parts.push(`${live.length} task workers active`);
+	}
 	const d = doneMarker(rt);
 	const o = owed(rt, d?.abandoned ? d.seq : 0);
-	if (o.posts.length) parts.push(`unread ${o.posts.map(s => `#${s}`).join(", ")}`);
+	if (o.posts.length) parts.push(absoluteTime ? `${o.posts.length} unread` : `unread ${o.posts.map(s => `#${s}`).join(", ")}`);
 	if (o.notices) parts.push(`notices: ${o.notices}`);
 	if (!d) parts.push("no [done] yet");
 	else if (!parts.length) parts.push(`activity after #${d.seq}`);

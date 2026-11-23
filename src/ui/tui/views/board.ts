@@ -1,10 +1,11 @@
 // Board: posts with search, author/mention/channel filters, #seq jump with return, follow, unread
 // divider and expandable long posts (§10.2). Only blocks in view are laid out (5 000+ posts).
 
+import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
 import type { BoardMessage } from "../../../board/types.ts";
 import { fit, pad, sanitize, sanitizeLine, wrap } from "../../sanitize.ts";
-import { printable } from "../keys.ts";
-import type { OpenTarget, View, ViewHost } from "../view.ts";
+import { button, card, group, item, list, type ListItem, NativeCache, nativeKey, postSummary, postText, span, strip, text } from "../native.ts";
+import { Capture, type OpenTarget, type View, type ViewHost } from "../view.ts";
 
 interface Filters {
 	search: string;
@@ -16,31 +17,43 @@ interface Filters {
 
 const NO_FILTERS: Filters = { search: "", author: "", mention: "off", mentionOf: "", channel: "" };
 const COLLAPSE = 6;
+const WINDOW = 50;
+const PREVIEW = 640;
+const ACTIONS = {
+	search: "/", jump: "#", author: "a", "clear-author": "A", mention: "m", channel: "c", clear: "x",
+	restore: "b", follow: "f", unread: "u", sender: "o",
+} as const;
 
 export class BoardView implements View {
 	readonly #host: ViewHost;
 	#f: Filters = { ...NO_FILTERS };
-	#saved: { filters: Filters; sel: number; follow: boolean } | undefined;
+	#saved: { filters: Filters; sel: number; follow: boolean; windowStart: number } | undefined;
 	#follow = true;
 	#sel = 0;
 	#top = 0;
+	#windowStart: number | undefined;
 	#expanded = new Set<number>();
-	#input: { kind: "search" | "jump"; text: string; before: Filters } | undefined;
+	#input: { kind: "search" | "jump"; field: Capture; before: Filters } | undefined;
+	#captures = 0;
 	#cacheKey = "";
-	#list: BoardMessage[] = [];
+	#list: readonly BoardMessage[] = [];
+	readonly #native = new NativeCache();
+	readonly #nativeField = new NativeCache();
+	#summaries = new Map<BoardMessage, ListItem>();
 	#lastRange = { from: 0, to: 0 };
 
 	constructor(host: ViewHost) {
 		this.#host = host;
 	}
 
-	#filtered(): BoardMessage[] {
+	#filtered(): readonly BoardMessage[] {
 		const model = this.#host.model;
 		const f = this.#f;
-		const key = `${model.version}|${f.search}|${f.author}|${f.mention}|${f.mentionOf}|${f.channel}`;
+		const key = JSON.stringify([model.version, f.search, f.author, f.mention, f.mentionOf, f.channel]);
 		if (key === this.#cacheKey) return this.#list;
 		const q = f.search.toLowerCase();
-		this.#list = model.messages().filter(m => {
+		const posts = model.messages();
+		this.#list = !(q || f.channel || f.author || f.mention !== "off") ? posts : posts.filter(m => {
 			if (f.channel && (m.channel || "main") !== f.channel) return false;
 			if (f.author && m.agent !== f.author) return false;
 			if (f.mention !== "off") {
@@ -55,14 +68,18 @@ export class BoardView implements View {
 		return this.#list;
 	}
 
-	#selIndex(list: BoardMessage[]): number {
+	#selIndex(list: readonly BoardMessage[]): number {
 		if (!list.length) return -1;
 		if (this.#follow || !this.#sel) return list.length - 1;
+		return Math.min(list.length - 1, this.#lowerBound(list, this.#sel));
+	}
+
+	#lowerBound(list: readonly BoardMessage[], seq: number): number {
 		let lo = 0;
-		let hi = list.length - 1;
+		let hi = list.length;
 		while (lo < hi) {
-			const mid = (lo + hi) >> 1;
-			if ((list[mid]?.seq ?? 0) < this.#sel) lo = mid + 1;
+			const mid = (lo + hi) >>> 1;
+			if (list[mid]!.seq < seq) lo = mid + 1;
 			else hi = mid;
 		}
 		return lo;
@@ -97,7 +114,7 @@ export class BoardView implements View {
 			return out;
 		}
 		const s = this.#selIndex(list);
-		this.#sel = list[s]?.seq ?? 0;
+		if (!this.#follow) this.#sel = list[s]?.seq ?? 0;
 		const cursor = this.#host.model.coordinatorCursor();
 		const heights = new Map<number, string[]>();
 		const blockAt = (i: number): string[] => {
@@ -146,8 +163,149 @@ export class BoardView implements View {
 		return parts.join(" ");
 	}
 
+	#window(size: number, index: number): number {
+		const tail = Math.max(0, size - WINDOW);
+		let start = this.#follow ? tail : Math.min(this.#windowStart ?? tail, tail);
+		if (index < start) start = Math.max(0, index);
+		else if (index >= start + WINDOW) start = index - WINDOW + 1;
+		this.#windowStart = start;
+		return start;
+	}
+
+	nativeStatus(): string {
+		const posts = this.#filtered();
+		const i = this.#selIndex(posts);
+		const start = this.#window(posts.length, i);
+		return [posts.length ? `${start + 1}–${Math.min(posts.length, start + WINDOW)} of ${posts.length} · #${posts[i]?.seq}` : "0 posts",
+			this.#follow ? "follow" : "", this.#describeFilters(), this.#saved ? "filters off · b back" : ""].filter(Boolean).join(" · ");
+	}
+
+	describeField(cx: DescribeContext): NativeNode | undefined {
+		const input = this.#input;
+		return input && this.#nativeField.get(`${cx.supports("input")}|${input.field.stamp}`, () => input.field.describe(cx));
+	}
+
+	#updateSearch(follow: boolean): void {
+		const input = this.#input;
+		if (input?.kind !== "search" || this.#f.search === input.field.value) return;
+		this.#f = { ...this.#f, search: input.field.value };
+		if (follow) this.#follow = true;
+	}
+
+	handleFieldEvent(event: NativeUiEvent): boolean {
+		if (!this.#input?.field.handleEvent(event)) return false;
+		this.#updateSearch(event.type === "edit" && !!event.text);
+		return true;
+	}
+
+	describe(cx: DescribeContext): NativeNode {
+		const posts = this.#filtered();
+		const i = this.#selIndex(posts);
+		const selected = posts[i];
+		const start = this.#window(posts.length, i);
+		const end = Math.min(start + WINDOW, posts.length);
+		const cursor = this.#host.model.coordinatorCursor();
+		const expanded = !!selected && this.#expanded.has(selected.seq);
+		return this.#native.get(`${nativeKey(cx)}|${cx.hour12}|${this.#cacheKey}|${cursor}|${i}|${start}|${expanded}|${this.#follow}|${!!this.#saved}`, () => {
+			const toolbar = strip(cx, "tools", [
+				button(cx, "search", "Search", "/", { on: !!this.#f.search }),
+				button(cx, "jump", "Jump to #", "#"),
+				button(cx, "author", this.#f.author ? `From ${this.#f.author}` : "Any author", "a"),
+				...(this.#f.author ? [button(cx, "clear-author", "Clear author", "A")] : []),
+				button(cx, "mention", this.#f.mention === "off" ? "Any mention" : `To ${this.#f.mention === "author" ? this.#f.mentionOf : "coordinator"}`, "m"),
+				button(cx, "channel", this.#f.channel ? `#${this.#f.channel}` : "All channels", "c"),
+				button(cx, "clear", "Clear filters", "x"),
+				button(cx, "follow", "Follow", "f", { on: this.#follow }),
+				button(cx, "unread", "First unread", "u", { disabled: !posts.length || (posts.at(-1)?.seq ?? 0) <= cursor }),
+				...(this.#saved ? [button(cx, "restore", "Restore filters", "b")] : []),
+			]);
+			const summaries = new Map<BoardMessage, ListItem>();
+			const items: ListItem[] = [];
+			for (let j = start; j < end; j++) {
+				const post = posts[j]!;
+				if (post.seq > cursor && (posts[j - 1]?.seq ?? 0) <= cursor) {
+					const divider = item("new-divider", [span(`New · after #${cursor}`, "warning strong")], undefined, "warning");
+					items.push({ ...divider, p: { ...divider.p, disabled: true } });
+				}
+				const entry = this.#summaries.get(post) ?? postSummary(post);
+				summaries.set(post, entry);
+				items.push(entry);
+			}
+			this.#summaries = summaries;
+			const out: NativeNode[] = [];
+			if (selected) {
+				const addressees = this.#host.model.addressees(selected);
+				const to = [...addressees.mentions.map(n => `@${n}`), ...(addressees.all ? ["@all"] : []), ...addressees.channels.map(c => `@#${c}`)];
+				const time = cx.hour12 === undefined || !Number.isFinite(selected.ts)
+					? selected.time.split(" ")[1] ?? selected.time
+					: new Date(selected.ts).toLocaleTimeString(undefined, { hour12: cx.hour12, hour: "numeric", minute: "2-digit" });
+				const head = `#${selected.seq} · ${selected.agent}${selected.control ? " · control" : ""}`;
+				const clean = sanitize(selected.text);
+				const long = clean.length > PREVIEW || clean.split("\n", COLLAPSE + 1).length > COLLAPSE;
+				const preview = !expanded && long ? `${clean.split("\n", COLLAPSE).join("\n").slice(0, PREVIEW).replace(/[\ud800-\udbff]$/, "")}…` : clean;
+				const detail = card(cx, `detail:post:${selected.seq}`, head, [
+					text("metadata", [span(`#${selected.channel || "main"} · ${time}`, "muted mono"), ...(to.length ? [span(` · ${to.join(" ")}`, "accent mono")] : [])]),
+					text("content", postText(preview, !!selected.control)),
+				], long ? !expanded : undefined);
+				out.push(detail);
+				out.push(strip(cx, `actions:post:${selected.seq}`, [
+					...(long ? [button(cx, "expand", expanded ? "Collapse post" : "Expand post", "Enter")] : []),
+					button(cx, "sender", "Inspect sender", "o", { disabled: !this.#host.model.members().some(m => m.name === selected.agent) }),
+				]));
+			}
+			out.push(toolbar);
+			if (posts.length && (start || end < posts.length)) out.push(strip(cx, "pages", [
+				button(cx, "older", "Older posts", undefined, { disabled: !start }),
+				text("window", `${start + 1}–${end} of ${posts.length}`, "num"),
+				button(cx, "newer", "Newer posts", undefined, { disabled: end === posts.length }),
+			]));
+			out.push(list(cx, "posts", items, selected ? `post:${selected.seq}` : undefined,
+				this.#host.model.head ? "No posts match the filters (x clears them)." : "The board is empty.", 8));
+			return group(cx, "board", out, "omp.swarm.board");
+		});
+	}
+
+	handleNativeEvent(event: NativeUiEvent, key: string): boolean {
+		if (this.#input) return false;
+		const posts = this.#filtered();
+		const i = this.#selIndex(posts);
+		const start = this.#window(posts.length, i);
+		const end = Math.min(start + WINDOW, posts.length);
+		const selected = posts[i];
+		if (event.type === "toggle") {
+			return !!selected && key === `detail:post:${selected.seq}` && this.#expand(selected, !event.collapsed);
+		}
+		const pick = event.type === "select" || event.type === "activate" ? key === "posts" ? event.item : ""
+			: event.type === "action" && key.startsWith("posts/") ? key.slice(6) : "";
+		if (pick) {
+			for (let j = start; j < end; j++) {
+				const post = posts[j]!;
+				if (pick !== `post:${post.seq}` || (event.type === "action" && event.act !== `swarm.${pick}`)) continue;
+				if (event.type === "activate") return this.#expand(post, !this.#expanded.has(post.seq));
+				if (this.#sel === post.seq && !this.#follow) return false;
+				this.#select(post);
+				return true;
+			}
+		}
+		if (event.type !== "action") return false;
+		for (const [action, input] of Object.entries(ACTIONS)) {
+			const path = action === "sender" ? `actions:post:${selected?.seq}/sender` : `tools/${action}`;
+			if (action === "restore" && !this.#saved || action === "clear-author" && !this.#f.author) continue;
+			if (key === path && event.act === `swarm.${action}`) return this.handleInput(input);
+		}
+		if (selected && key === `actions:post:${selected.seq}/expand` && event.act === "swarm.expand") return this.#expand(selected, !this.#expanded.has(selected.seq));
+		const page = key === "pages/older" && event.act === "swarm.older" && start > 0 ? -WINDOW
+			: key === "pages/newer" && event.act === "swarm.newer" && end < posts.length ? WINDOW : 0;
+		if (page) {
+			this.#move(page);
+			this.#windowStart = Math.max(0, Math.min(posts.length - WINDOW, start + page));
+			return true;
+		}
+		return false;
+	}
+
 	status(width: number): string {
-		if (this.#input) return fit(`${this.#input.kind === "search" ? "/" : "#"}${this.#input.text}▏`, width);
+		if (this.#input) return fit(`${this.#input.kind === "search" ? "/" : "#"}${this.#input.field.value}▏`, width);
 		const list = this.#filtered();
 		const parts = [list.length ? `${this.#lastRange.from}–${this.#lastRange.to} of ${list.length}` : "0 posts"];
 		if (this.#follow) parts.push("follow");
@@ -170,18 +328,38 @@ export class BoardView implements View {
 		if (target?.seq) this.#jump(target.seq);
 	}
 
-	#jump(seq: number): void {
-		const list = this.#filtered();
-		if (list.some(m => m.seq === seq)) {
-			this.#follow = false;
-			this.#sel = seq;
-			return;
-		}
-		if (seq < 1 || seq > this.#host.model.head) return;
-		this.#saved = { filters: this.#f, sel: this.#sel, follow: this.#follow };
-		this.#f = { ...NO_FILTERS };
+	#select(post: BoardMessage): void {
+		this.#pinFollowWindow();
 		this.#follow = false;
-		this.#sel = seq;
+		this.#sel = post.seq;
+	}
+
+	#pinFollowWindow(): void {
+		if (this.#follow) this.#windowStart = Math.max(0, this.#filtered().length - WINDOW);
+	}
+
+	#expand(post: BoardMessage, expanded: boolean): boolean {
+		const changed = this.#expanded.has(post.seq) !== expanded || this.#follow || this.#sel !== post.seq;
+		if (!changed) return false;
+		if (expanded) this.#expanded.add(post.seq);
+		else this.#expanded.delete(post.seq);
+		this.#select(post);
+		return true;
+	}
+
+	#jump(seq: number): void {
+		if (!Number.isSafeInteger(seq) || seq < 1) return;
+		const post = this.#host.model.messages()[seq - 1];
+		if (!post || post.seq !== seq) return;
+		const posts = this.#filtered();
+		if (posts[this.#lowerBound(posts, seq)]?.seq !== seq) {
+			this.#saved ??= {
+				filters: this.#f, sel: this.#sel, follow: this.#follow,
+				windowStart: this.#window(posts.length, this.#selIndex(posts)),
+			};
+			this.#f = NO_FILTERS;
+		}
+		this.#select(post);
 	}
 
 	#move(delta: number): void {
@@ -189,9 +367,10 @@ export class BoardView implements View {
 		if (!list.length) return;
 		const s = this.#selIndex(list);
 		const n = Math.max(0, Math.min(list.length - 1, s + delta));
-		this.#follow = n === list.length - 1 && delta > 0 ? this.#follow : false;
-		this.#sel = list[n]?.seq ?? 0;
-		if (n === list.length - 1 && delta > 0) this.#follow = true;
+		const next = list[n]!;
+		this.#pinFollowWindow();
+		this.#follow = n === list.length - 1 && delta > 0;
+		this.#sel = next.seq;
 	}
 
 	#selected(): BoardMessage | undefined {
@@ -210,26 +389,10 @@ export class BoardView implements View {
 			}
 			if (keys.confirm(data)) {
 				this.#input = undefined;
-				if (inp.kind === "jump") {
-					const seq = Number(inp.text);
-					if (Number.isInteger(seq)) this.#jump(seq);
-				}
+				if (inp.kind === "jump") this.#jump(Number(inp.field.value));
 				return true;
 			}
-			if (keys.backspace(data)) {
-				inp.text = inp.text.slice(0, -1);
-				if (inp.kind === "search") this.#f = { ...this.#f, search: inp.text };
-				return true;
-			}
-			const ch = printable(data);
-			if (ch) {
-				if (inp.kind === "jump" && !/[0-9]/.test(ch)) return true;
-				inp.text += ch;
-				if (inp.kind === "search") {
-					this.#f = { ...this.#f, search: inp.text };
-					this.#follow = true;
-				}
-			}
+			if (inp.field.handleKey(keys, data)) this.#updateSearch(!keys.backspace(data));
 			return true;
 		}
 		if (keys.up(data)) {
@@ -250,8 +413,8 @@ export class BoardView implements View {
 		}
 		if (keys.home(data)) {
 			const list = this.#filtered();
-			this.#follow = false;
-			this.#sel = list[0]?.seq ?? 0;
+			const first = list[0];
+			if (first) this.#select(first);
 			this.#top = 0;
 			return true;
 		}
@@ -261,20 +424,15 @@ export class BoardView implements View {
 		}
 		if (keys.confirm(data)) {
 			const m = this.#selected();
-			if (m) {
-				if (this.#expanded.has(m.seq)) this.#expanded.delete(m.seq);
-				else this.#expanded.add(m.seq);
-				this.#follow = false;
-				this.#sel = m.seq;
-			}
+			if (m) this.#expand(m, !this.#expanded.has(m.seq));
 			return true;
 		}
 		switch (data) {
 			case "/":
-				this.#input = { kind: "search", text: this.#f.search, before: { ...this.#f } };
+				this.#input = { kind: "search", field: new Capture(`board-search:${++this.#captures}`, "Search posts", this.#f.search), before: this.#f };
 				return true;
 			case "#":
-				this.#input = { kind: "jump", text: "", before: { ...this.#f } };
+				this.#input = { kind: "jump", field: new Capture(`board-jump:${++this.#captures}`, "Jump to post #", "", true), before: this.#f };
 				return true;
 			case "n":
 				this.#move(1);
@@ -282,17 +440,16 @@ export class BoardView implements View {
 			case "N":
 				this.#move(-1);
 				return true;
-			case "f":
-				this.#follow = !this.#follow;
-				if (!this.#follow) this.#sel = this.#selected()?.seq ?? 0;
+			case "f": {
+				const selected = this.#selected();
+				if (this.#follow && selected) this.#select(selected);
+				else this.#follow = !this.#follow;
 				return true;
+			}
 			case "u": {
 				const cursor = model.coordinatorCursor();
 				const first = this.#filtered().find(m => m.seq > cursor);
-				if (first) {
-					this.#follow = false;
-					this.#sel = first.seq;
-				}
+				if (first) this.#select(first);
 				return true;
 			}
 			case "x":
@@ -304,6 +461,7 @@ export class BoardView implements View {
 					this.#f = this.#saved.filters;
 					this.#sel = this.#saved.sel;
 					this.#follow = this.#saved.follow;
+					this.#windowStart = this.#saved.windowStart;
 					this.#saved = undefined;
 				}
 				return true;
@@ -323,14 +481,14 @@ export class BoardView implements View {
 				return true;
 			}
 			case "c": {
-				const chans = ["main", ...model.channels().map(c => c.name)];
+				const chans = [...new Set(["main", ...model.channels().map(c => c.name)])];
 				const i = chans.indexOf(this.#f.channel);
 				this.#f = { ...this.#f, channel: this.#f.channel === "" ? "main" : chans[i + 1] ?? "" };
 				return true;
 			}
 			case "o": {
 				const m = this.#selected();
-				if (m) this.#host.open("members", { member: m.agent });
+				if (m && model.members().some(member => member.name === m.agent)) this.#host.open("members", { member: m.agent });
 				return true;
 			}
 		}

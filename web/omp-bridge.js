@@ -81,8 +81,7 @@
 		};
 		const apply = (p, where) => {
 			if (gen !== drawerGen || drawer.dataset.member !== member) return;
-			if (epoch && p.epoch !== epoch) {
-				list.replaceChildren();
+			if (p.cursor_reset || (epoch && p.epoch !== epoch)) {
 				where = "replace";
 			}
 			epoch = p.epoch;

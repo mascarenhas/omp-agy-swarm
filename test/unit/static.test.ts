@@ -77,6 +77,17 @@ describe("dependency rules (§2)", () => {
 		}
 	});
 
+
+	test("native rendering uses type-only host internals, never deep native builders or wire values", () => {
+		for (const f of all) {
+			for (const i of imports(f)) {
+				if (i.spec.startsWith("@oh-my-pi/pi-tui/native") || i.spec.startsWith("@oh-my-pi/pi-wire")) {
+					expect([rel(f), i.spec, i.typeOnly]).toEqual([rel(f), i.spec, true]);
+				}
+				if (rel(f) === "ui/tui/native.ts" && i.spec.startsWith("@oh-my-pi/")) expect(i.typeOnly).toBe(true);
+			}
+		}
+	});
 	test("ui/web is imported only by ui/commands.ts; TUI/web/model never import the runtime by value", () => {
 		for (const f of all) {
 			for (const i of imports(f)) {

@@ -111,7 +111,7 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 	};
 
 	pi.registerCommand("swarm", {
-		description: "Open the swarm board (overview | board | members | transcript [name])",
+		description: "Open the read-only swarm dashboard (overview | board | members | transcript [name])",
 		getArgumentCompletions: prefix =>
 			Object.keys(VIEWS)
 				.filter(v => v.startsWith(prefix))
@@ -127,6 +127,7 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 				return;
 			}
 			const options = {
+				// Fullscreen gives the overlay its own native screen on TSP peers; ANSI keeps the same cell overlay.
 				overlay: true,
 				overlayOptions: { width: "100%" as const, maxHeight: "100%" as const, margin: 0, fullscreen: true, mouseTracking: false },
 			};

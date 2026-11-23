@@ -4,6 +4,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { type Browser, chromium, type Page } from "playwright-core";
 import { RuntimeReadModel } from "../../src/runtime/read-model.ts";
 import { WebBoard } from "../../src/ui/web/server.ts";
@@ -103,6 +104,29 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		expect(text).toContain("make the change");
 		await page.keyboard.press("Escape");
 		await page.waitForSelector("#omp-drawer[hidden]", { state: "attached" });
+	});
+
+	test("the transcript drawer replaces its items on a same-epoch cursor reset", async () => {
+		const worker = h.session("ui");
+		const original = worker.branchEntries;
+		const manager = SessionManager.inMemory(h.binding.cwd);
+		const common = manager.appendCustomMessageEntry("probe", "WEB-COMMON-ENTRY", true);
+		for (let i = 0; i < 200; i++) manager.appendCustomMessageEntry("probe", `WEB-RETIRED-ENTRY ${i}`, true);
+		worker.branchEntries = () => manager.getBranch();
+		try {
+			await page.evaluate(id => window.sidecar.ui.toggleConversation(id), h.member("ui").conversationId);
+			const drawer = page.locator("#omp-drawer:not([hidden])");
+			await drawer.getByText("WEB-RETIRED-ENTRY 199", { exact: true }).waitFor();
+			manager.branch(common);
+			manager.appendCustomMessageEntry("probe", "WEB-REPLACEMENT-ENTRY", true);
+			await drawer.getByRole("button", { name: "Load older" }).click();
+			await drawer.getByText("WEB-REPLACEMENT-ENTRY", { exact: true }).waitFor();
+			expect(await drawer.locator(".omp-item-text").allTextContents()).toEqual(["WEB-COMMON-ENTRY", "WEB-REPLACEMENT-ENTRY"]);
+			await page.keyboard.press("Escape");
+			await page.waitForSelector("#omp-drawer[hidden]", { state: "attached" });
+		} finally {
+			worker.branchEntries = original;
+		}
 	});
 
 	test("a snapshot that arrives before omp-bridge.js loads is not lost (the drawer still opens)", async () => {
