@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { APP_NAME, getActiveProfile, getAgentDbPath, getAgentDir, getProfileRootDir } from "@oh-my-pi/pi-utils/dirs";
 import { resolveOmpBin, stripNodeModulesBins } from "../../scripts/omp-bin.ts";
+import { SUPPORTED_HOST } from "../../src/env.ts";
 import { PtyOmp } from "../helpers/pty.ts";
 import { Checks, metrics, treeHash } from "./check.ts";
 import { MockLlm, type Script } from "./mock-llm/server.ts";
@@ -157,7 +158,7 @@ export async function runPaidCase(s: PaidScenario, options: CaseOptions): Promis
 	try {
 		if (seconds <= 0) throw new Error("suite has insufficient time to leave its shutdown margin");
 		if (s.pty) {
-			// 19.1.0 applies XDG relocation only to its default agent path for
+			// omp 19.1.x applies XDG relocation only to its default agent path for
 			// each profile. Refuse to write a live terminal breadcrumb if not.
 			if ((!loopback && agentDir !== join(getProfileRootDir(profile), "agent")) ||
 				!["linux", "darwin"].includes(process.platform))
@@ -298,8 +299,9 @@ export async function runPaid(ids: string[], list: PaidScenario[]): Promise<numb
 	}
 	const omp = resolveOmpBin();
 	const version = execFileSync(omp, ["--version"], { encoding: "utf8" }).trim();
-	if (!/^(?:omp\/)?19\.1\.0(?:\s|$)/.test(version)) {
-		console.error(`Paid checkpoint requires host omp 19.1.0, got ${version}.`);
+	const hostVersion = version.replace(/^omp\//, "").split(/\s/)[0] ?? "";
+	if (!SUPPORTED_HOST.includes(hostVersion)) {
+		console.error(`Paid checkpoint requires host omp ${SUPPORTED_HOST.join(" or ")}, got ${version}.`);
 		return 2;
 	}
 	console.log(`Host omp: ${version} (${omp}); hard scheduling ceiling $${ceiling}.`);

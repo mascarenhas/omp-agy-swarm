@@ -1,6 +1,6 @@
 # omp-agy-swarm
 
-An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.1.0**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
+An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.1.1**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
 
 - **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances registered in omp's global `AgentRegistry`—making live workers inspectable via `/hub`, native transcript focus, and (in tray-capable hosts like Tern) Tray cards without touching `~/.omp/agent/agents/` (worker transcripts stay under `<swarm_dir>/sessions/`).
 - **Full per-worker model and exact reasoning effort control:** inherit the coordinator's model and effort by default, or pin any runnable `provider/id` and exact effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — never `auto`) with live boundary model switching, immediate effort-only switching, and no silent fallback downgrades.
@@ -12,7 +12,7 @@ An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.
 
 ## Installation & Loading
 
-Requires **omp `19.1.0`** (`@oh-my-pi/pi-coding-agent: 19.1.0`), **Bun**, and **git** (for `share`/`branch` workspaces).
+Requires **omp `19.1.1`** (`@oh-my-pi/pi-coding-agent: 19.1.1`), **Bun**, and **git** (for `share`/`branch` workspaces).
 
 ```sh
 # 1. Link a local checkout for persistent use in omp
@@ -304,7 +304,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs the deterministic suites (ty
 
 ## Known Limits & Platform Notes
 
-- **omp `19.1.0` target:** pinned and tested against `@oh-my-pi/pi-coding-agent` `19.1.0`; loading under another host version logs a warning on stderr.
+- **omp `19.1.1` target:** pinned and tested against `@oh-my-pi/pi-coding-agent` `19.1.1`; loading under another host version logs a warning on stderr.
 - **Linux `/proc/self/fd` file containment:** `safeRead` (`src/ui/view-files.ts`) verifies opened regular-file descriptors via `/proc/self/fd/<fd>` after `O_NOFOLLOW` open so symlink swaps cannot escape `<swarm_dir>` or `OMP_SWARM_UI_ROOTS`. On non-Linux platforms this check fails closed (`unverifiable`), so `plan.json`, `view.json`, `view.html`, `/api/frame`, and `/api/file` reads are refused.
 - **Explicit revival after restart:** after a process restart, non-killed members attach in `stopped` state and previous background jobs are not resumed. Board posts never auto-revive unattended agents; the coordinator must invoke `swarm{action:"revive"}` (exec-tier) to restart them and replay owed posts.
 - **Private package & vendored frontend:** `web/vendor/` holds verbatim copies of Antigravity's swarm board frontend (`NOTICE.md`). `test/unit/static.test.ts` enforces both SHA-256 integrity and `"private": true` in `package.json`.
