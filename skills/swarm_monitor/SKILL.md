@@ -42,20 +42,26 @@ move it.
 
 - **`woke: "timeout"` is a tick.** Run **Each tick** below, then wait again
   with `timeout_seconds: 180`.
-- **`woke: "post"` (or `"notice"` / `"switch"`) is NOT a tick.** Someone named
-  you or a notice arrived. Process the returned `messages` (and `read_board`
-  only while `more` is `true`), update `LAST`, and **do not increment your tick
-  counters**. Then wait again with `timeout_seconds` set to the result's
-  `remaining_seconds` (at least `1`, or `180` if absent/0) so the tick cadence
-  stays intact — unless you were woken from dormant mode or after a restart
-  (see **Resuming**).
+- **`woke: "post"` (or `"notice"` / `"switch"`) and mid-turn asides are NOT ticks.**
+  Someone named you or a notice arrived. For a `swarm_wait` result, process
+  `messages` (calling cursor `read_board{limit: 200}`—omit `since`, since a
+  literal `since < cursor` requests history—only while `more` is `true`), update
+  `LAST`, and **do not increment your tick counters**; then wait again with
+  `timeout_seconds` set to `remaining_seconds` (at least `1`, or `180` if
+  absent/0) unless woken from dormant mode or after a restart (see
+  **Resuming**). A mid-turn aside is a custom message, not a `swarm_wait` result
+  (no `messages`, `more`, or `remaining_seconds` fields; further addressed pages
+  are pushed automatically); handle it without incrementing tick counters. If an
+  aside is already queued, `swarm_wait` returns `woke: "interrupted"` instead of
+  parking, while a cursor `read_board` returns the other unread posts and
+  excludes only queued/receipted ones.
 - **Count ticks only on `woke: "timeout"`.**
 
 ## Each tick
 
 1. Process any `messages` returned by `swarm_wait` and call
-   `read_board{since: LAST, limit: 200}` only while `more` is `true`; update
-   `LAST`.
+   `read_board{limit: 200}` (omit `since` for cursor reads) only while `more` is
+   `true`; update `LAST`.
 2. Call `read_board{status: true}`. It returns `head`, `tail_from_seq`, and one
    row per member:
    - `name`, `role`
@@ -64,7 +70,7 @@ move it.
      `waiting on background work`, `idle`, `working`, `starting`, `reviving`,
      `switching model`, `failed (<kind>)`, `stopped`, …)
    - `wake_mode`: `mentions` | `anything` | `working`
-   - `wait_since`, `last_read_seq`, `channels` (`["main", …]` or `["all"]`)
+   - `wait_since`, `last_read_seq` (contiguous floor; sparse mid-turn receipts may exist above it), `channels` (`["main", …]` or `["all"]`)
    - `wait_until` (present when parked with a timeout)
    - `last_post_seq`, `last_post_time` (omitted if the member has not posted)
    - `error` (present as `"<kind>: <text>"` if the member's last turn failed)
@@ -83,19 +89,23 @@ background work` / `in swarm_wait, with background work`), or is a task worker
 with `wait_until` set, it is **not** a stall: a long build, background job,
 timed wait, or deep tool turn is normal.
 
-When stalled, identify the root cause and post once to the member who can act:
+When stalled, identify the root cause and post once to the member who can act (your `@name` nudges wake eligible idle members and reach eligible busy members—including a busy TUI/RPC coordinator—at their next tool-batch or stop boundary; foreground tools aren't interrupted, though native interruptible waits can be):
 
 - **A result went to nobody.** Someone posted after the coordinator's
-  `last_read_seq` without naming it. →
+  `last_read_seq` without addressing anyone (check whether it addressed any
+  member at all—directly, via a group prefix, `@all`, or a channel mention—not
+  just whether it named `@coordinator`). →
   `@coordinator [stall] #41 (parser's result) and #42 were addressed to nobody; everyone has been waiting since 20:31.`
 - **The coordinator ended its turn with unread posts.** Same as above: cite the
-  unread `#seq`s.
+  unread `#seq`s. Note that `last_read_seq` is a contiguous floor, not proof
+  that a higher addressed `#seq` is unread (mid-turn receipts can be sparse).
 - **A failed or stopped member.** A member has `error` set (quota or turn
-  failure) or is `stopped` with posts addressed to it after its
-  `last_read_seq`. Board posts do **not** revive stopped members. → Tell
-  `@coordinator [stall]` naming the member, its `error` or `stopped` state, and
-  the `#seq`s it owes (it needs `swarm{action:"model"}` or
-  `swarm{action:"revive"}`).
+  failure) or is `stopped` with owed posts addressed to it after
+  `last_read_seq` (remembering `last_read_seq` is a contiguous floor and higher
+  addressed posts may already have sparse receipts). Board posts do **not**
+  revive stopped members. → Tell `@coordinator [stall]` naming the member, its
+  `error` or `stopped` state, and the `#seq`s it owes (it needs
+  `swarm{action:"model"}` or `swarm{action:"revive"}`).
 - **An `@mention` went unanswered.** A `waiting` member (with no `error`) was
   named in a post newer than its own `last_post_seq` (or it has never posted)
   and has not replied. Judge from the board, not `wait_since`: a member that

@@ -20,7 +20,7 @@ import type {
 } from "../board/types.ts";
 import { LIMITS, raceTimeout, type SwarmEnv, TIMING } from "../env.ts";
 import { messageText } from "./activity.ts";
-import { acknowledge, handoffPrompt, reconcile, release, wakePendingFor } from "./delivery.ts";
+import { acknowledge, handoffPrompt, reconcile, release, settleToolDelivery, wakePendingFor } from "./delivery.ts";
 import { completionCurrent, completionLabel, decide, declareIncomplete, evaluateQuiescence, liveTaskWork, liveWorkReason, owed, recordGateCompletion } from "./gate.ts";
 import { type Member, memberFromRecord, Member as MemberClass, type Op, type OpKind, preferredAgentId, roleDefaultMode } from "./member.ts";
 import { applyCoordinatorSwitch, QuotaCache } from "./models.ts";
@@ -178,6 +178,12 @@ export class SwarmRuntime {
 		this.board = new Board({ boardMembers: () => this.#boardMembers() });
 		this.factory = deps.makeFactory(this.sid);
 		this.coordinator = new MemberClass("coordinator", "coordinator", { mode: "inherit", path: binding.cwd }, "idle");
+		// The first swarm tool can create the runtime after the coordinator's agent_start.
+		if (!binding.headless && binding.isStreaming()) {
+			this.coordinator.phase = "working";
+			this.coordinator.runId = 1;
+			this.coordinator.stats.runs = 1;
+		}
 		this.coordinator.conversationId = this.sid;
 		this.coordinator.authorized = true;
 		this.members.set("coordinator", this.coordinator);
@@ -225,9 +231,8 @@ export class SwarmRuntime {
 		for (const [name, rec] of Object.entries(roster.members)) {
 			if (!rec || typeof rec !== "object") continue;
 			if (name === "coordinator") {
-				this.coordinator.lastReadSeq = Number(rec.last_read_seq) || 0;
+				this.coordinator.restoreReadState(rec);
 				this.coordinator.lastNudgedSeq = Number(rec.last_nudged_seq) || 0;
-				this.coordinator.wakeFloor = Number(rec.wake_floor) || 0;
 				this.coordinator.stats.steps = Number(rec.stats?.steps) || 0;
 				this.coordinator.stats.tokens = Number(rec.stats?.tokens) || 0;
 				this.coordinator.stats.cost = Number(rec.stats?.cost) || 0;
@@ -247,6 +252,7 @@ export class SwarmRuntime {
 				m.lastReadSeq = head;
 				clamped = true;
 			}
+			m.pruneAddressedRead(head);
 			if (m.role === "coordinator") continue;
 			if (!m.killed) {
 				m.phase = "stopped";
@@ -710,6 +716,11 @@ export class SwarmRuntime {
 					reconcile(this, m);
 					if (m.delivery) woke.push(m.name);
 				}
+			} else if (m.phase === "working" && rings("mentions")) {
+				m.redeliveryExhausted = false;
+				const previous = m.delivery;
+				reconcile(this, m);
+				if (!previous && m.delivery) woke.push(m.name);
 			} else if (m.phase === "stopped") {
 				if (rings(roleDefaultMode(m.role))) {
 					// SW-09: a post never starts an unattended agent; revival needs swarm{action:"revive"} (exec).
@@ -1051,6 +1062,7 @@ export class SwarmRuntime {
 	#detachMember(m: Member, reason: "closing" | "killed" | "aborted"): void {
 		m.gen++;
 		m.awaiting = false;
+		m.runSawError = false;
 		this.#cancelOp(m);
 		m.unsubscribe?.();
 		m.unsubscribe = undefined;
@@ -1273,9 +1285,10 @@ export class SwarmRuntime {
 				if (!was && unread.length === 0 && notices === 0) continue;
 				const item: AbandonedItem = { name: m.name, was: was || "waiting", ...(unread.length ? { unread } : {}), ...(notices ? { notices } : {}) };
 				abandoned.push(item);
-				if (session && asyncWork) {
+				const queuedAside = m.delivery?.status === "dispatched" && m.delivery.addressedSeqs !== undefined;
+				if (session && (asyncWork || queuedAside)) {
 					m.notices = [];
-					item.was += "; session detached to stop background work";
+					item.was += queuedAside ? "; session detached to stop a queued wake" : "; session detached to stop background work";
 					disposals.push(settleWithin(this.#detachForAbandon(m, session, false), Math.max(0, deadlineAt - Date.now())).then(settled => {
 						if (!settled) item.was += "; stop not confirmed";
 						return settled;
@@ -1329,10 +1342,12 @@ export class SwarmRuntime {
 			for (const m of this.members.values()) {
 				if (m.role === "worker" && !m.killed) {
 					m.wakeFloor = Math.max(m.wakeFloor, r.msg.seq);
+					m.pruneAddressedRead();
 					if (m.phase !== "stopped" && !m.op && !m.waiter) m.phase = m.hostWorking ? "working" : "idle";
 				}
 			}
 			c.wakeFloor = Math.max(c.wakeFloor, r.msg.seq);
+			c.pruneAddressedRead();
 			this.flushStructural();
 			return { seq: r.msg.seq, abandoned };
 		} finally {
@@ -1401,10 +1416,13 @@ export class SwarmRuntime {
 	onMainAgentStart(): void {
 		this.#mainAwaiting = false;
 		const c = this.coordinator;
+		if (c.runId === c.settledRun) c.runSawError = false;
 		c.runId++;
 		c.stats.runs++;
-		if (c.phase !== "parked" && c.phase !== "resuming") c.phase = "working";
+		c.awaiting = false;
+		if (c.phase !== "parked" && c.phase !== "resuming" && c.phase !== "switching") c.phase = "working";
 		this.changed();
+		reconcile(this, c);
 	}
 
 	onMainTurnStart(): void {
@@ -1414,6 +1432,7 @@ export class SwarmRuntime {
 	onMainMessageEnd(msg: HostMessage): void {
 		const c = this.coordinator;
 		if (msg.role === "assistant") {
+			if (!this.binding.headless && msg.stopReason === "error") c.runSawError = true;
 			c.tracker.onAssistant(msg);
 			this.recordUsage(c, msg);
 			return;
@@ -1429,12 +1448,15 @@ export class SwarmRuntime {
 		}
 	}
 
-	onMainToolEnd(toolCallId: string, isError: boolean): void {
+	onMainAutoRetryEnd(success: boolean): void {
 		const c = this.coordinator;
-		const d = c.delivery;
-		if (d?.kind !== "tool" || d.toolCallId !== toolCallId) return;
-		if (isError) release(this, c, "the tool result was an error");
-		else acknowledge(this, c, d);
+		if (!success || this.binding.headless || !c.runSawError) return;
+		c.runSawError = false;
+		reconcile(this, c);
+	}
+
+	onMainToolEnd(toolCallId: string, isError: boolean): void {
+		settleToolDelivery(this, this.coordinator, toolCallId, isError);
 	}
 
 	onMainStopHook(): void {
@@ -1444,16 +1466,24 @@ export class SwarmRuntime {
 	onMainAgentEnd(ev: { willContinue?: boolean; awaitingAsyncWork?: boolean; mayResume?: boolean }): void {
 		if (ev.willContinue) {
 			this.#mainAwaiting = this.binding.headless && ev.awaitingAsyncWork === true;
+			if (!this.binding.headless && ev.awaitingAsyncWork && this.coordinator.phase === "working") {
+				const c = this.coordinator;
+				c.awaiting = true;
+				c.phase = "idle";
+				this.changed();
+				this.#resumeCoordinator(c);
+			}
 			return;
 		}
 		const endedWithoutResult = this.#mainAwaiting;
 		this.#mainAwaiting = false;
 		const c = this.coordinator;
+		c.awaiting = false;
 		if (c.runId > c.settledRun || endedWithoutResult) {
 			c.settledRun = c.runId;
 			c.tracker.onRunEnd();
 			if (c.delivery) release(this, c, "the run ended before the wake was received");
-			if (c.phase !== "parked") c.phase = "idle";
+			if (c.phase !== "parked" && c.phase !== "switching") c.phase = "idle";
 			c.redeliveryExhausted = false;
 			this.changed();
 		} else if (!this.binding.headless) return;
@@ -1473,9 +1503,20 @@ export class SwarmRuntime {
 			}
 			return;
 		}
+		this.#resumeCoordinator(c);
+	}
+
+	#resumeCoordinator(c: Member): void {
+		if (c.phase === "switching") return;
 		if (this.coordinatorSwitch) {
-			void applyCoordinatorSwitch(this).then(res => {
-				if (res && res.state !== "ok") this.coordinatorNotice("external_change", res.text.replace(/^\[swarm\] /, ""));
+			c.phase = "switching";
+			void applyCoordinatorSwitch(this).then(
+				res => { if (res && res.state !== "ok") this.coordinatorNotice("external_change", res.text.replace(/^\[swarm\] /, "")); },
+				err => this.coordinatorNotice("external_change", `Your model switch failed: ${err instanceof Error ? err.message : String(err)}`),
+			).finally(() => {
+				if (c.phase === "switching") c.phase = this.binding.isStreaming() ? "working" : "idle";
+				this.changed();
+				if (this.coordinatorSwitch && c.phase === "idle") return this.#resumeCoordinator(c);
 				reconcile(this, c);
 			});
 			return;
@@ -1488,10 +1529,16 @@ export class SwarmRuntime {
 		this.changed();
 	}
 
+	/** A new transcript can supersede a failed run without emitting its final agent_end. */
+	onMainTranscriptReset(): void {
+		this.coordinator.runSawError = false;
+	}
+
 	/** session_clear keeps the session id (19.0.1): retain the runtime, invalidate the delivery/UI epoch. */
 	onSessionClear(): void {
 		const c = this.coordinator;
 		this.epoch++;
+		this.onMainTranscriptReset();
 		if (c.delivery) release(this, c, "the conversation was cleared");
 		if (c.waiter) claim(this, c, c.waiter.id, "closing");
 		c.reminders.restored = "Your conversation was cleared; the swarm continues. read_board{since:0} catches you up.";
@@ -1519,7 +1566,7 @@ export class SwarmRuntime {
 			workspace: describeWorkspace(m.workspace),
 			wake_mode: m.phase === "parked" ? m.wakeMode : roleDefaultMode(m.role),
 			last_read_seq: m.lastReadSeq,
-			unread: this.board.uiUnread(m.name, m.role, m.lastReadSeq),
+			unread: this.board.uiUnread(m.name, m.role, m.lastReadSeq, m.addressedRead),
 			owed: m.killed ? [] : wakePendingFor(this, m).map(p => p.seq),
 			steps: m.stats.steps,
 			activity: m.tracker.activity,

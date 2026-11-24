@@ -289,7 +289,7 @@ export function startBoundarySwitch(rt: SwarmRuntime, m: Member): void {
 	const gen = m.gen;
 	void switchMember(rt, rt.coordinator, m, model, sw.effort).then(out => {
 		if (rt.closing || m.gen !== gen || m.killed) return;
-		if (out.kind === "switched" && !m.delivery) {
+		if (out.kind === "switched" && !out.entry.resumed && !m.delivery) {
 			m.reminders.resume = `Your model is now ${m.model} (${m.effort || "default"}); continue.`;
 			reconcile(rt, m);
 		} else if (out.kind === "error") {
@@ -308,7 +308,7 @@ export interface CoordinatorSwitchResult {
 }
 
 /**
- * Applies a scheduled coordinator switch at a run boundary. Effort is applied only if the model
+ * Applies a scheduled coordinator switch at a run boundary or an awaiting pause. Effort is applied only if the model
  * change succeeded. When the host does not finish within `timeoutMs` the fence is invalidated at
  * once: a turn may start on the old model from here on, so a late completion must never change
  * the effort or the roster mid-turn (the roster catches up at the next turn start).
@@ -339,8 +339,15 @@ export async function applyCoordinatorSwitch(rt: SwarmRuntime, timeoutMs: number
 		});
 		return { state: "pending", text: `[swarm] Your model switch to ${sw.model} is still being applied; continue your work.` };
 	}
+	let effortError: string | undefined;
 	if (fence === rt.coordinatorSwitchSeq) {
-		if (res.ok && sw.effort !== undefined) binding.setThinkingLevel(sw.effort);
+		if (res.ok && sw.effort !== undefined) {
+			try {
+				binding.setThinkingLevel(sw.effort);
+			} catch (err) {
+				effortError = err instanceof Error ? err.message : String(err);
+			}
+		}
 		rt.coordinator.model = modelKey(binding.model());
 		rt.coordinator.effort = binding.thinkingLevel() ?? "";
 		rt.flushStructural();
@@ -349,6 +356,8 @@ export async function applyCoordinatorSwitch(rt: SwarmRuntime, timeoutMs: number
 	const now = `${rt.coordinator.model} (${rt.coordinator.effort || "default"})`;
 	if (!res.ok)
 		return { state: "failed", text: `[swarm] Your switch to ${sw.model} failed${res.error ? ` (${res.error})` : ""}; you are on ${now}. Continue.` };
+	if (effortError !== undefined)
+		return { state: "failed", text: `[swarm] Your model is now ${now}, but applying effort ${sw.effort} failed${effortError ? ` (${effortError})` : ""}. Continue.` };
 	return { state: "ok", text: `[swarm] Your model is now ${now}. Continue.` };
 }
 

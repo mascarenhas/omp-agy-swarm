@@ -97,6 +97,10 @@ export class CoordinatorBinding implements CoordinatorPort {
 		this.pi.setThinkingLevel(effort as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
 	}
 
+	isStreaming(): boolean {
+		return !this.#ctx.isIdle();
+	}
+
 	sendWake(message: CustomWakeMessage): void {
 		this.pi.sendMessage(message, { deliverAs: "aside" });
 	}

@@ -72,7 +72,7 @@ export class RuntimeReadModel implements SwarmReadModel {
 			},
 			wakeMode: m.phase === "parked" ? m.wakeMode : m.role === "narrator" ? "anything" : "mentions",
 			lastReadSeq: m.lastReadSeq,
-			unread: rt.board.uiUnread(m.name, m.role, m.lastReadSeq),
+			unread: rt.board.uiUnread(m.name, m.role, m.lastReadSeq, m.addressedRead),
 			owed: m.killed || m.role === "coordinator" ? [] : wakePendingFor(rt, m).map(p => p.seq),
 			posts: posts.length,
 			lastPostSeq: last,

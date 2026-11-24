@@ -115,6 +115,10 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 		current(ctx)?.onMainMessageEnd(e.message as unknown as HostMessage);
 	});
 
+	pi.on("auto_retry_end", (e, ctx) => {
+		current(ctx)?.onMainAutoRetryEnd(e.success);
+	});
+
 	pi.on("tool_execution_end", (e, ctx) => {
 		current(ctx)?.onMainToolEnd(e.toolCallId, e.isError === true);
 	});
@@ -176,6 +180,8 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 		// A pre-swarm self switch belonged to the session we left.
 		b.pendingSelfSwitch = undefined;
 		const sid = b.sessionId;
+		// Resuming the same session file can replace its transcript without changing the id.
+		registry.get(sid)?.onMainTranscriptReset();
 		for (const rt of registry.all()) {
 			if (rt.sid !== sid) {
 				commands.onShutdown(rt);

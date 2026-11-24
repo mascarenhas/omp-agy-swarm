@@ -1,4 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { encodeTspJson, encodeTspMessage, splitTspMessage } from "@oh-my-pi/pi-tui/native/encode";
 import type { TspFrame, TspNode } from "@oh-my-pi/pi-wire";
 import type { Script } from "../e2e/mock-llm/server.ts";
@@ -235,3 +237,37 @@ test("a reduced native peer still has a semantic screen and keyboard navigation"
 	p.write("q");
 	await p.waitForNative(doc => !!editor(doc), "reduced inline compositor restored");
 }, 60_000);
+
+test("compiled TUI coordinator receives a worker mention at its next foreground tool boundary", async () => {
+	const worker = Promise.withResolvers<void>();
+	releaseWorker = worker.resolve;
+	const question = "TUI-MIDTURN-QUESTION-6097";
+	const response = "TUI-MIDTURN-ANSWER-4bad";
+	const p = tty = new PtyOmp({
+		coord: { rules: [
+			{ when: "^user:.*tui-midturn-start$", reply: { tools: [{ name: "swarm", args: { action: "add", name: "worker", model: "mock/worker-a", brief: "Ask me the question." } }] } },
+			{ when: '"added"', reply: { tools: [{ name: "bash", args: {
+				command: "touch coordinator-busy; i=0; while [ ! -f coordinator-release ] && [ \"$i\" -lt 600 ]; do sleep .02; i=$((i+1)); done; test -f coordinator-release && echo COORDINATOR-TOOL-COMPLETE",
+				async: false, timeout: 16,
+			} }] } },
+			{ when: question, reply: { text: response } },
+		], default: { text: "Missing mid-turn question." } },
+		"worker-a": { rules: [
+			{ when: "You are `worker`", reply: { wait: worker.promise, tools: [{ name: "post_message", args: { text: `@coordinator ${question}` } }] } },
+		], default: { text: "Question posted." } },
+	}, 100, 32, {}, { apc: 1024 });
+	await p.waitForNative(doc => !!editor(doc), "interactive editor ready");
+	await submit(p, "tui-midturn-start");
+	const work = join(p.root, "work");
+	await p.waitFor(() => existsSync(join(work, "coordinator-busy")), 10_000, "coordinator inside bash");
+	worker.resolve();
+	const board = join(p.swarm, "board.jsonl");
+	await p.waitFor(() => existsSync(board) && readFileSync(board, "utf8").includes(question), 10_000, "worker posted while coordinator is busy");
+	const mainRequests = () => p.mock.requests("coord").filter(r => r.rule !== -3 && !r.last.startsWith("user: <composer-prediction>"));
+	expect(mainRequests().map(r => r.rule)).toEqual([0, 1]);
+	writeFileSync(join(work, "coordinator-release"), "");
+	await p.waitForNative(doc => includes(region(doc, "main"), response), "coordinator answered the same run's aside");
+	expect(mainRequests().map(r => r.rule)).toEqual([0, 1, 2]);
+	expect(mainRequests()[2]?.last).toContain(question);
+	expect(mainRequests()[2]?.roles).toContain("tool");
+}, 40_000);

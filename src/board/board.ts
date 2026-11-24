@@ -242,6 +242,7 @@ export class Board {
 		let bytes = 0;
 		let more = false;
 		const match = (msg: BoardMessage): boolean => {
+			if (opts.addressedOnly) return !msg.control && msg.ring.mentions.has(name);
 			if (opts.channel === undefined) return this.visibleTo(name, role, msg);
 			if (opts.channel === "*") return true;
 			const ch = typeof msg.channel === "string" && msg.channel ? msg.channel : MAIN;
@@ -249,7 +250,7 @@ export class Board {
 		};
 		for (let i = Math.max(0, since); i < this.messages.length; i++) {
 			const msg = this.messages[i];
-			if (!msg || !match(msg)) continue;
+			if (!msg || opts.exclude?.has(msg.seq) || opts.excludeQueued?.includes(msg.seq) || !match(msg)) continue;
 			const b = utf8Bytes(msg.text);
 			if (out.length > 0 && (out.length >= opts.limit || bytes + b > opts.maxBytes)) {
 				more = true;
@@ -263,35 +264,38 @@ export class Board {
 	}
 
 	/** Posts after `floor` that ring `name` under `mode` (decided at each post). */
-	wakePending(name: string, mode: WakeMode, floor: number): BoardMessage[] {
+	wakePending(name: string, mode: WakeMode, floor: number, exclude?: ReadonlySet<number>, limit = Infinity): BoardMessage[] {
 		const out: BoardMessage[] = [];
 		if (mode === "working") return out;
 		for (let i = Math.max(0, floor); i < this.messages.length; i++) {
 			const msg = this.messages[i];
-			if (!msg || msg.control || msg.agent === name) continue;
+			if (!msg || msg.control || msg.agent === name || exclude?.has(msg.seq)) continue;
 			const ring = mode === "mentions" ? msg.ring.mentions : msg.ring.sees;
-			if (ring.has(name)) out.push(msg);
+			if (ring.has(name)) {
+				out.push(msg);
+				if (out.length >= limit) break;
+			}
 		}
 		return out;
 	}
 
 	/** Posts visible to the coordinator after `floor`, not control, not its own ("a result went to nobody"). */
-	gateUnread(floor: number): BoardMessage[] {
+	gateUnread(floor: number, exclude?: ReadonlySet<number>): BoardMessage[] {
 		const out: BoardMessage[] = [];
 		for (let i = Math.max(0, floor); i < this.messages.length; i++) {
 			const msg = this.messages[i];
-			if (!msg || msg.control || msg.agent === "coordinator") continue;
+			if (!msg || msg.control || msg.agent === "coordinator" || exclude?.has(msg.seq)) continue;
 			if (this.visibleTo("coordinator", "coordinator", msg)) out.push(msg);
 		}
 		return out;
 	}
 
 	/** visibleUnread exactly as upstream: visible, not control, own posts included, seq > lastRead. */
-	uiUnread(name: string, role: Role, lastRead: number): number {
+	uiUnread(name: string, role: Role, lastRead: number, exclude?: ReadonlySet<number>): number {
 		let n = 0;
 		for (let i = Math.max(0, lastRead); i < this.messages.length; i++) {
 			const msg = this.messages[i];
-			if (!msg || msg.control) continue;
+			if (!msg || msg.control || exclude?.has(msg.seq)) continue;
 			if (this.visibleTo(name, role, msg)) n++;
 		}
 		return n;

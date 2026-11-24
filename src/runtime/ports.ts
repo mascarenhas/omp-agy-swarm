@@ -83,6 +83,7 @@ export type WorkerEvent =
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args?: unknown }
 	| { type: "tool_execution_end"; toolCallId: string; toolName: string; isError?: boolean; result?: unknown }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; errorMessage: string }
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| {
 			type: "auto_compaction_end";
 			result: unknown;
@@ -250,6 +251,7 @@ export interface CoordinatorPort {
 	hasAuth(model: ModelInfo): boolean;
 	setModel(model: ModelInfo): Promise<boolean>;
 	setThinkingLevel(effort: string): void;
+	isStreaming(): boolean;
 	sendWake(message: CustomWakeMessage): void;
 	activeTools(): string[];
 	branchEntries(): readonly TranscriptEntry[];

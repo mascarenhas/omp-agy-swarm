@@ -65,6 +65,7 @@ export class ScriptedSession implements WorkerSession {
 	readonly #factory: ScriptedFactory;
 	readonly entries: TranscriptEntry[] = [];
 	#run: { ac: AbortController; done: Promise<void> } | undefined;
+	#asides: HostMessage[] = [];
 	#runOpen = false;
 	get isRunActive(): boolean {
 		return this.#runOpen;
@@ -74,6 +75,7 @@ export class ScriptedSession implements WorkerSession {
 		return !!this.wakeSources;
 	}
 	#last: HostMessage | undefined;
+	#disposing = false;
 	disposed = false;
 	/** Set by a test (or a brain) to emulate the host cost gate refusing a request. */
 	costCapRefusal: { readonly message: string } | undefined;
@@ -130,6 +132,25 @@ export class ScriptedSession implements WorkerSession {
 		};
 	}
 
+	#receive(message: HostMessage): void {
+		this.emit({ type: "message_start", message });
+		this.emit({ type: "message_end", message });
+		this.#entry(message);
+	}
+
+	#drainAsides(): string | undefined {
+		const queued = this.#asides;
+		this.#asides = [];
+		for (const message of queued) this.#receive(message);
+		return queued.length ? String(queued[queued.length - 1]!.content) : undefined;
+	}
+
+	#beginDispose(): void {
+		if (this.#disposing) return;
+		this.#disposing = true;
+		this.#drainAsides();
+	}
+
 	async #startRun(input: string, receipt: HostMessage): Promise<void> {
 		const ac = new AbortController();
 		const { promise, resolve } = Promise.withResolvers<void>();
@@ -140,15 +161,13 @@ export class ScriptedSession implements WorkerSession {
 			for (const listener of this.#runListeners) listener("running");
 		}
 		this.emit({ type: "agent_start" });
-		this.emit({ type: "message_start", message: receipt });
-		this.emit({ type: "message_end", message: receipt });
-		this.#entry(receipt);
+		this.#receive(receipt);
 		const brain = this.#factory.brains.get(this.name) ?? this.#factory.defaultBrain;
-		let stopReason = "stop";
-		let errorMessage: string | undefined;
+		let turnInput = input;
+		let stopReason: string;
 		const ctx: TurnCtx = {
 			name: this.name,
-			input,
+			get input() { return turnInput; },
 			signal: ac.signal,
 			session: this,
 			call: (tool, params = {}) => ctx.batch([[tool, params]]).then(r => r[0] as ToolOut),
@@ -180,37 +199,52 @@ export class ScriptedSession implements WorkerSession {
 				);
 				this.emit({ type: "turn_end" });
 				if (ac.signal.aborted) throw new RunFailed("aborted");
+				this.#drainAsides();
 				return results;
 			},
 			fail: (message: string): never => {
 				throw new RunFailed(`error:${message}`);
 			},
 		};
-		try {
-			await brain(ctx);
-			if (ac.signal.aborted) stopReason = "aborted";
-		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			if (ac.signal.aborted || msg === "aborted") stopReason = "aborted";
-			else {
-				stopReason = "error";
-				errorMessage = msg.startsWith("error:") ? msg.slice(6) : msg;
+		for (;;) {
+			stopReason = "stop";
+			let errorMessage: string | undefined;
+			try {
+				await brain(ctx);
+				if (ac.signal.aborted) stopReason = "aborted";
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				if (ac.signal.aborted || msg === "aborted") stopReason = "aborted";
+				else {
+					stopReason = "error";
+					errorMessage = msg.startsWith("error:") ? msg.slice(6) : msg;
+				}
 			}
+			this.#last = {
+				role: "assistant",
+				content: [{ type: "text", text: "turn end" }],
+				stopReason,
+				errorMessage,
+				provider: this.model?.provider,
+				model: this.model?.id,
+				usage: this.#factory.usage.get(this.name) ?? { totalTokens: 5, cost: { total: 0.0005 } },
+			};
+			this.emit({ type: "message_end", message: this.#last });
+			this.#entry(this.#last);
+			this.emit({ type: "turn_end" });
+			// A stop-boundary aside buys another model turn in the same loop.
+			const aside = stopReason === "stop" && !this.#disposing ? this.#drainAsides() : undefined;
+			if (aside === undefined) break;
+			turnInput = aside;
 		}
-		this.#last = {
-			role: "assistant",
-			content: [{ type: "text", text: "turn end" }],
-			stopReason,
-			errorMessage,
-			provider: this.model?.provider,
-			model: this.model?.id,
-			usage: this.#factory.usage.get(this.name) ?? { totalTokens: 5, cost: { total: 0.0005 } },
-		};
-		this.emit({ type: "message_end", message: this.#last });
-		this.#entry(this.#last);
-		this.emit({ type: "turn_end" });
 		this.#run = undefined;
-		if (stopReason !== "aborted" && this.wakeSources) this.emit({ type: "agent_pause", yielded: true, awaiting: true });
+		// The host announces the end of an errored loop as non-final before a stranded
+		// aside resumes it. This is a new agent_start in the same native run.
+		const stranded = this.#disposing ? undefined : this.#asides.shift();
+		if (stranded) {
+			this.emit({ type: "agent_pause", yielded: true, awaiting: false });
+			void this.#startRun(String(stranded.content), stranded);
+		} else if (stopReason !== "aborted" && this.wakeSources) this.emit({ type: "agent_pause", yielded: true, awaiting: true });
 		else this.endRun();
 		resolve();
 	}
@@ -232,6 +266,7 @@ export class ScriptedSession implements WorkerSession {
 	}
 
 	async sendCustomMessage(message: CustomWakeMessage, _options: { deliverAs: "aside" }): Promise<boolean> {
+		if (this.#disposing) return false;
 		const mode = this.#factory.sendMode(this.name);
 		this.#factory.sent.push({ name: this.name, message });
 		if (mode === "reject") throw new Error("send rejected (scripted)");
@@ -239,11 +274,13 @@ export class ScriptedSession implements WorkerSession {
 		if (mode === "hang") return new Promise(() => {});
 		const receipt: HostMessage = { role: "custom", customType: message.customType, content: message.content, details: message.details };
 		if (mode === "fold") {
-			this.emit({ type: "message_end", message: receipt });
-			this.#entry(receipt);
+			this.#receive(receipt);
 			return false;
 		}
-		if (this.#run) return false;
+		if (this.#run) {
+			this.#asides.push(receipt);
+			return false;
+		}
 		await this.#startRun(message.content, receipt);
 		return true;
 	}
@@ -285,6 +322,7 @@ export class ScriptedSession implements WorkerSession {
 	}
 
 	async stop(): Promise<void> {
+		this.#beginDispose();
 		await this.abort();
 		await this.dispose();
 	}
@@ -292,6 +330,7 @@ export class ScriptedSession implements WorkerSession {
 	hostKill(): void {
 		this.teardown.push("hostKill");
 		this.opts.onHostKill(this);
+		this.#beginDispose();
 	}
 
 	async hostRelease(killed: boolean): Promise<void> {
@@ -304,6 +343,7 @@ export class ScriptedSession implements WorkerSession {
 
 	async dispose(): Promise<void> {
 		this.teardown.push("dispose");
+		this.#beginDispose();
 		if (this.#factory.disposeHangs.has(this.name)) return new Promise(() => {});
 		const gate = this.#factory.disposeGates.get(this.name);
 		if (gate) await gate;

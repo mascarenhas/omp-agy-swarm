@@ -2,7 +2,7 @@
 
 import { QUOTA_RE, LIMITS, TIMING } from "../env.ts";
 import { messageText } from "./activity.ts";
-import { acknowledge, reconcile, release, wakePendingFor } from "./delivery.ts";
+import { acknowledge, reconcile, release, settleToolDelivery, wakePendingFor } from "./delivery.ts";
 import { type CycleCause, type Member, roleDefaultMode } from "./member.ts";
 import { startBoundarySwitch } from "./models.ts";
 import type { HostMessage, WorkerEvent } from "./ports.ts";
@@ -41,6 +41,13 @@ export function compactedReminder(m: Member): string {
 /** Worker events (session.subscribe), bound to the generation that created the session. */
 export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: WorkerEvent): void {
 	if (m.gen !== gen || m.killed || rt.closing) return;
+	const msg = (ev.type === "message_start" || ev.type === "message_end") && "message" in ev ? ev.message as HostMessage : undefined;
+	if (msg?.role === "custom" && msg.customType === "swarm-wake") {
+		const d = m.delivery;
+		if (ev.type === "message_end" && d?.kind === "aside" && d.status === "dispatched" && deliveryIdOf(msg) === d.id) acknowledge(rt, m, d);
+		// Inbound board messages are not worker activity (including a stale receipt).
+		return;
+	}
 	m.tracker.touch();
 	m.stuckNotified = false;
 	switch (ev.type) {
@@ -49,17 +56,21 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 			m.postsAtLoopStart = m.stats.posts;
 			// A run's first loop records the cost-cap refusal it starts with (19.0.1 emits agent_start
 			// per model loop; later loops of the same run keep the first record).
-			if (m.runId === m.settledRun) m.costRefusalSeen = m.session?.costCapRefusal;
+			if (m.runId === m.settledRun) {
+				m.costRefusalSeen = m.session?.costCapRefusal;
+				m.runSawError = false;
+			}
 			m.runId++;
 			m.stats.runs++;
 			if (m.phase === "starting" || m.phase === "idle") m.phase = "working";
 			if (m.role === "worker") rt.progress();
 			rt.changed();
+			reconcile(rt, m);
 			return;
 		case "message_end": {
-			const msg = "message" in ev ? (ev.message as HostMessage) : undefined;
 			if (!msg) return;
 			if (msg.role === "assistant") {
+				if (msg.stopReason === "error") m.runSawError = true;
 				m.tracker.onAssistant(msg);
 				rt.changedActivity();
 				return;
@@ -68,7 +79,6 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 			if (!d || d.status !== "dispatched") return;
 			// The prompt's receipt is the user message carrying exactly the text that was sent.
 			if (msg.role === "user" && d.kind === "prompt" && d.text !== undefined && messageText(msg).trim() === d.text.trim()) acknowledge(rt, m, d);
-			else if (msg.role === "custom" && msg.customType === "swarm-wake" && deliveryIdOf(msg) === d.id) acknowledge(rt, m, d);
 			return;
 		}
 		case "tool_execution_start":
@@ -77,11 +87,7 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 			return;
 		case "tool_execution_end": {
 			if (!("toolCallId" in ev)) return;
-			const d = m.delivery;
-			if (d?.kind === "tool" && d.toolCallId === ev.toolCallId) {
-				if ("isError" in ev && ev.isError) release(rt, m, "the tool result was an error");
-				else acknowledge(rt, m, d);
-			}
+			settleToolDelivery(rt, m, ev.toolCallId, "isError" in ev && ev.isError === true);
 			if (m.role === "worker") rt.progress();
 			return;
 		}
@@ -101,7 +107,8 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 				m.failure = null;
 				m.retryToken = false;
 			}
-			if (m.delivery) release(rt, m, "the loop paused before the wake was received");
+			// A paused run can still own an aside queued by the host.
+			if (m.delivery && !m.delivery.addressedSeqs) release(rt, m, "the loop paused before the wake was received");
 			if (m.op?.kind !== "switch" && !m.waiter) {
 				m.phase = "idle";
 				m.wakeMode = roleDefaultMode(m.role);
@@ -125,6 +132,12 @@ export function onWorkerEvent(rt: SwarmRuntime, m: Member, gen: number, ev: Work
 		case "auto_retry_start":
 			if ("attempt" in ev) m.tracker.onRetry(Number(ev.attempt), Number(ev.maxAttempts), String(ev.errorMessage ?? ""));
 			rt.changedActivity();
+			return;
+		case "auto_retry_end":
+			if ("success" in ev && ev.success === true && m.runSawError) {
+				m.runSawError = false;
+				reconcile(rt, m);
+			}
 			return;
 		case "auto_compaction_end":
 			if (compactionDone(ev)) {
@@ -170,6 +183,7 @@ export function settleRun(rt: SwarmRuntime, m: Member, error?: string): void {
 	m.settledRun = runId;
 	if (rt.closing || m.killed) return;
 	m.tracker.onRunEnd();
+	const queuedAside = m.delivery?.addressedSeqs !== undefined;
 	if (m.delivery) release(rt, m, "the run ended before the wake was received");
 	if (m.op?.kind === "switch") return;
 	if (m.role === "worker") rt.progress();
@@ -187,6 +201,10 @@ export function settleRun(rt: SwarmRuntime, m: Member, error?: string): void {
 		m.wakeMode = roleDefaultMode(m.role);
 		m.waitSince = m.lastReadSeq;
 		rt.changed();
+		if (queuedAside) {
+			if (m.pendingSwitch) startBoundarySwitch(rt, m);
+			else reconcile(rt, m);
+		}
 		return;
 	}
 	if (error || last?.stopReason === "error") {

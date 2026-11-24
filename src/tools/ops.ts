@@ -21,6 +21,7 @@ import {
 } from "../env.ts";
 import {
 	type PresentedPage,
+	hasBriefBacklog,
 	pageFloor,
 	presentToolResult,
 	registerReadDelivery,
@@ -779,8 +780,21 @@ export function readBoardOp(ctx: OpsContext, p: ReadParams): ToolResult {
 		sinceNote = since;
 		since = cursor; // never skip an unread post
 	}
-	const page = rt.board.page(caller.name, caller.role, since, { limit, maxBytes: LIMITS.readPage.maxBytes, channel });
-	if (channel === undefined && page.messages.length) registerReadDelivery(rt, caller, ctx.toolCallId, page);
+	const ownView = channel === undefined;
+	const history = ownView && since < cursor;
+	const aside = ownView && caller.delivery?.addressedSeqs ? caller.delivery : undefined;
+	const excludeQueued = !history && aside?.status === "dispatched" ? aside.addressedSeqs : undefined;
+	const page = rt.board.page(caller.name, caller.role, since, {
+		limit, maxBytes: LIMITS.readPage.maxBytes, channel,
+		exclude: ownView && !history ? caller.addressedRead : undefined,
+		excludeQueued,
+	});
+	if (ownView && page.messages.length && !(history && aside)) {
+		// Before dispatch a current read can take over the slot. After dispatch it can only
+		// acknowledge posts not in the host-owned aside.
+		if (aside?.status === "admitted") caller.delivery = undefined;
+		registerReadDelivery(rt, caller, ctx.toolCallId, page);
+	}
 	return ok(
 		{
 			head,
@@ -851,17 +865,19 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 	if (m.pendingSwitch || (isCoord && rt.coordinatorSwitch))
 		return ok({ woke: "switch", note: "Your model switch applies when this turn ends. End your turn." });
 	if (isCoord && rt.outcome?.terminal) return ok({ ...INCOMPLETE_RESULT });
-	if (nudgeDue(rt, m) && m.cycle) {
+	if (!d?.addressedSeqs && nudgeDue(rt, m) && m.cycle) {
 		m.cycle.nudged = true;
 		m.stats.nudges++;
 		return ok({ woke: "nudge", note: nudgeText(m.addedBy) });
 	}
-	const pending = rt.board.wakePending(m.name, mode, pageFloor(m));
-	const quiescentUnread = isCoord && !liveTaskWork(rt).length ? rt.board.gateUnread(pageFloor(m)) : [];
-	if (pending.length || m.notices.length || quiescentUnread.length) {
+	const pending = wakePendingFor(rt, m, mode, 1);
+	const quiescentUnread = isCoord && !liveTaskWork(rt).length ? rt.board.gateUnread(pageFloor(m), m.addressedRead) : [];
+	const hasPosts = pending.length > 0 || quiescentUnread.length > 0 || hasBriefBacklog(m);
+	if (hasPosts || m.notices.length) {
 		m.lastParkBlockedSeq = pending[0]?.seq ?? m.lastParkBlockedSeq;
-		const presented = presentToolResult(rt, m, ctx.toolCallId, pending.length || quiescentUnread.length ? "post" : "notice");
-		return waitPayload(rt, m, pending.length || quiescentUnread.length ? "post" : "notice", presented, {
+		const reason = hasPosts ? "post" : "notice";
+		const presented = presentToolResult(rt, m, ctx.toolCallId, reason);
+		return waitPayload(rt, m, reason, presented, {
 			waited_seconds: 0,
 			cursor_note: cursorNote,
 			note: !pending.length && quiescentUnread.length ? QUIESCENT_NOTE : undefined,

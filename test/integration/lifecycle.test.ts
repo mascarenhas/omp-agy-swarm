@@ -143,6 +143,7 @@ describe("add", () => {
 		await until(() => inputs.length >= 2, 1000, "the rest delivered");
 		expect(inputs[1]).toContain("note 21");
 		expect(inputs[1]).toContain("note 25");
+		expect(inputs[1]).not.toContain("@late do it");
 		await until(() => m.lastReadSeq === m.briefSeq, 1000, "caught up");
 	});
 

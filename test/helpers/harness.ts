@@ -73,6 +73,7 @@ export class FakeBinding implements CoordinatorPort {
 	models_: ModelInfo[] = [...MODELS];
 	wakes: CustomWakeMessage[] = [];
 	notes: string[] = [];
+	streaming = false;
 	pendingSelfSwitch: PendingSwitch | undefined;
 	setModelResult: boolean | "throw" | "hang" = true;
 	/** When set, setModel completes only after this promise resolves (a slow host switch). */
@@ -122,6 +123,9 @@ export class FakeBinding implements CoordinatorPort {
 	}
 	setThinkingLevel(effort: string): void {
 		this.effort = effort;
+	}
+	isStreaming(): boolean {
+		return this.streaming;
 	}
 	sendWake(message: CustomWakeMessage): void {
 		this.wakes.push(message);
