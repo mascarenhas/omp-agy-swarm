@@ -307,14 +307,13 @@ describe("cycles and nudges (I5)", () => {
 });
 
 describe("failures (I6)", () => {
-	test("one report per failed run; no automatic retry of old debt; a post by name retries", async () => {
+	test("reports settled failures once; a queued aside can resume a failed loop, but only a new mention retries after the cap", async () => {
 		h = new Harness();
 		let runs = 0;
 		const posted = Promise.withResolvers<void>();
 		h.factory.brains.set("f", async t => {
 			runs++;
 			if (runs === 2) {
-				// A qualifying post arrives while this run fails: the failure path allows one retry.
 				await h.post("@f arrived during the failing run");
 				posted.resolve();
 			}
@@ -329,13 +328,15 @@ describe("failures (I6)", () => {
 		expect(runs).toBe(1);
 		await h.post("@f try again");
 		await posted.promise;
-		await until(() => m.failure?.count === 2, 1000, "second failure");
+		await until(() => m.failure?.count === 2, 1000, "second settled failure");
 		await settle(40);
-		// count reached 2: the post that arrived during the failed run is not retried automatically.
-		expect(runs).toBe(2);
+		// One already-queued aside drives a native loop; there is no swarm-initiated retry.
+		expect(runs).toBe(3);
+		expect(h.factory.sent.filter(s => s.name === "f")).toHaveLength(2);
+		expect(h.rt.memberStatus(m).owed).toEqual([]);
 		expect(h.rt.coordinator.notices.filter(n => n.kind === "failure").length).toBe(2);
 		await h.post("@f once more");
-		await until(() => runs === 3, 1000, "explicit retry by name");
+		await until(() => runs === 4, 1000, "explicit retry by name");
 	});
 
 	test("compaction reminder rides the next wake only after a completed compaction (I12)", async () => {

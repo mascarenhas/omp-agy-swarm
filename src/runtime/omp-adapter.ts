@@ -541,6 +541,9 @@ class WorkerRegistration {
 				} finally {
 					this.#jobs?.cancelAll({ ownerId: ref.id });
 					this.#quiesce(true);
+					// The terminal registry event fences swarm tools before the host awaits
+					// tombstone persistence. Start native suppression in that same fence.
+					this.#raw?.beginDispose();
 				}
 			} else if (this.#raw && ((type === "removed" && ref === this.#ref) || (type === "registered" && ref !== this.#ref))) {
 				// Before attach, SDK's own failed initialization also emits "removed".
@@ -729,10 +732,10 @@ class WorkerRegistration {
 		const ref = this.#ref;
 		const stop = async (): Promise<void> => {
 			if (kill && raw) {
-				// Do not keep the worker focusable while abort settles. Normally
-				// abort completes before disposal (as in Hub and Tray), but a
-				// stuck abort must not prevent disposal from starting.
+				// Fence the native aside queue, too: abort alone can start a fresh
+				// loop for a stranded aside before disposal begins.
 				if (ref) this.#registry.unregister(this.id, ref);
+				raw.beginDispose();
 				this.#jobs?.cancelAll({ ownerId: this.id });
 				const abort = raw.abort().then(() => ({ ok: true as const }), err => ({ ok: false as const, err }));
 				await raceTimeout(abort, TIMING.killStopMs / 2, undefined, { unref: true });

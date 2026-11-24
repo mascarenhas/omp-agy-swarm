@@ -65,7 +65,7 @@ export interface Owed {
 export function owed(rt: SwarmRuntime, floor = 0): Owed {
 	const c = rt.coordinator;
 	const from = Math.max(pageFloor(c), floor);
-	return { posts: rt.board.gateUnread(from).map(p => p.seq), notices: c.notices.length };
+	return { posts: rt.board.gateUnread(from, c.addressedRead).map(p => p.seq), notices: c.notices.length };
 }
 
 function isOwedEmpty(o: Owed): boolean {
@@ -161,7 +161,7 @@ function budgetExceeded(rt: SwarmRuntime): boolean {
 /** Reserves a gate delivery (page from the coordinator's cursor plus notices). */
 function reserveGate(rt: SwarmRuntime): string {
 	const c = rt.coordinator;
-	const page = rt.board.page("coordinator", "coordinator", pageFloor(c), LIMITS.wakePage);
+	const page = rt.board.page("coordinator", "coordinator", pageFloor(c), { ...LIMITS.wakePage, exclude: c.addressedRead });
 	const notices = c.notices.slice();
 	const noticeTexts = notices.map(n => n.text);
 	if (c.droppedNotices > 0) noticeTexts.unshift(`${c.droppedNotices} earlier notices dropped`);

@@ -5,8 +5,9 @@ import { join } from "node:path";
 import { type Ctx, metrics, roster } from "../e2e/check.ts";
 import { MockLlm, type Script } from "../e2e/mock-llm/server.ts";
 import { REPO, runOmp, type RunSpec, tool } from "../e2e/scenario.ts";
+import { until } from "../helpers/harness.ts";
 
-async function probe(script: Script, run: Partial<RunSpec> = {}, prepare?: (cwd: string) => void, config = "") {
+async function probe(script: Script, run: Partial<RunSpec> = {}, prepare?: (cwd: string) => void, config = "", drive?: (c: Ctx) => Promise<void>) {
 	const root = mkdtempSync(join(tmpdir(), "omp-native-jobs-"));
 	const log = join(root, "probe.log");
 	const mock = new MockLlm(script);
@@ -17,7 +18,7 @@ async function probe(script: Script, run: Partial<RunSpec> = {}, prepare?: (cwd:
 		writeFileSync(join(c.agent, "config.yml"), `async:\n  printWake: false\n${config}`);
 		prepare?.(c.repo);
 		mock.start();
-		const result = await runOmp(c, {
+		const running = runOmp(c, {
 			prompt: "start-native-jobs",
 			pluginArgs: ["--no-extensions", "-e", join(REPO, "test/fixtures/jobs-probe.ts"), "-e", REPO],
 			args: ["--max-time", "25", "--approval-mode", "yolo", ...(run.args ?? [])],
@@ -27,6 +28,11 @@ async function probe(script: Script, run: Partial<RunSpec> = {}, prepare?: (cwd:
 				XDG_STATE_HOME: join(home, "state"), XDG_CACHE_HOME: join(home, "cache"), ...run.env,
 			},
 		}, false);
+		try { await drive?.(c); } catch (err) {
+			await running;
+			throw err;
+		}
+		const result = await running;
 		const rows = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>) : [];
 		const diagnostic = JSON.stringify({ result, rows, requests: mock.requests().map(r => [r.model, r.rule, r.last]) });
 		expect(result.code, diagnostic).toBe(0);
@@ -39,6 +45,104 @@ async function probe(script: Script, run: Partial<RunSpec> = {}, prepare?: (cwd:
 }
 
 const finish = tool("swarm", { action: "finish", summary: "Verified." });
+
+async function expectBusyWorkerAside(retry: boolean): Promise<void> {
+	const question = "MIDTURN-QUESTION-bb73f1";
+	const reply = "MIDTURN-REPLY-430bfc";
+	const { rows, outcome, requests, diagnostic } = await probe({
+		coord: { rules: [
+			{ when: "^user:.*start-native-jobs$", reply: { tools: [tool("swarm", { action: "add", name: "worker", brief: "Start the held command.", model: "mock/worker-a" })] } },
+			{ when: '"added"', reply: { tools: [tool("jobs_probe", { action: "await_busy" })] } },
+			{ when: "^tool: JOBS-PROBE-await_busy", reply: { tools: [tool("post_message", { text: `@worker ${question}` })] } },
+			{ when: '^tool:\\s*\\{"seq":2,', times: 1, reply: { tools: [tool("jobs_probe", { action: "release_busy" })] } },
+			{ when: '"completion":"accepted"', reply: { text: "Mid-turn reply verified" } },
+			{ when: reply, whenNot: "Cannot finish:", reply: { tools: [finish] } },
+			{ when: "^tool:", reply: { tools: [tool("swarm_wait")] } },
+		] },
+		"worker-a": { rules: [
+			{ when: "You are `worker`", times: retry ? 1 : 0, reply: { status: 400, text: "overloaded_error: Overloaded" } },
+			{ when: "You are `worker`", reply: { tools: [tool("bash", {
+				command: "touch mid-turn-busy; i=0; while [ ! -f mid-turn-release ] && [ \"$i\" -lt 600 ]; do sleep .02; i=$((i+1)); done; test -f mid-turn-release && echo MIDTURN-TOOL-DONE",
+				async: false, timeout: 16,
+			})] } },
+			{ when: question, times: 1, reply: { tools: [tool("post_message", { text: `@coordinator [done] ${reply}` })] } },
+		], default: { text: "End the same run." } },
+	}, { env: { OMP_SWARM_WORKER_TOOLS: "read,write,bash" } }, undefined, retry ? "retry:\n  enabled: true\n  baseDelayMs: 50\n" : "");
+	expect(rows.filter(r => String(r.stage).startsWith("busy-")).map(r => r.stage), diagnostic).toEqual([
+		"busy-tool-running", "busy-tool-released", "busy-tool-ended", "busy-aside-received", "busy-reply-posted", "busy-worker-ended",
+	]);
+	expect(rows.find(r => r.stage === "busy-aside-received"), diagnostic).toMatchObject({ text: expect.stringContaining(question) });
+	expect(rows.find(r => r.stage === "busy-tool-ended"), diagnostic).toMatchObject({ isError: false });
+	expect(rows.find(r => r.stage === "busy-reply-posted"), diagnostic).toMatchObject({ isError: false });
+	const workerRequests = requests.filter(r => r.model === "worker-a" && r.rule !== -3);
+	if (retry) expect(workerRequests.slice(0, 3).map(r => r.rule), diagnostic).toEqual([0, 1, 2]);
+	expect(workerRequests[retry ? 2 : 1]?.last, diagnostic).toContain(question);
+	expect(outcome, diagnostic).toBe("complete");
+}
+
+test("compiled worker receives and answers an aside at the next foreground tool boundary in the same run", () => expectBusyWorkerAside(false), 60_000);
+test("compiled worker receives a mid-turn aside after native auto-retry succeeds", () => expectBusyWorkerAside(true), 60_000);
+
+test("compiled worker handles a stop-boundary aside in its original loop", async () => {
+	const final = Promise.withResolvers<void>();
+	const question = "STOP-BOUNDARY-QUESTION-a137";
+	const reply = "STOP-BOUNDARY-REPLY-98d4";
+	const { rows, outcome, requests, diagnostic } = await probe({
+		coord: { rules: [
+			{ when: "^user:.*start-native-jobs$", reply: { tools: [tool("swarm", { action: "add", name: "worker", brief: "Do your work and end.", model: "mock/worker-a" })] } },
+			{ when: '"added"', reply: { tools: [tool("jobs_probe", { action: "await_busy" })] } },
+			{ when: "^tool: JOBS-PROBE-await_busy", reply: { tools: [tool("bash", {
+				command: "i=0; while [ ! -f worker-final-request ] && [ \"$i\" -lt 500 ]; do sleep .02; i=$((i+1)); done; test -f worker-final-request && echo WORKER-READY-TO-END",
+				async: false, timeout: 12,
+			})] } },
+			{ when: "WORKER-READY-TO-END", reply: { tools: [tool("post_message", { text: `@worker ${question}` })] } },
+			{ when: '^tool:\\s*\\{"seq":2,', times: 1, reply: { tools: [tool("jobs_probe", { action: "release_busy" })] } },
+			{ when: '"completion":"accepted"', reply: { text: "Verified" } },
+			{ when: reply, whenNot: "Cannot finish:", reply: { tools: [finish] } },
+			{ when: "^tool:", reply: { tools: [tool("swarm_wait")] } },
+		] },
+		"worker-a": { rules: [
+			{ when: "You are `worker`", reply: { tools: [tool("bash", { command: "touch mid-turn-busy; echo WORKER-WORK-DONE", async: false })] } },
+			{ when: "WORKER-WORK-DONE", times: 1, reply: { text: "I am done with my work.", wait: final.promise } },
+			{ when: question, times: 1, reply: { tools: [tool("post_message", { text: `@coordinator [done] ${reply}` })] } },
+		], default: { text: "Now I am done." } },
+	}, { env: { OMP_SWARM_WORKER_TOOLS: "read,bash" } }, undefined, "", async c => {
+		try {
+			await until(() => c.mock.requests("worker-a").some(r => r.rule === 1), 15_000, "worker final request");
+			writeFileSync(join(c.repo, "worker-final-request"), "");
+			await until(() => existsSync(join(c.repo, "mid-turn-release")), 10_000, "coordinator posted the question");
+		} finally { final.resolve(); }
+	});
+	const workerRequests = requests.filter(r => r.model === "worker-a" && r.rule !== -3);
+	expect(workerRequests.slice(0, 3).map(r => r.rule), diagnostic).toEqual([0, 1, 2]);
+	expect(rows.filter(r => /^busy-(?:aside-received|reply-posted|worker-)/.test(String(r.stage))).map(r => r.stage), diagnostic)
+		.toEqual(["busy-aside-received", "busy-reply-posted", "busy-worker-ended"]);
+	expect(outcome, diagnostic).toBe("complete");
+}, 60_000);
+
+test("compiled swarm kill fences the native aside before abort can restart the worker", async () => {
+	const question = "KILL-QUEUED-ASIDE-a930";
+	const { rows, outcome, requests, diagnostic, roster: members } = await probe({
+		coord: { rules: [
+			{ when: "^user:.*start-native-jobs$", reply: { tools: [tool("swarm", { action: "add", name: "worker", brief: "Start the held command.", model: "mock/worker-a" })] } },
+			{ when: '"added"', reply: { tools: [tool("jobs_probe", { action: "await_busy" })] } },
+			{ when: "^tool: JOBS-PROBE-await_busy", reply: { tools: [tool("post_message", { text: `@worker ${question}` })] } },
+			{ when: '^tool:\\s*\\{"seq":2,', times: 1, reply: { tools: [tool("swarm", { action: "kill", name: "worker" })] } },
+			{ when: '"completion":"accepted"', reply: { text: "Verified" } },
+			{ when: "^tool:", reply: { tools: [finish] } },
+		] },
+		"worker-a": { rules: [
+			{ when: "You are `worker`", reply: { tools: [tool("bash", { command: "touch mid-turn-busy; sleep 15", async: false, timeout: 18 })] } },
+		], default: { text: "This unexpected turn must never run." } },
+	}, { env: { OMP_SWARM_WORKER_TOOLS: "read,bash" } });
+	expect(rows.find(r => r.stage === "busy-tool-running"), diagnostic).toBeDefined();
+	// Host disposal may record the aside, but never wakes another loop with it.
+	expect(rows.find(r => r.stage === "busy-aside-received"), diagnostic).toMatchObject({ text: expect.stringContaining(question) });
+	expect(rows.filter(r => r.stage === "busy-worker-restarted" || r.stage === "busy-reply-posted"), diagnostic).toEqual([]);
+	expect(requests.filter(r => r.model === "worker-a" && r.rule !== -3).map(r => r.rule), diagnostic).toEqual([0]);
+	expect(members.worker, diagnostic).toMatchObject({ killed: true, last_read_seq: 1 });
+	expect(outcome, diagnostic).toBe("complete");
+}, 60_000);
 
 for (const mode of ["print", "json", "cli-wait"] as const) {
 	test(`compiled ${mode}: a headless swarm keeps Main jobs waking after finish, then restores its setting`, async () => {

@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgentRegistry, AgentSession, type ExtensionAPI, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -54,7 +54,7 @@ export default function jobsProbe(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => { offRegistry(); await Promise.resolve(); observe("shutdown"); });
 	pi.registerTool({
 		name: "jobs_probe", label: "Jobs probe", description: "Record host job and settings evidence in compiled integration tests.",
-		parameters: z.object({ action: z.enum(["hold", "release_worker", "running", "native_stop", "one_gone", "both_gone"]) }),
+		parameters: z.object({ action: z.enum(["hold", "release_worker", "await_busy", "release_busy", "running", "native_stop", "one_gone", "both_gone"]) }),
 		async execute(_id, { action }, _signal, _onUpdate, ctx) {
 			const main = registry.get(MAIN_AGENT_ID)?.session;
 			if (!(main instanceof AgentSession) || !main.asyncJobManager) throw new Error("Main has no native manager");
@@ -96,6 +96,27 @@ export default function jobsProbe(pi: ExtensionAPI): void {
 						observe("worker-woke-job");
 				});
 				writeFileSync(join(ctx.cwd, "release-job"), "LATCH-RELEASED-WORKER-NONCE-f43d2b");
+			} else if (action === "await_busy") {
+				const marker = join(ctx.cwd, "mid-turn-busy");
+				const deadline = Date.now() + 8_000;
+				while (!existsSync(marker) && Date.now() < deadline) await Bun.sleep(10);
+				const raw = registry.get("swarm~worker")?.session;
+				if (!existsSync(marker) || !(raw instanceof AgentSession) || !raw.isStreaming)
+					throw new Error("worker never entered its foreground tool");
+				observe("busy-tool-running");
+				raw.subscribe(event => {
+					if (event.type === "agent_start") observe("busy-worker-restarted");
+					if (event.type === "agent_end") observe("busy-worker-ended");
+					if (event.type === "tool_execution_end" && event.toolName === "bash")
+						observe("busy-tool-ended", { isError: event.isError });
+					if (event.type === "message_end" && event.message.role === "custom" && event.message.customType === "swarm-wake")
+						observe("busy-aside-received", { text: event.message.content });
+					if (event.type === "tool_execution_end" && event.toolName === "post_message")
+						observe("busy-reply-posted", { isError: event.isError });
+				});
+			} else if (action === "release_busy") {
+				observe("busy-tool-released");
+				writeFileSync(join(ctx.cwd, "mid-turn-release"), "release");
 			} else if (action === "running") {
 				const [a, b] = ["alpha", "beta"].map(name => registry.get(`swarm~${name}`)?.session);
 				if (!(a instanceof AgentSession) || !(b instanceof AgentSession) || !a.asyncJobManager) throw new Error("workers have no manager");

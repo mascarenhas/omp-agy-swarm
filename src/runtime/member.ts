@@ -62,6 +62,11 @@ export interface Delivery {
 	readonly gen: number;
 	readonly kind: DeliveryKind;
 	status: "admitted" | "dispatched";
+	/** Present only for a streaming aside; receipt covers these posts, not the gaps between them. */
+	addressedSeqs?: number[];
+	/** Explicit read while a wake owns the slot. Its page omits the queued post sequence numbers. */
+	duringAsideRead?: Delivery;
+	readSeqs?: number[];
 	since: number;
 	through: number;
 	noticeIds: number[];
@@ -138,6 +143,7 @@ export class Member {
 	waitUntil: number | null = null;
 	lastPark: MemberRecord["last_park"] = null;
 	lastReadSeq = 0;
+	addressedRead: Set<number> | undefined;
 	/** Posts at or below this seq were explicitly abandoned and never wake the member again. */
 	wakeFloor = 0;
 	lastNudgedSeq = 0;
@@ -175,6 +181,8 @@ export class Member {
 	runId = 0;
 	postsAtLoopStart = 0;
 	settledRun = 0;
+	/** An assistant error in any loop of this native run fences further pushed asides. */
+	runSawError = false;
 	/** The session's cost-cap refusal when the current run started (a newer one ends the run as a cost failure). */
 	costRefusalSeen: unknown;
 	nudgePending = false;
@@ -251,6 +259,25 @@ export class Member {
 		}
 	}
 
+	restoreReadState(rec: MemberRecord): void {
+		this.lastReadSeq = Number(rec.last_read_seq) || 0;
+		this.wakeFloor = Number(rec.wake_floor) || 0;
+		if (Array.isArray(rec.addressed_read_seqs)) {
+			const floor = Math.max(this.lastReadSeq, this.wakeFloor);
+			for (const seq of rec.addressed_read_seqs) {
+				if (Number.isSafeInteger(seq) && seq > floor) (this.addressedRead ??= new Set()).add(seq);
+			}
+		}
+	}
+
+	pruneAddressedRead(ceiling = Infinity): void {
+		const seen = this.addressedRead;
+		if (!seen) return;
+		const floor = Math.max(this.lastReadSeq, this.wakeFloor);
+		for (const seq of seen) if (seq <= floor || seq > ceiling) seen.delete(seq);
+		if (!seen.size) this.addressedRead = undefined;
+	}
+
 	toRecord(): MemberRecord {
 		const r: MemberRecord = {
 			role: this.role,
@@ -287,6 +314,7 @@ export class Member {
 		}
 		r.stats = { steps: this.stats.steps, tokens: this.stats.tokens, cost: this.stats.cost };
 		if (this.wakeFloor > 0) r.wake_floor = this.wakeFloor;
+		if (this.addressedRead) r.addressed_read_seqs = Array.from(this.addressedRead).sort((a, b) => a - b);
 		if (this.addedSeq > 0) r.added_seq = this.addedSeq;
 		if (this.killedSeq !== undefined) r.killed_seq = this.killedSeq;
 		return r;
@@ -316,8 +344,7 @@ export function memberFromRecord(name: string, rec: MemberRecord): Member {
 	m.briefPresented = rec.brief_presented === true;
 	m.channels = Array.isArray(rec.channels) ? rec.channels : null;
 	m.sessionFile = typeof rec.session_file === "string" ? rec.session_file : null;
-	m.lastReadSeq = Number(rec.last_read_seq) || 0;
-	m.wakeFloor = Number(rec.wake_floor) || 0;
+	m.restoreReadState(rec);
 	m.lastNudgedSeq = Number(rec.last_nudged_seq) || 0;
 	m.lastParkBlockedSeq = Number(rec.last_park_blocked_seq) || 0;
 	m.killed = rec.killed === true;

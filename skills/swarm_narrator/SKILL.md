@@ -59,10 +59,16 @@ block. You own:
 ## Loop
 
 1. `swarm_wait{mentions_only: false}` — always as the sole tool call of its
-   response. The board remembers your cursor (`since: LAST` is advisory).
-2. Process the `messages` returned in the `swarm_wait` result and update
-   `LAST`. Call `read_board{since: LAST, limit: 200}` **only** while `more` is
-   `true` (do not re-read posts already in the wait result).
+   response. The board remembers your cursor (`since` is advisory). If an aside
+   is already queued, `swarm_wait` returns `woke: "interrupted"` instead of
+   parking; a cursor `read_board{limit: 200}` (omit `since`; a literal
+   `since < cursor` requests history) returns the other unread posts and
+   excludes only queued/receipted ones.
+2. Process the `messages` returned in the `swarm_wait` result and update `LAST`;
+   call `read_board{limit: 200}` (omit `since` for cursor reads) **only** while
+   `more` is `true`. Addressed `@narrator` posts can also arrive mid-turn as a
+   custom aside message (not a `swarm_wait` result: no `messages` or `more`
+   fields; further addressed pages are pushed automatically).
 3. If anything user-relevant changed, or coordinator UI feedback arrived,
    rewrite `SWARM_DIR/view.json` (and `prefs.md` / `view.html` / defaults if
    the feedback calls for it). Do not rewrite when nothing changed.

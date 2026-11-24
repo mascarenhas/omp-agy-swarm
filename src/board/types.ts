@@ -122,6 +122,8 @@ export interface MemberRecord {
 	wait_until?: number | null;
 	last_park?: { mode: WakeMode; since: number; until: number | null } | null;
 	last_read_seq: number;
+	/** Receipted mid-turn posts above the contiguous read cursor. */
+	addressed_read_seqs?: number[];
 	wake_floor?: number;
 	last_nudged_seq: number;
 	last_park_blocked_seq: number;
@@ -176,4 +178,7 @@ export interface PageOptions {
 	maxBytes: number;
 	/** `undefined` = own view; `"*"` = every channel; a name = that channel. */
 	channel?: string;
+	addressedOnly?: boolean;
+	exclude?: ReadonlySet<number>;
+	excludeQueued?: readonly number[];
 }

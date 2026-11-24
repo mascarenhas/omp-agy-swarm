@@ -139,8 +139,20 @@ has not read), `error`, and spend. Each worker is in one of four states:
   `"in swarm_wait, with background work"`) — it is still live and wakes when
   job results arrive.
 - `working`: actively running (or `starting`, `reviving`, `switching model`, or
-  `waking`). Post to it and it will see the post when free, but do not expect a
-  reply immediately.
+  `waking`). Addressed posts (`@name`, group prefix, `@all`, subscribed
+  `@#channel`) and targeted notices reach an eligible busy member mid-turn at
+  its next tool-batch or stop boundary (another model turn in the same run;
+  foreground tools aren't interrupted, though native interruptible waits can be,
+  and a single long blocking tool call delays delivery until it returns), so a
+  reply or course correction may arrive before it finishes. After an assistant
+  error, one aside already queued in the host may resume the same native run,
+  but no further pushed asides are sent until the run settles or omp's native
+  auto-retry succeeds (`auto_retry_end` with `success: true`; an exhausted retry
+  does not lift it—including while paused on background work, where wakes stay
+  blocked until that work finishes—and same-ID `/clear` or same-file `/resume`
+  resets the latch). Unaddressed chatter still waits for its next `read_board`
+  or wake. Applies to TUI/RPC coordinators too (headless coordinator stop-gate
+  behavior is unchanged).
 - `stopped`: not loaded, e.g. after a restart. **Board posts do not auto-revive
   stopped members**: a post naming a stopped member is saved for it,
   `post_message` returns `stopped: […]` with a hint, and you receive a notice.
@@ -426,11 +438,23 @@ subscribes to, or `@all`.
 - **Mentions cross channels.** `@name` reaches that member whatever channel the
   post is in. A member waiting with `mentions_only: false` wakes for anything
   in its own channels and `main`, not other channels.
-- **`@name` is a wakeup doorbell, never a CC.** Every `@mention` wakes that
-  agent and costs it a turn. On peer-to-peer handoffs (`author <-> verifier`),
-  instruct workers to `@mention` only the peer who acts next, and tag
-  `@coordinator` only when the final deliverable is ready, on a blocker or
-  decision, or when no next peer exists.
+- **`@name` is a wakeup doorbell, never a CC.** An `@mention` wakes an eligible
+  idle agent (costing it a turn) and delivers mid-turn to an eligible `working`
+  agent at its next tool-batch or stop boundary (stopped members, headless
+  coordinators, and switch/finish/non-coordinator spend fences still block
+  delivery—an eligible TUI/RPC coordinator keeps receiving reporting wakes
+  whether idle or streaming—and after an assistant error on a worker or
+  interactive/RPC coordinator no further pushed asides are sent until the run
+  settles or native auto-retry succeeds (`auto_retry_end` with `success: true`;
+  exhausted retries keep it latched—including while paused on background
+  work—and same-ID `/clear` or same-file `/resume` resets it) even if one
+  already-queued aside resumes the same native run; foreground tools aren't
+  interrupted, though native interruptible waits can be, and a long blocking
+  tool call delays delivery). Tag a busy member only to steer or ask it
+  mid-flight, never as an FYI; on peer-to-peer handoffs
+  (`author <-> verifier`), instruct workers to `@mention` only the peer who acts
+  next, and tag `@coordinator` only when the final deliverable is ready, on a
+  blocker or decision, or when no next peer exists.
 - A post that names nobody is still read on the next wake (and delivered to you
   when the swarm goes quiescent), but put the `@` on so work keeps moving.
 
@@ -445,8 +469,13 @@ Call `swarm_wait` rather than polling `read_board` in a loop. Waiting consumes n
   **sole** tool call of its response. Violating this returns
   `woke: "not_parked"` (earlier calls still ran; call `swarm_wait` again cleanly).
 - **Cursor:** the board tracks your read cursor server-side and advances it
-  only once delivery receipt is confirmed. `since` is optional and advisory;
-  passing a value ahead of your cursor never skips unread posts.
+  only once delivery receipt is confirmed (mid-turn receipts are tracked
+  separately so cursor-based `read_board` does not repeat them and unread
+  unaddressed posts stay intact). Omit `since` for cursor reads (`since` is
+  advisory ahead of your cursor, while a literal `since < cursor` requests
+  history). While a mid-turn aside is queued, a cursor `read_board` returns the
+  other unread posts and excludes only queued/receipted posts (explicit history
+  reads are unchanged).
 - **Options:** `mentions_only: false` wakes for any visible post (default
   `true`); `timeout_seconds` (1..86,400) bounds the sleep and returns
   `remaining_seconds` on early board/notice/stall wakes (not on `woke: "job"`).
@@ -465,10 +494,16 @@ Call `swarm_wait` rather than polling `read_board` in a loop. Waiting consumes n
   - `incomplete`: terminal budget/deadline/stall stop — stop waiting and report
     what is unfinished.
   - `switch`: a scheduled self model switch (coordinator or worker) applies
-    when your turn ends — end your turn so it takes effect.
+    when your turn ends normally or pauses awaiting background work (both
+    workers and TUI/RPC coordinators) — end your turn so it takes effect (a
+    worker's scheduled switch need not apply after a failed or aborted turn; a
+    later idle wake is still possible and the switch can apply when that turn
+    ends).
   - `nudge` (workers only): woken to post a missing result.
-  - `not_parked`, `interrupted`, `aborted`, `killed`, `closing`, `no_swarm`:
-    wait did not complete normally (re-wait or read arriving wake as noted).
+  - `interrupted`: a wake is already queued (read it instead of parking) or the
+    wait was interrupted.
+  - `not_parked`, `aborted`, `killed`, `closing`, `no_swarm`: wait did not
+    complete normally (re-wait as noted).
 
 ## Things that will bite
 
@@ -494,8 +529,11 @@ Call `swarm_wait` rather than polling `read_board` in a loop. Waiting consumes n
   every worker as if there were no channels. Do not over-split either, and
   archive finished areas.
 - **Failures and quota do not self-heal.** A worker whose turn fails sits at
-  `waiting` (`detail: "failed (<kind>)"`, `error` set) and you get a notice;
-  nothing restarts it automatically after failure. Switch it with
+  `waiting` (`detail: "failed (<kind>)"`, `error` set) and you get a notice. An
+  already-queued aside can continue a failed loop before the run settles, and a
+  settled non-cost failure gets one bounded, delayed retry only when fresh
+  addressed work or an unpresented brief is owed (cost refusals get no automatic
+  retry); otherwise it waits for you. Switch it with
   `swarm{action:"model", name, model?, effort?}` to clear the failure and
   resume where it left off (leave `model` off to use yours, or use the model
   the user asked for), or post to it by `@name` to retry on the same model.

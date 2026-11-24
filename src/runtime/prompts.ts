@@ -48,12 +48,16 @@ How you work
    the evidence (test output, diff summary). If you are blocked or need a decision, post \`@${by} [blocked] …\`
    saying exactly what you need.
 3. Refer to earlier posts by number (#12). Never copy or summarize another member's post into yours.
-4. A mention is a doorbell that costs the named member a turn. Mention only who must act next. No thanks, no
-   acknowledgements, no status nobody asked for.
+4. A mention is a doorbell: mention only who must act next. No thanks, no acknowledgements, no status nobody
+   asked for.
 5. For ordinary standby after posting, end your turn or use untimed swarm_wait{}. Set a timeout only if you must
    wake yourself on a deadline.${c.backgroundJobs ? " Both directed board posts and the results of your own managed background jobs can wake you." : ""}
-6. When you wake, the new posts are in the wake message or the swarm_wait result. If it says more posts follow, read
-   them with read_board first. Act on what is addressed to you, post the outcome, and wait again.
+6. After an ordinary wake or swarm_wait result, read any remaining pages with read_board if the result says more
+   posts follow. Act on what is addressed to you, post the outcome, and wait again.
+7. Addressed posts (@name, group prefix, @all, or @#channel you subscribe to) can arrive as swarm messages between
+   tool batches or at the stop boundary. Handle them within your role and continue your current work unless the
+   message changes it. Further addressed pages are pushed automatically; unaddressed posts still arrive through
+   an ordinary wake or board read.
 
 You are not a task subagent: there is no \`yield\` and no parent reading your reply. Run the builds and tests your
 brief asks for yourself. Your output is your files and your board posts.
@@ -129,6 +133,7 @@ export interface WakeTextInput {
 	more: boolean;
 	triggerSeq?: number;
 	nudge?: string;
+	midTurn?: boolean;
 }
 
 export function wakeText(w: WakeTextInput): string {
@@ -140,12 +145,16 @@ export function wakeText(w: WakeTextInput): string {
 	if (w.nudge) lines.push(w.nudge);
 	for (const p of w.posts) lines.push(formatPost(p, w.name));
 	if (w.more) {
-		let more = 'More posts follow: read_board until "more" is false.';
+		let more = w.midTurn ? "More addressed posts will follow." : 'More posts follow: read_board until "more" is false.';
 		if (w.triggerSeq !== undefined && !w.posts.some(p => p.seq === w.triggerSeq))
 			more += ` The post that woke you is #${w.triggerSeq}.`;
 		lines.push(more);
 	}
-	if (w.posts.length) lines.push('Act on the posts marked "→ @you", post the outcome, then call swarm_wait.');
+	if (w.posts.length) {
+		lines.push(w.midTurn
+			? "Handle these addressed posts within your role; continue your current work."
+			: 'Act on the posts marked "→ @you", post the outcome, then call swarm_wait.');
+	}
 	return lines.join("\n");
 }
 
