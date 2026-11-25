@@ -1,7 +1,7 @@
 // Environment knobs and limits: the single source of every tunable number in the plugin.
 // PURE: node builtins only.
 
-export const SUPPORTED_HOST: readonly string[] = ["19.1.1"];
+export const SUPPORTED_HOST: readonly string[] = ["19.2.0"];
 
 export const MEMBER_TOOL_NAMES = ["swarm", "post_message", "read_board", "swarm_wait"] as const;
 export type SwarmToolName = (typeof MEMBER_TOOL_NAMES)[number];

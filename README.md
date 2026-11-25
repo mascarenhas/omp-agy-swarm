@@ -1,6 +1,6 @@
 # omp-agy-swarm
 
-An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.1.1**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
+An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.2.0**: parallel worker agents, each in its own isolated conversation, collaborating through one append-only shared message board.
 
 - **In-process workers, zero persistent agent profiles:** workers run as restricted `createAgentSession` instances registered in omp's global `AgentRegistry`—making live workers inspectable via `/hub`, native transcript focus, and (in tray-capable hosts like Tern) Tray cards without touching `~/.omp/agent/agents/` (worker transcripts stay under `<swarm_dir>/sessions/`).
 - **Full per-worker model and exact reasoning effort control:** inherit the coordinator's model and effort by default, or pin any runnable `provider/id` and exact effort (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — never `auto`) with live boundary model switching, immediate effort-only switching, and no silent fallback downgrades.
@@ -12,7 +12,7 @@ An Antigravity-style multi-agent swarm extension for [omp](https://omp.sh) **19.
 
 ## Installation & Loading
 
-Requires **omp `19.1.1`** (`@oh-my-pi/pi-coding-agent: 19.1.1`), **Bun**, and **git** (for `share`/`branch` workspaces).
+Requires **omp `19.2.0`** (`@oh-my-pi/pi-coding-agent: 19.2.0`), **Bun**, and **git** (for `share`/`branch` workspaces).
 
 ```sh
 # 1. Link a local checkout for persistent use in omp
@@ -126,10 +126,10 @@ Omit unused `effort`, `workspace`, `role`, and `op` fields. If a caller must sen
 
 Binds no network ports, is strictly read-only (nothing in `/swarm` moves any agent's read cursor), and stays keyboard-driven. `/swarm-ui` remains the separate optional web board.
 
-- **Tern (TSP) vs. ANSI/SSH:** in Tern (terminals that negotiate the Tern Surface Protocol), `/swarm` (a fullscreen `omp.swarm` page with a shared header showing title, mode, `#seq`, directory basename—full path in the coordinator's Members details—spend, and worker counts, plus a dock), the below-editor status widget, wake messages (`swarm-wake`), and web-board notices (`swarm-ui`) render as native UI with pointer support for tabs, lists, filters, paging, help, and dock search/jump inputs. Plain terminals and ordinary SSH sessions (non-TSP peers) keep the ANSI UI (`≥ 24×6`). For debugging (with debug logging enabled), `PI_TUI_NATIVE_STATS=1` emits a debug-level `{sf, ops, rows}` total per reconciled surface (a full TSP swarm screen has `rows: 0`, while unrelated inline host nodes can still fall back).
+- **Tern (TSP) vs. ANSI/SSH:** in Tern (terminals that negotiate the Tern Surface Protocol), `/swarm` (a fullscreen reactive `@oh-my-pi/pi-tui` `omp.swarm` page with `dock: 1`, a shared header showing title, mode, `#seq`, directory basename—full path in the coordinator's Members details—spend, and worker counts, a dock, and a hoisted modal help overlay on peers with `overlay` support, falling back to inline help with a Close button on reduced peers), the below-editor status widget, wake messages (`swarm-wake`), and web-board notices (`swarm-ui`) render as native semantic nodes with zero `rows` fallbacks and pointer support for tabs, lists, filters, paging, help, and search/jump inputs. Active search (`/`) and `#seq` jump inputs mount inside the focused `page` subtree (not `dock`), so Tern focuses them automatically on open and clears focus on close without losing page focus, with pointer/keyboard editing and `Esc`/`Enter` working cleanly. Main-session tool calls and results return `ExtensionRows`—compact one-line summaries in ANSI terminals while Tern keeps omp's full expandable tool cards. Plain terminals and ordinary SSH sessions (non-TSP peers) render `/swarm` (`≥ 24×6`), the status widget, and `swarm-wake`/`swarm-ui` notices via width-aware `<canvas>` rows.
 - **Tabs:**
-  - **1 Overview:** goal and outcome work threads, attention items, recent flagged screenshot captions (up to 8), and jump actions to the selected member or board post (Overview/header file info refreshes every 2 s).
-  - **2 Board:** in native mode, selected post detail above the feed (with expand/collapse and sender link), filter toolbar, bounded 50-post feed with unread divider (leaving follow keeps the current window and slides at its edges; Older/Newer page explicitly), plus dock search (`/`) and `#seq` jump; in ANSI mode, visible post blocks lay out by available rows and expose filters via keys and the status line.
+  - **1 Overview:** goal and outcome work threads, attention items, recent flagged screenshot captions (up to 8), and jump actions to the selected member or board post (Overview/header file info refreshes every 2 s; in native mode, timed waits format the saved deadline in the host locale without reading `Date.now()`).
+  - **2 Board:** in native mode, selected post detail above the feed (with expand/collapse and sender link), filter toolbar, bounded 50-post feed with unread divider (leaving follow keeps the current window and slides at its edges; Older/Newer page explicitly), plus focused search (`/`) and `#seq` jump inputs in the page; in ANSI mode, visible post blocks lay out by available rows and expose filters via keys and the status line.
   - **3 Members:** grouped roster (coordinator, task workers/groups/helpers, narrator/monitor) with killed toggle (`K`), selected member facts, and **View transcript** (`Enter` / `t` in native; `t` in ANSI).
   - **4 Transcript:** read-only conversation history for live and historical members (newest-first, content-budgeted right after the member line in native, with paging moving the window; search typing/`Esc` keep your place), plus member cycling and follow. To watch a live worker in omp's native transcript instead: close `/swarm`, open `/hub`, press `1`, select the displayed registry ID (e.g., `swarm~parser`), and press `Enter`—or click its Tern Tray card (stopped, killed, and coordinator entries show no live-focus hint).
 
@@ -170,7 +170,7 @@ Live workers (including `narrator` and `monitor`) register in omp's global `Agen
   - A custom `OMP_SWARM_DIR` outside a persisted root session's artifact tree hides workers from the in-session Hub filter and excludes them from native subagent tree cost (durable swarm spend in `status`/`metrics.json` is unaffected; when the default `<Main artifacts>/swarm/sessions` directory is reached through a symlink such as `/home` → `/var/home`, worker transcript paths use Main's spelling when both resolve to that same physical directory, while custom paths keep their own spelling and stay subject to Hub's lexical filter). With `--no-session` (which falls back to a temp dir only when `OMP_SWARM_DIR` is unset), the Hub's root-file filter is disabled so workers remain visible, though file-backed worker refs do not contribute to native tree cost without a matching root.
   - After a restart, stopped workers stay hidden from Hub and Tray until revived with `swarm{action:"revive"}`.
   - Creating, forking, and reviving workers never overwrites the terminal's resume breadcrumb, so `omp --continue` (and auto-resume) follows omp's normal breadcrumb and recent-session rules rather than jumping to a worker transcript. If an older plugin version left the terminal's resume pointer on a worker transcript, resume the coordinator session once explicitly (`omp --resume <session id prefix>`) to reset it.
-  - Live swarm workers are among the global registry's visible peers and can appear in `agent://all` broadcast receipts (worker IRC remains disabled).
+  - Live swarm workers are among the global registry's visible peers and can appear in `agent://all` broadcast receipts (workers disable both `enableIrc` and `task.crossInstance`, so they neither use IRC nor advertise cross-instance peers).
   - Headless (`print`/`json`) runs register globally too, but have no Hub or Tray UI.
 
 ### Optional Web Board (`/swarm-ui`)
@@ -305,7 +305,7 @@ GitHub Actions CI (`.github/workflows/ci.yml`) runs the deterministic suites (ty
 
 ## Known Limits & Platform Notes
 
-- **omp `19.1.1` target:** pinned and tested against `@oh-my-pi/pi-coding-agent` `19.1.1`; loading under another host version logs a warning on stderr.
+- **omp `19.2.0` target:** pinned and tested against `@oh-my-pi/pi-coding-agent` `19.2.0`; loading under another host version logs a warning on stderr.
 - **Linux `/proc/self/fd` file containment:** `safeRead` (`src/ui/view-files.ts`) verifies opened regular-file descriptors via `/proc/self/fd/<fd>` after `O_NOFOLLOW` open so symlink swaps cannot escape `<swarm_dir>` or `OMP_SWARM_UI_ROOTS`. On non-Linux platforms this check fails closed (`unverifiable`), so `plan.json`, `view.json`, `view.html`, `/api/frame`, and `/api/file` reads are refused.
 - **Explicit revival after restart:** after a process restart, non-killed members attach in `stopped` state and previous background jobs are not resumed. Board posts never auto-revive unattended agents; the coordinator must invoke `swarm{action:"revive"}` (exec-tier) to restart them and replay owed posts.
 - **Private package & vendored frontend:** `web/vendor/` holds verbatim copies of Antigravity's swarm board frontend (`NOTICE.md`). `test/unit/static.test.ts` enforces both SHA-256 integrity and `"private": true` in `package.json`.

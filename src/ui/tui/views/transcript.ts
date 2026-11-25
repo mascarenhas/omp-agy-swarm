@@ -1,10 +1,11 @@
 // Transcript: a member's conversation as compact items, paged over the whole current branch
 // (older pages load on demand), follow, member cycling and search over loaded items (§10.2).
 
-import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
-import type { TranscriptItem, TranscriptPage, TranscriptSource } from "../../model.ts";
+import { structural, type Accessor, type KeyEvent, type UiNode } from "@oh-my-pi/pi-tui";
+import type { MemberView, TranscriptItem, TranscriptPage, TranscriptSource } from "../../model.ts";
 import { fit, sanitize, sanitizeLine, wrap } from "../../sanitize.ts";
-import { button, group, id, NativeCache, nativeKey, section, span, strip, text } from "../native.ts";
+import { printable } from "../keys.ts";
+import { button, col, id, row, section, span, text } from "../native.ts";
 import { Capture, type OpenTarget, type View, type ViewHost } from "../view.ts";
 
 const LABEL: Record<TranscriptItem["kind"], [string, string]> = {
@@ -21,7 +22,6 @@ const LABEL: Record<TranscriptItem["kind"], [string, string]> = {
 // panes: up to 40 short entries, or fewer for long entries (at least one).
 const WINDOW_COST = 80;
 const PAGE = 200;
-const ACTIONS = { "previous-member": "[", "next-member": "]", follow: "f", search: "/" } as const;
 const NATIVE_LABEL: Record<TranscriptItem["kind"], string> = {
 	user: "User", wake: "Swarm wake", assistant: "Assistant", thinking: "Thinking",
 	tool_call: "Tool call", tool_result: "Tool result", system: "System",
@@ -66,13 +66,8 @@ export class TranscriptView implements View {
 	#input: Capture | undefined;
 	#captures = 0;
 	#epochGeneration = 0;
-	#pageRevision = 0;
 	#nativeAnchor: TranscriptItem | "head" | undefined;
 	#reveal = 0;
-	readonly #native = new NativeCache();
-	readonly #nativeField = new NativeCache();
-	#nativeEntries = new WeakMap<TranscriptItem, NativeNode>();
-	#entryProfile = -1;
 	#searchSnapshot: { items: TranscriptItem[]; search: string; hits: TranscriptItem[]; positions: number[] } | undefined;
 	#readError: string | undefined;
 	#lineCache = new Map<string, string[]>();
@@ -102,7 +97,6 @@ export class TranscriptView implements View {
 	#resetEntries(): void {
 		this.#epochGeneration++;
 		this.#lineCache.clear();
-		this.#nativeEntries = new WeakMap();
 	}
 
 	#read(opts: Parameters<TranscriptSource["page"]>[0]): TranscriptPage | undefined {
@@ -127,7 +121,6 @@ export class TranscriptView implements View {
 		this.#seenVersion = this.#host.model.version;
 		this.#top = head ? 0 : Number.MAX_SAFE_INTEGER;
 		this.#nativeAnchor = head ? "head" : undefined;
-		this.#pageRevision++;
 	}
 
 	#loadTail(): void {
@@ -183,7 +176,6 @@ export class TranscriptView implements View {
 		if (p.items.length) {
 			this.#items = [...p.items, ...this.#items];
 			this.#first = p.first;
-			this.#pageRevision++;
 		}
 		return p.items;
 	}
@@ -197,7 +189,6 @@ export class TranscriptView implements View {
 		if (p.items.length) {
 			this.#items = [...this.#items, ...p.items];
 			this.#last = p.last;
-			this.#pageRevision++;
 		}
 		this.#moreAfter = p.more_after;
 	}
@@ -287,95 +278,77 @@ export class TranscriptView implements View {
 		this.#reveal++;
 	}
 
-	describeField(cx: DescribeContext): NativeNode | undefined {
-		const field = this.#input;
-		return field && this.#nativeField.get(`${cx.supports("input")}|${field.stamp}`, () => field.describe(cx));
-	}
+	field(): Capture | undefined { return this.#input; }
 
-	handleFieldEvent(event: NativeUiEvent): boolean { return this.#input?.handleEvent(event) ?? false; }
-
-	describe(cx: DescribeContext): NativeNode {
-		this.#refresh();
-		const model = this.#host.model;
-		const member = model.members().find(m => m.name === this.#member);
-		const visible = this.#visibleItems();
-		const { start, end } = this.#window(visible);
-		const profile = nativeKey(cx);
-		return this.#native.get(JSON.stringify([profile, model.version, this.#pageRevision, this.#member, start, end, this.#follow, this.#search,
-			this.#moreBefore, this.#moreAfter, this.#readError, this.#reveal]), () => {
-			const tools = strip(cx, "tools", [
-				button(cx, "previous-member", "Previous member", "["),
-				button(cx, "next-member", "Next member", "]"),
-				button(cx, "search", "Search loaded items", "/", { on: !!this.#search, disabled: !member }),
-				button(cx, "follow", "Follow", "f", { on: this.#follow, disabled: !member }),
-			]);
-			const out: NativeNode[] = [];
-			if (!member) {
-				out.push(text("empty", "Select a member in Members and press t, or use [ / ] here.", "muted"));
-				return group(cx, "transcript", [...out, tools], "omp.swarm.transcript");
-			}
-			const historical = member.killed || member.state === "killed" || member.state === "stopped";
-			const live = !historical && !!this.#src && (!!member.liveAgentId || member.role === "coordinator");
-			out.push(text("member", [span(member.name, "strong"), span(historical ? ` · ${member.state} · read-only history` : live ? " · live" : " · read-only transcript", "muted"),
-				...(visible.length ? [span(" · newest first", "muted")] : [])]));
-			if (this.#entryProfile !== profile) {
-				this.#entryProfile = profile;
-				this.#nativeEntries = new WeakMap();
-			}
-			const entries: NativeNode[] = [];
-			// Tern shows the beginning of an over-tall page. Keep the newest
-			// entries above older ones and secondary controls.
-			for (let index = end - 1; index >= start; index--) {
-				const it = visible[index]!;
-				let node = this.#nativeEntries.get(it);
-				if (!node) {
-					const label = `${NATIVE_LABEL[it.kind]}${it.tool ? ` · ${it.tool}` : ""}${it.kind === "tool_result" ? it.ok === false ? " · error" : " · ok" : ""}`;
-					node = section(cx, `entry:${id(member.name)}:${this.#epochGeneration}:${id(it.id)}`, label, [
-						...(it.model ? [text("model", it.model, "muted mono")] : []),
-						text("body", it.text, it.kind === "tool_call" || it.kind === "tool_result" ? "mono" : undefined),
-						...(it.truncated ? [text("truncated", "Excerpt truncated", "muted")] : []),
-					]);
-					this.#nativeEntries.set(it, node);
-				}
-				entries.push(node);
-			}
-			if (entries.length) {
-				const history = group(cx, "history", entries);
-				out.push(this.#reveal ? { ...history, reveal: { at: "start", n: this.#reveal } } : history);
-			}
-			if (this.#readError) out.push(text("read-error", `Could not read transcript: ${this.#readError}`, "error"));
-			else if (!this.#src) out.push(text("unavailable", "Transcript unavailable for this member.", "muted"));
-			else if (!visible.length) out.push(text("no-items", this.#search && this.#items.length ? "No matches in the loaded transcript items." : "No transcript items available.", "muted"));
-			if (this.#src) out.push(strip(cx, "pages", [
-				button(cx, "head", "Start of history", "Home"),
-				button(cx, "older", "Older entries", "PgUp", { disabled: !start && !this.#moreBefore }),
-				button(cx, "newer", "Newer entries", "PgDn", { disabled: end >= visible.length && !this.#moreAfter }),
-				button(cx, "tail", "Latest entries", "End"),
-			]));
-			out.push(tools);
-			if (live && member.liveAgentId && member.role !== "coordinator") out.push(text("live-focus", [
-				span("For omp’s live transcript: close "), span("/swarm", "key"), span(", open "), span("/hub", "key"),
-				span(", press "), span("1", "key"), span(" (Agents), select "), span(member.liveAgentId, "mono strong"),
-				span(", press "), span("Enter", "key"), span(". Or select its Tern Tray card."),
-			]));
-			return group(cx, "transcript", out, "omp.swarm.transcript");
+	native(revision: Accessor<number>): UiNode {
+		const snapshot = structural(() => {
+			revision();
+			this.#refresh();
+			const member = this.#host.model.members().find(m => m.name === this.#member);
+			const visible = this.#visibleItems();
+			return { member, visible, ...this.#window(visible) };
 		});
+		const history = col("history", () => {
+			const { member, visible, start, end } = snapshot();
+			return member && this.#nativeEntries(member.name, visible, start, end);
+		}, undefined, () => {
+			revision();
+			return this.#reveal ? { at: "start", n: this.#reveal } : undefined;
+		});
+		return col("transcript", () => {
+			const { member, visible, start, end } = snapshot();
+			return this.#nativeContent(member, visible, start, end, history);
+		}, "omp.swarm.transcript");
 	}
 
-	handleNativeEvent(event: NativeUiEvent, key: string): boolean {
-		if (this.#input || event.type !== "action") return false;
-		this.#refresh();
-		for (const [action, input] of Object.entries(ACTIONS)) {
-			if (key === `tools/${action}` && event.act === `swarm.${action}`) return this.handleInput(input, true);
+	#nativeContent(member: MemberView | undefined, visible: readonly TranscriptItem[], start: number, end: number, history: UiNode): UiNode[] {
+		const tool = (id: string, label: string, shortcut: string, options?: Parameters<typeof button>[4]) =>
+			button(id, label, shortcut, () => this.#host.interact(this, () => this.#shortcut(shortcut, true)), options);
+		const tools = row("tools", [
+			tool("previous-member", "Previous member", "["),
+			tool("next-member", "Next member", "]"),
+			tool("search", "Search loaded items", "/", { on: !!this.#search, disabled: !member }),
+			tool("follow", "Follow", "f", { on: this.#follow, disabled: !member }),
+		]);
+		if (!member) return [text("empty", "Select a member in Members and press t, or use [ / ] here.", "muted"), tools];
+		const out: UiNode[] = [];
+		const historical = member.killed || member.state === "killed" || member.state === "stopped";
+		const live = !historical && !!this.#src && (!!member.liveAgentId || member.role === "coordinator");
+		out.push(text("member", [span(member.name, "strong"), span(historical ? ` · ${member.state} · read-only history` : live ? " · live" : " · read-only transcript", "muted"),
+			...(visible.length ? [span(" · newest first", "muted")] : [])]));
+		if (end > start) out.push(history);
+		if (this.#readError) out.push(text("read-error", `Could not read transcript: ${this.#readError}`, "error"));
+		else if (!this.#src) out.push(text("unavailable", "Transcript unavailable for this member.", "muted"));
+		else if (!visible.length) out.push(text("no-items", this.#search && this.#items.length ? "No matches in the loaded transcript items." : "No transcript items available.", "muted"));
+		if (this.#src) out.push(row("pages", [
+			button("head", "Start of history", "Home", () => this.#host.interact(this, () => this.#boundary(true))),
+			button("older", "Older entries", "PgUp", () => this.#host.interact(this, () => this.#stepNative(-1, true)), { disabled: !start && !this.#moreBefore }),
+			button("newer", "Newer entries", "PgDn", () => this.#host.interact(this, () => this.#stepNative(1, true)), { disabled: end >= visible.length && !this.#moreAfter }),
+			button("tail", "Latest entries", "End", () => this.#host.interact(this, () => this.#boundary(false))),
+		]));
+		out.push(tools);
+		if (live && member.liveAgentId && member.role !== "coordinator") out.push(text("live-focus", [
+			span("For omp’s live transcript: close "), span("/swarm", "key"), span(", open "), span("/hub", "key"),
+			span(", press "), span("1", "key"), span(" (Agents), select "), span(member.liveAgentId, "mono strong"),
+			span(", press "), span("Enter", "key"), span(". Or select its Tern Tray card."),
+		]));
+		return out;
+	}
+
+	#nativeEntries(member: string, visible: readonly TranscriptItem[], start: number, end: number): UiNode[] {
+		const entries: UiNode[] = [];
+		// Tern shows the beginning of an over-tall page. Keep the newest entries first.
+		const key = `entry:${id(member)}:${this.#epochGeneration}:`;
+		for (let index = end - 1; index >= start; index--) {
+			const it = visible[index]!;
+			const label = `${NATIVE_LABEL[it.kind]}${it.tool ? ` · ${it.tool}` : ""}${it.kind === "tool_result" ? it.ok === false ? " · error" : " · ok" : ""}`;
+			entries.push(section(`${key}${id(it.id)}`, label, [
+				...(it.model ? [text("model", it.model, "muted mono")] : []),
+				text("body", it.text, it.kind === "tool_call" || it.kind === "tool_result" ? "mono" : undefined),
+				...(it.truncated ? [text("truncated", "Excerpt truncated", "muted")] : []),
+			]));
 		}
-		if (!this.#src) return false;
-		const items = this.#visibleItems();
-		const { start, end } = this.#window(items);
-		if (key === "pages/older" && event.act === "swarm.older" && (start > 0 || this.#moreBefore)) { this.#stepNative(-1, true); return true; }
-		if (key === "pages/newer" && event.act === "swarm.newer" && (end < items.length || this.#moreAfter)) { this.#stepNative(1, true); return true; }
-		if (key === "pages/head" && event.act === "swarm.head") { this.#boundary(true); return true; }
-		if (key === "pages/tail" && event.act === "swarm.tail") { this.#boundary(false); return true; }
-		return false;
+		return entries;
 	}
 
 	#boundary(head: boolean): void {
@@ -387,7 +360,7 @@ export class TranscriptView implements View {
 
 	render(width: number, rows: number): string[] {
 		this.#rows = rows;
-		if (!this.#member) return ["Select a member in Members and press t.", ...Array(Math.max(0, rows - 1)).fill("")];
+		if (!this.#member) return [fit("Select a member in Members and press t.", width), ...Array(Math.max(0, rows - 1)).fill("")];
 		this.#refresh();
 		const lines: string[] = [];
 		const header = this.#host.theme.bold(fit(`${sanitizeLine(this.#member)}${this.#moreBefore ? " · older above (PgUp)" : " · start of conversation"}`, width));
@@ -428,7 +401,7 @@ export class TranscriptView implements View {
 		if (next) this.show({ member: next });
 	}
 
-	handleInput(data: string, native = false): boolean {
+	handleInput(data: KeyEvent, native = false): boolean {
 		const { keys } = this.#host;
 		const width = this.#cacheWidth || 80;
 		if (this.#input !== undefined) {
@@ -471,6 +444,10 @@ export class TranscriptView implements View {
 			this.#boundary(false);
 			return true;
 		}
+		return this.#shortcut(printable(data), native);
+	}
+
+	#shortcut(data: string | undefined, native: boolean): boolean {
 		switch (data) {
 			case "f":
 				if (native && this.#follow) this.#nativeAnchor = this.#visibleItems().at(-1);

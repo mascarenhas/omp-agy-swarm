@@ -1,8 +1,8 @@
 // ToolDefinition wrappers for the main session (§8.1). Registered `defaultInactive` + `essential`
 // and admitted only in the main session_start (H13).
 
-import type { AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
+import type { ZodLikeSchema } from "@oh-my-pi/omptype/zod";
+import type { AgentSession, ExtensionContext, ToolDefinition } from "@oh-my-pi/pi-coding-agent";
 import type { SwarmEnv } from "../env.ts";
 import type { CoordinatorBinding } from "../runtime/coordinator.ts";
 import type { ThinkingCaps } from "../runtime/ports.ts";
@@ -24,8 +24,9 @@ import {
 import { callLine, lineComponent, resultLine } from "./render.ts";
 import { DESCRIPTIONS, type Schemas } from "./schemas.ts";
 
-/** Scheduling flags typed once (§2 rule 5). */
-export type MainTool = ToolDefinition & Pick<AgentTool, "interruptible" | "concurrency">;
+// The host forwards these scheduling flags even though ToolDefinition doesn't declare them.
+type ToolScheduling = Pick<AgentSession["state"]["tools"][number], "interruptible" | "concurrency">;
+export type MainTool = ToolDefinition & ToolScheduling;
 
 export interface MainToolHost {
 	schemas: Schemas;
@@ -88,35 +89,32 @@ export function mainToolDefinitions(host: MainToolHost): MainTool[] {
 			batch: rt?.coordinator.tracker.batchOf(toolCallId),
 			isWorker: false,
 		};
-		return op(o, (params ?? {}) as P);
+		return op(o, params);
 	};
-	const render = (tool: string) => ({
-		renderCall: (args: unknown) => lineComponent(callLine(tool, (args ?? {}) as Record<string, unknown>)),
-		renderResult: (result: { details?: unknown }) => lineComponent(resultLine(tool, result.details as Record<string, unknown> | undefined)),
-	});
 	const define = <P>(
-		name: "swarm" | "post_message" | "read_board" | "swarm_wait",
-		parameters: unknown,
+		name: keyof Schemas,
+		parameters: ZodLikeSchema<P>,
 		approval: MainTool["approval"],
 		op: (o: OpsContext, p: P) => ToolResult | Promise<ToolResult>,
-		flags: Pick<AgentTool, "interruptible" | "concurrency"> = {},
-	): MainTool => {
-		const tool = {
-			name,
-			label: name,
-			description: DESCRIPTIONS[name],
-			parameters,
-			loadMode: "essential" as const,
-			defaultInactive: true,
-			approval,
-			...flags,
-			...render(name),
-			execute: (toolCallId: string, params: P, signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext) =>
-				run(toolCallId, params, signal, ctx, op),
-		};
-		// ToolDefinition is generic over the host's schema type; ours is the pi.zod schema it accepts.
-		return tool as unknown as MainTool;
-	};
+		flags: ToolScheduling = {},
+	): MainTool => ({
+		name,
+		label: name,
+		description: DESCRIPTIONS[name],
+		// The SDK accepts pi.zod at runtime; its generic TSchema doesn't model all ZodLikeSchema instantiations.
+		parameters: parameters as unknown as MainTool["parameters"],
+		loadMode: "essential",
+		defaultInactive: true,
+		approval,
+		...flags,
+		renderCall: args => lineComponent(callLine(name, (args ?? {}) as Record<string, unknown>)),
+		renderResult: ({ details }) => {
+			const text = resultLine(name, details as Record<string, unknown> | undefined);
+			return text ? lineComponent(text) : undefined;
+		},
+		execute: (toolCallId, params, signal, _onUpdate, ctx) =>
+			run(toolCallId, (params ?? {}) as P, signal, ctx, op),
+	});
 	return [
 		// The approval prompt runs before execute: its cwd comes from the binding session_start set.
 		define<SwarmParams>("swarm", host.schemas.swarm, swarmApproval(() => host.boundCwd() ?? process.cwd()), swarmOp),

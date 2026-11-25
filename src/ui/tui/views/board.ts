@@ -1,10 +1,11 @@
 // Board: posts with search, author/mention/channel filters, #seq jump with return, follow, unread
 // divider and expandable long posts (§10.2). Only blocks in view are laid out (5 000+ posts).
 
-import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import type { Accessor, KeyEvent, UiNode } from "@oh-my-pi/pi-tui";
 import type { BoardMessage } from "../../../board/types.ts";
 import { fit, pad, sanitize, sanitizeLine, wrap } from "../../sanitize.ts";
-import { button, card, group, item, list, type ListItem, NativeCache, nativeKey, postSummary, postText, span, strip, text } from "../native.ts";
+import { printable } from "../keys.ts";
+import { button, card, col, item, list, postSummary, postText, row, span, text } from "../native.ts";
 import { Capture, type OpenTarget, type View, type ViewHost } from "../view.ts";
 
 interface Filters {
@@ -19,10 +20,7 @@ const NO_FILTERS: Filters = { search: "", author: "", mention: "off", mentionOf:
 const COLLAPSE = 6;
 const WINDOW = 50;
 const PREVIEW = 640;
-const ACTIONS = {
-	search: "/", jump: "#", author: "a", "clear-author": "A", mention: "m", channel: "c", clear: "x",
-	restore: "b", follow: "f", unread: "u", sender: "o",
-} as const;
+type ButtonOptions = Parameters<typeof button>[4];
 
 export class BoardView implements View {
 	readonly #host: ViewHost;
@@ -37,9 +35,6 @@ export class BoardView implements View {
 	#captures = 0;
 	#cacheKey = "";
 	#list: readonly BoardMessage[] = [];
-	readonly #native = new NativeCache();
-	readonly #nativeField = new NativeCache();
-	#summaries = new Map<BoardMessage, ListItem>();
 	#lastRange = { from: 0, to: 0 };
 
 	constructor(host: ViewHost) {
@@ -109,7 +104,7 @@ export class BoardView implements View {
 		const list = this.#filtered();
 		const out: string[] = [];
 		if (!list.length) {
-			out.push(this.#host.model.messages().length ? "No posts match the filters (x clears them)." : "The board is empty.");
+			out.push(fit(this.#host.model.messages().length ? "No posts match the filters (x clears them)." : "The board is empty.", width));
 			while (out.length < rows) out.push("");
 			return out;
 		}
@@ -180,9 +175,8 @@ export class BoardView implements View {
 			this.#follow ? "follow" : "", this.#describeFilters(), this.#saved ? "filters off · b back" : ""].filter(Boolean).join(" · ");
 	}
 
-	describeField(cx: DescribeContext): NativeNode | undefined {
-		const input = this.#input;
-		return input && this.#nativeField.get(`${cx.supports("input")}|${input.field.stamp}`, () => input.field.describe(cx));
+	field(): Capture | undefined {
+		return this.#input?.field;
 	}
 
 	#updateSearch(follow: boolean): void {
@@ -192,13 +186,11 @@ export class BoardView implements View {
 		if (follow) this.#follow = true;
 	}
 
-	handleFieldEvent(event: NativeUiEvent): boolean {
-		if (!this.#input?.field.handleEvent(event)) return false;
-		this.#updateSearch(event.type === "edit" && !!event.text);
-		return true;
+	native(revision: Accessor<number>): UiNode {
+		return col("board", () => { revision(); return this.#nativeContent(); }, "omp.swarm.board");
 	}
 
-	describe(cx: DescribeContext): NativeNode {
+	#nativeContent(): UiNode[] {
 		const posts = this.#filtered();
 		const i = this.#selIndex(posts);
 		const selected = posts[i];
@@ -206,102 +198,73 @@ export class BoardView implements View {
 		const end = Math.min(start + WINDOW, posts.length);
 		const cursor = this.#host.model.coordinatorCursor();
 		const expanded = !!selected && this.#expanded.has(selected.seq);
-		return this.#native.get(`${nativeKey(cx)}|${cx.hour12}|${this.#cacheKey}|${cursor}|${i}|${start}|${expanded}|${this.#follow}|${!!this.#saved}`, () => {
-			const toolbar = strip(cx, "tools", [
-				button(cx, "search", "Search", "/", { on: !!this.#f.search }),
-				button(cx, "jump", "Jump to #", "#"),
-				button(cx, "author", this.#f.author ? `From ${this.#f.author}` : "Any author", "a"),
-				...(this.#f.author ? [button(cx, "clear-author", "Clear author", "A")] : []),
-				button(cx, "mention", this.#f.mention === "off" ? "Any mention" : `To ${this.#f.mention === "author" ? this.#f.mentionOf : "coordinator"}`, "m"),
-				button(cx, "channel", this.#f.channel ? `#${this.#f.channel}` : "All channels", "c"),
-				button(cx, "clear", "Clear filters", "x"),
-				button(cx, "follow", "Follow", "f", { on: this.#follow }),
-				button(cx, "unread", "First unread", "u", { disabled: !posts.length || (posts.at(-1)?.seq ?? 0) <= cursor }),
-				...(this.#saved ? [button(cx, "restore", "Restore filters", "b")] : []),
-			]);
-			const summaries = new Map<BoardMessage, ListItem>();
-			const items: ListItem[] = [];
-			for (let j = start; j < end; j++) {
-				const post = posts[j]!;
-				if (post.seq > cursor && (posts[j - 1]?.seq ?? 0) <= cursor) {
-					const divider = item("new-divider", [span(`New · after #${cursor}`, "warning strong")], undefined, "warning");
-					items.push({ ...divider, p: { ...divider.p, disabled: true } });
-				}
-				const entry = this.#summaries.get(post) ?? postSummary(post);
-				summaries.set(post, entry);
-				items.push(entry);
+		const action = (id: string, label: string, shortcut: string, options?: ButtonOptions) =>
+			button(id, label, shortcut, () => this.#host.interact(this, () => this.#shortcut(shortcut)), options);
+		const toolbar = row("tools", [
+			action("search", "Search", "/", { on: !!this.#f.search }),
+			action("jump", "Jump to #", "#"),
+			action("author", this.#f.author ? `From ${this.#f.author}` : "Any author", "a"),
+			...(this.#f.author ? [action("clear-author", "Clear author", "A")] : []),
+			action("mention", this.#f.mention === "off" ? "Any mention" : `To ${this.#f.mention === "author" ? this.#f.mentionOf : "coordinator"}`, "m"),
+			action("channel", this.#f.channel ? `#${this.#f.channel}` : "All channels", "c"),
+			action("clear", "Clear filters", "x"),
+			action("follow", "Follow", "f", { on: this.#follow }),
+			action("unread", "First unread", "u", { disabled: !posts.length || (posts.at(-1)?.seq ?? 0) <= cursor }),
+			...(this.#saved ? [action("restore", "Restore filters", "b")] : []),
+		]);
+		const items: UiNode<"item">[] = [];
+		for (let j = start; j < end; j++) {
+			const post = posts[j]!;
+			if (post.seq > cursor && (posts[j - 1]?.seq ?? 0) <= cursor) {
+				items.push(item("new-divider", [span(`New · after #${cursor}`, "warning strong")], undefined, "warning", true));
 			}
-			this.#summaries = summaries;
-			const out: NativeNode[] = [];
-			if (selected) {
-				const addressees = this.#host.model.addressees(selected);
-				const to = [...addressees.mentions.map(n => `@${n}`), ...(addressees.all ? ["@all"] : []), ...addressees.channels.map(c => `@#${c}`)];
-				const time = cx.hour12 === undefined || !Number.isFinite(selected.ts)
-					? selected.time.split(" ")[1] ?? selected.time
-					: new Date(selected.ts).toLocaleTimeString(undefined, { hour12: cx.hour12, hour: "numeric", minute: "2-digit" });
-				const head = `#${selected.seq} · ${selected.agent}${selected.control ? " · control" : ""}`;
-				const clean = sanitize(selected.text);
-				const long = clean.length > PREVIEW || clean.split("\n", COLLAPSE + 1).length > COLLAPSE;
-				const preview = !expanded && long ? `${clean.split("\n", COLLAPSE).join("\n").slice(0, PREVIEW).replace(/[\ud800-\udbff]$/, "")}…` : clean;
-				const detail = card(cx, `detail:post:${selected.seq}`, head, [
-					text("metadata", [span(`#${selected.channel || "main"} · ${time}`, "muted mono"), ...(to.length ? [span(` · ${to.join(" ")}`, "accent mono")] : [])]),
-					text("content", postText(preview, !!selected.control)),
-				], long ? !expanded : undefined);
-				out.push(detail);
-				out.push(strip(cx, `actions:post:${selected.seq}`, [
-					...(long ? [button(cx, "expand", expanded ? "Collapse post" : "Expand post", "Enter")] : []),
-					button(cx, "sender", "Inspect sender", "o", { disabled: !this.#host.model.members().some(m => m.name === selected.agent) }),
-				]));
-			}
-			out.push(toolbar);
-			if (posts.length && (start || end < posts.length)) out.push(strip(cx, "pages", [
-				button(cx, "older", "Older posts", undefined, { disabled: !start }),
-				text("window", `${start + 1}–${end} of ${posts.length}`, "num"),
-				button(cx, "newer", "Newer posts", undefined, { disabled: end === posts.length }),
+			items.push(postSummary(post));
+		}
+		const out: UiNode[] = [];
+		if (selected) {
+			const addressees = this.#host.model.addressees(selected);
+			const to = [...addressees.mentions.map(n => `@${n}`), ...(addressees.all ? ["@all"] : []), ...addressees.channels.map(c => `@#${c}`)];
+			const time = Number.isFinite(selected.ts)
+				? new Date(selected.ts).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+				: selected.time.split(" ")[1] ?? selected.time;
+			const head = `#${selected.seq} · ${selected.agent}${selected.control ? " · control" : ""}`;
+			const clean = sanitize(selected.text);
+			const long = clean.length > PREVIEW || clean.split("\n", COLLAPSE + 1).length > COLLAPSE;
+			const preview = !expanded && long ? `${clean.split("\n", COLLAPSE).join("\n").slice(0, PREVIEW).replace(/[\ud800-\udbff]$/, "")}…` : clean;
+			const toggle = (collapsed: boolean) => this.#host.interact(this, () => this.#expand(selected, !collapsed));
+			out.push(card(`detail:post:${selected.seq}`, head, [
+				text("metadata", [span(`#${selected.channel || "main"} · ${time}`, "muted mono"), ...(to.length ? [span(` · ${to.join(" ")}`, "accent mono")] : [])]),
+				text("content", postText(preview, !!selected.control)),
+			], long ? { collapsed: !expanded, toggle } : undefined));
+			out.push(row(`actions:post:${selected.seq}`, [
+				...(long ? [button("expand", expanded ? "Collapse post" : "Expand post", "Enter", () => toggle(expanded))] : []),
+				action("sender", "Inspect sender", "o", { disabled: !this.#host.model.members().some(m => m.name === selected.agent) }),
 			]));
-			out.push(list(cx, "posts", items, selected ? `post:${selected.seq}` : undefined,
-				this.#host.model.head ? "No posts match the filters (x clears them)." : "The board is empty.", 8));
-			return group(cx, "board", out, "omp.swarm.board");
-		});
-	}
-
-	handleNativeEvent(event: NativeUiEvent, key: string): boolean {
-		if (this.#input) return false;
-		const posts = this.#filtered();
-		const i = this.#selIndex(posts);
-		const start = this.#window(posts.length, i);
-		const end = Math.min(start + WINDOW, posts.length);
-		const selected = posts[i];
-		if (event.type === "toggle") {
-			return !!selected && key === `detail:post:${selected.seq}` && this.#expand(selected, !event.collapsed);
 		}
-		const pick = event.type === "select" || event.type === "activate" ? key === "posts" ? event.item : ""
-			: event.type === "action" && key.startsWith("posts/") ? key.slice(6) : "";
-		if (pick) {
-			for (let j = start; j < end; j++) {
-				const post = posts[j]!;
-				if (pick !== `post:${post.seq}` || (event.type === "action" && event.act !== `swarm.${pick}`)) continue;
-				if (event.type === "activate") return this.#expand(post, !this.#expanded.has(post.seq));
-				if (this.#sel === post.seq && !this.#follow) return false;
-				this.#select(post);
-				return true;
-			}
+		out.push(toolbar);
+		if (posts.length && (start || end < posts.length)) {
+			const page = (delta: number) => this.#host.interact(this, () => {
+				this.#move(delta);
+				this.#windowStart = Math.max(0, Math.min(posts.length - WINDOW, start + delta));
+			});
+			out.push(row("pages", [
+				button("older", "Older posts", undefined, () => page(-WINDOW), { disabled: !start }),
+				text("window", `${start + 1}–${end} of ${posts.length}`, "num"),
+				button("newer", "Newer posts", undefined, () => page(WINDOW), { disabled: end === posts.length }),
+			]));
 		}
-		if (event.type !== "action") return false;
-		for (const [action, input] of Object.entries(ACTIONS)) {
-			const path = action === "sender" ? `actions:post:${selected?.seq}/sender` : `tools/${action}`;
-			if (action === "restore" && !this.#saved || action === "clear-author" && !this.#f.author) continue;
-			if (key === path && event.act === `swarm.${action}`) return this.handleInput(input);
-		}
-		if (selected && key === `actions:post:${selected.seq}/expand` && event.act === "swarm.expand") return this.#expand(selected, !this.#expanded.has(selected.seq));
-		const page = key === "pages/older" && event.act === "swarm.older" && start > 0 ? -WINDOW
-			: key === "pages/newer" && event.act === "swarm.newer" && end < posts.length ? WINDOW : 0;
-		if (page) {
-			this.#move(page);
-			this.#windowStart = Math.max(0, Math.min(posts.length - WINDOW, start + page));
-			return true;
-		}
-		return false;
+		out.push(list("posts", items, selected ? `post:${selected.seq}` : undefined,
+			this.#host.model.head ? "No posts match the filters (x clears them)." : "The board is empty.",
+			(pick, activate) => this.#host.interact(this, () => {
+				for (let j = start; j < end; j++) {
+					const post = posts[j]!;
+					if (pick !== `post:${post.seq}`) continue;
+					if (activate) this.#expand(post, !this.#expanded.has(post.seq));
+					else if (this.#sel !== post.seq || this.#follow) this.#select(post);
+					break;
+				}
+			}), 8));
+		return out;
 	}
 
 	status(width: number): string {
@@ -378,8 +341,8 @@ export class BoardView implements View {
 		return list[this.#selIndex(list)];
 	}
 
-	handleInput(data: string): boolean {
-		const { keys, model } = this.#host;
+	handleInput(data: KeyEvent): boolean {
+		const { keys } = this.#host;
 		const inp = this.#input;
 		if (inp) {
 			if (keys.cancel(data)) {
@@ -427,9 +390,17 @@ export class BoardView implements View {
 			if (m) this.#expand(m, !this.#expanded.has(m.seq));
 			return true;
 		}
+		return this.#shortcut(printable(data));
+	}
+
+	#shortcut(data: string | undefined): boolean {
+		const { model } = this.#host;
 		switch (data) {
 			case "/":
-				this.#input = { kind: "search", field: new Capture(`board-search:${++this.#captures}`, "Search posts", this.#f.search), before: this.#f };
+				this.#input = { kind: "search", before: this.#f, field: new Capture(`board-search:${++this.#captures}`, "Search posts", this.#f.search, false, inserted => {
+					this.#updateSearch(inserted);
+					this.#host.requestRender();
+				}) };
 				return true;
 			case "#":
 				this.#input = { kind: "jump", field: new Capture(`board-jump:${++this.#captures}`, "Jump to post #", "", true), before: this.#f };

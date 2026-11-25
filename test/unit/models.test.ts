@@ -1,9 +1,9 @@
 // §4.1–4.2 resolution and effort (with the SW-14 explicit alias-suffix parsing).
 
 import { describe, expect, test } from "bun:test";
-import { resolveEffort, resolveSpec } from "../../src/runtime/models.ts";
+import { applyCoordinatorSwitch, applyPreSwarmSwitch, resolveEffort, resolveSpec } from "../../src/runtime/models.ts";
 import type { ModelInfo } from "../../src/runtime/ports.ts";
-import { fakeCaps } from "../helpers/harness.ts";
+import { FakeBinding, fakeCaps, Harness } from "../helpers/harness.ts";
 
 const LIST: ModelInfo[] = [
 	{ provider: "zai", id: "glm-4.7:max", reasoning: true },
@@ -77,4 +77,46 @@ describe("resolveEffort", () => {
 		expect(resolveEffort(fakeCaps, plain, "high").effort).toBe("off");
 		expect(resolveEffort(fakeCaps, plain, "high").note).toContain("does not reason");
 	});
+});
+
+describe("applyPreSwarmSwitch", () => {
+	test("reports a synchronous effort failure after changing the model", async () => {
+		const binding = new FakeBinding("pre-swarm", "print", process.cwd());
+		binding.pendingSelfSwitch = { model: "mock/worker-b", effort: "low" };
+		binding.setThinkingLevel = () => { throw new Error("could not apply effort"); };
+
+		expect(await applyPreSwarmSwitch(binding, 200)).toEqual({
+			state: "failed",
+			text: "[swarm] Your model is now mock/worker-b (high), but applying effort low failed (could not apply effort). Continue.",
+		});
+		expect(binding.pendingSelfSwitch).toBeUndefined();
+	});
+
+	test("reports a synchronous model failure without changing effort", async () => {
+		const binding = new FakeBinding("pre-swarm", "print", process.cwd());
+		binding.pendingSelfSwitch = { model: "mock/worker-b", effort: "low" };
+		binding.setModel = () => { throw new Error("could not apply model"); };
+
+		expect(await applyPreSwarmSwitch(binding, 200)).toEqual({
+			state: "failed",
+			text: "[swarm] Your switch to mock/worker-b failed (could not apply model); you are on mock/coord (high). Continue.",
+		});
+		expect(binding.pendingSelfSwitch).toBeUndefined();
+	});
+});
+
+test("applyCoordinatorSwitch reports a synchronous model failure without changing effort", async () => {
+	const h = new Harness();
+	try {
+		h.rt.coordinatorSwitch = { model: "mock/worker-b", effort: "low" };
+		h.binding.setModel = () => { throw new Error("could not apply model"); };
+
+		expect(await applyCoordinatorSwitch(h.rt, 200)).toEqual({
+			state: "failed",
+			text: "[swarm] Your switch to mock/worker-b failed (could not apply model); you are on mock/coord (high). Continue.",
+		});
+		expect(h.rt.coordinatorSwitch).toBeUndefined();
+	} finally {
+		await h.close();
+	}
 });

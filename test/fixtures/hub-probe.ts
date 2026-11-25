@@ -6,7 +6,8 @@ import { HistoryProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/
 import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
 import { sessionFileBelongsToRoot } from "@oh-my-pi/pi-coding-agent/registry/persisted-agents";
-import { SessionObserverRegistry, TASK_SUBAGENT_LIFECYCLE_CHANNEL, type SubagentLifecyclePayload } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { SessionObserverRegistry, TASK_SUBAGENT_LIFECYCLE_CHANNEL, type SubagentLifecyclePayload } from "@oh-my-pi/pi-coding-agent/task/session-observer-registry";
+import { cfgTaskCrossInstance } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { z } from "@oh-my-pi/omptype/zod";
 import { CoordinatorBinding } from "../../src/runtime/coordinator.ts";
 import { createSessionFactory, scopedSettings } from "../../src/runtime/omp-adapter.ts";
@@ -84,9 +85,13 @@ export default function hubProbe(pi: ExtensionAPI): void {
 				const main = registry.get(MAIN_AGENT_ID)?.session;
 				const history = new HistoryProtocolHandler();
 				const rootFile = ctx.sessionManager.getSessionFile();
+				const worker = ref.session instanceof AgentSession ? ref.session : undefined;
 				emit({
 					file: ref.sessionFile, stage: "parked", status: ref.status, activity: ref.activity,
 					parentless: ref.parentId === undefined, raw: ref.session instanceof AgentSession,
+					mainCrossInstance: main instanceof AgentSession ? cfgTaskCrossInstance.get(main.settings) : undefined,
+					workerCrossInstance: worker ? cfgTaskCrossInstance.get(worker.settings) : undefined,
+					workerAdvertisesPeers: worker?.systemPrompt.some(block => block.includes("agent://peers")),
 					ownsFocus: await lifecycle.ensureLive(ref.id) === ref.session,
 					contextStatus: observer.getSession(ref.id)?.status,
 					mainWakeAgents: main instanceof AgentSession ? main.wakeSources?.agents ?? [] : null,

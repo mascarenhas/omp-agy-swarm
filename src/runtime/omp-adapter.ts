@@ -10,6 +10,7 @@ import {
 	AgentSession,
 	AgentRegistry,
 	createAgentSession,
+	type CreateAgentSessionOptions,
 	createSubagentSettings,
 	type CustomTool,
 	type ExtensionAPI,
@@ -21,6 +22,7 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-coding-agent";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async";
+import { MAX_THINKING_SUFFIX_OPTIONS, splitThinkingSuffix } from "@oh-my-pi/pi-coding-agent/config/model-selector";
 import { findScopedSettings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { AgentRegistryApi } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentLifecycleManager, type AgentLifecycleApi } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
@@ -28,14 +30,12 @@ import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-in
 import { CostGate, type CostCapRefusal } from "@oh-my-pi/pi-coding-agent/session/cost-gate";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { discoverAgents, getAgent } from "@oh-my-pi/pi-coding-agent/task/discovery";
+import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, type SubagentLifecyclePayload } from "@oh-my-pi/pi-coding-agent/task/session-observer-registry";
 import { cfgTaskAgentModelOverrides, cfgTaskMaxEffort } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { TASK_SUBAGENT_EVENT_CHANNEL, type SubagentEventPayload } from "@oh-my-pi/pi-coding-agent/task/types";
 import { cfgAsyncMaxJobs, cfgAsyncPrintWake } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import type { RemoteAgentSession } from "@oh-my-pi/pi-coding-agent/thread/remote-agent-session";
 import type { Model } from "@oh-my-pi/pi-ai";
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import { MAX_THINKING_SUFFIX_OPTIONS, splitThinkingSuffix } from "@oh-my-pi/pi-tui/overlays/model-selector";
-import type { SubagentLifecyclePayload } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
 import { DEFAULT_SCOUT_EFFORT, EFFORTS, isEffort, raceTimeout, TIMING } from "../env.ts";
 import { HubBridge } from "./hub-bridge.ts";
 import { preferredAgentId } from "./member.ts";
@@ -280,7 +280,7 @@ class ScoutUsage {
 					}
 				}
 			}),
-			bus.on("task:subagent:lifecycle", data => {
+			bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, data => {
 				const frame = data as SubagentLifecyclePayload;
 				if (frame.status !== "started") {
 					this.#retiring.delete(frame.id);
@@ -806,6 +806,8 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 			const pinCap = operatorCap && (EFFORTS.indexOf(effort) < EFFORTS.indexOf(operatorCap) ? effort : operatorCap);
 			const settings = createSubagentSettings(scoped, {
 				...subagentLspWritethroughSettings(scoped),
+				// Worker sessions disable IRC; don't advertise cross-instance agents either.
+				"task.crossInstance": false,
 				// Remote journals can arrive after another request in the same eval cell.
 				// Keep capped worker trees on the billing thread without changing concurrency.
 				...(jobs && o.checkSwarmSpend ? { "task.workerThreads": 0 } : {}),
@@ -845,7 +847,7 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 				});
 			} else {
 				// Like native Task, never replace Main's terminal breadcrumb. The
-				// fresh persisted factory has no suppression option in omp 19.1;
+				// fresh persisted factory has no suppression option;
 				// persisting an empty manager retains the host's normal file naming.
 				sessionManager = await SessionManager.inMemory(o.cwd).persistCopy({ sessionDir: sessionsDir, suppressBreadcrumb: true });
 			}
@@ -898,7 +900,7 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						sessionManager,
 						costGate,
 						model,
-						thinkingLevel: o.effort as ThinkingLevel | undefined,
+						thinkingLevel: o.effort as CreateAgentSessionOptions["thinkingLevel"],
 						restrictToolNames: true,
 						allowRestrictedCustomTools: true,
 						toolNames: o.toolNames,
@@ -942,9 +944,9 @@ export function createSessionFactory(binding: CoordinatorBinding, events: Worker
 						agentId: id,
 						agentDisplayName: o.name,
 						get expectedAgentRef(): null {
-							// In omp 19.1 the SDK first reads this option immediately
-							// before its CAS. Reject late occupants here: its normal
-							// null-CAS fallback may otherwise reclaim a parked ref.
+							// The SDK first reads this option immediately before its
+							// CAS. Reject late occupants here: its normal null-CAS
+							// fallback may otherwise reclaim a parked ref.
 							if (!checkedSlot) {
 								o.signal.throwIfAborted();
 								if (registry.list().some(ref => ref.id.toLowerCase() === key)) throw new RegistryIdOccupied(id);

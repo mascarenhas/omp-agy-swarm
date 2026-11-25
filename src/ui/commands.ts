@@ -12,7 +12,7 @@ import { project, type SwarmReadModel } from "./model.ts";
 import { renderWakeMessage, renderWebBoardMessage } from "./tui/custom-message.ts";
 import { EmptyOverlay, SwarmOverlay } from "./tui/overlay.ts";
 import type { ViewId } from "./tui/view.ts";
-import { widgetComponent, widgetLine } from "./tui/widget.ts";
+import { createWidgetLink, widgetComponent, widgetLine, type WidgetLink } from "./tui/widget.ts";
 import { WebBoard } from "./web/server.ts";
 
 export interface UiHost {
@@ -41,7 +41,7 @@ function summary(model: SwarmReadModel): string {
 export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle {
 	const models = new Map<string, RuntimeReadModel>();
 	const boards = new Map<string, WebBoard>();
-	const widgets = new Map<string, () => void>();
+	const widgets = new Map<string, WidgetLink>();
 
 	pi.registerMessageRenderer("swarm-wake", renderWakeMessage);
 	pi.registerMessageRenderer("swarm-ui", renderWebBoardMessage);
@@ -71,7 +71,7 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 			} catch (err) {
 				return { error: `could not listen on 127.0.0.1:${port}: ${(err as Error).message}` };
 			}
-			widgets.get(rt.sid)?.();
+			widgets.get(rt.sid)?.set(board.link());
 		}
 		return { board };
 	};
@@ -98,16 +98,15 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 		const b = rt.binding as CoordinatorBinding;
 		if (b.mode !== "tui" || widgets.has(rt.sid)) return;
 		const ctx = b.ctx;
+		const link = createWidgetLink(boards.get(rt.sid)?.link());
+		widgets.set(rt.sid, link);
 		try {
 			ctx.ui.setWidget(
 				"swarm",
-				tui => {
-					widgets.set(rt.sid, () => tui.requestRender());
-					return widgetComponent(modelOf(rt), tui, () => boards.get(rt.sid)?.link());
-				},
+				ui => widgetComponent(modelOf(rt), ui, link),
 				{ placement: "belowEditor" },
 			);
-		} catch {}
+		} catch { widgets.delete(rt.sid); }
 	};
 
 	pi.registerCommand("swarm", {
@@ -126,20 +125,19 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 				if (ctx.mode === "rpc") ctx.ui.notify(rt ? summary(modelOf(rt)) : host.refusal(b.sessionId) ?? "No swarm in this session yet.", "info");
 				return;
 			}
-			const options = {
-				// Fullscreen gives the overlay its own native screen on TSP peers; ANSI keeps the same cell overlay.
-				overlay: true,
-				overlayOptions: { width: "100%" as const, maxHeight: "100%" as const, margin: 0, fullscreen: true, mouseTracking: false },
-			};
-			if (!rt) {
-				await ctx.ui.custom<void>((tui, _theme, kb, done) => new EmptyOverlay(tui, kb, () => done(undefined), host.refusal(b.sessionId)), options);
-				return;
+			const options = { overlay: true, fullscreen: true };
+			let overlay: EmptyOverlay | SwarmOverlay | undefined;
+			try {
+				await ctx.ui.custom<void>((ui, theme, kb, done) => {
+					const close = () => done(undefined);
+					overlay = rt
+						? new SwarmOverlay(modelOf(rt), ui, theme, kb, close, view, name ? { member: name } : undefined)
+						: new EmptyOverlay(ui, kb, close, host.refusal(b.sessionId));
+					return overlay.component();
+				}, options);
+			} finally {
+				overlay?.dispose();
 			}
-			const model = modelOf(rt);
-			await ctx.ui.custom<void>(
-				(tui, theme, kb, done) => new SwarmOverlay(model, tui, theme, kb, () => done(undefined), view, name ? { member: name } : undefined),
-				options,
-			);
 		},
 	});
 
@@ -162,7 +160,7 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 			if (sub === "stop") {
 				if (rt && existing?.running) {
 					existing.stop();
-					widgets.get(rt.sid)?.();
+					widgets.get(rt.sid)?.set(undefined);
 					ctx.ui.notify("Web board stopped.", "info");
 				} else ctx.ui.notify("Web board is not running.", "info");
 				return;

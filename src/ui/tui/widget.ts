@@ -1,10 +1,13 @@
 // The status widget: one width-aware line under the editor, coalesced to ≤ 4 updates per second.
 
-import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui/native/node";
+import type { ExtensionUiHost } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/render-types";
+import { nativeRendering, onCleanup, signal, type Signal, type UiNode } from "@oh-my-pi/pi-tui";
 import { countMembers, type SwarmReadModel } from "../model.ts";
 import { fit, sanitizeLine, width } from "../sanitize.ts";
-import { NativeCache, span, text } from "./native.ts";
-import type { TuiLike } from "./overlay.ts";
+import { col, node, span, text } from "./native.ts";
+
+export type WidgetLink = Signal<string | undefined>;
+export const createWidgetLink = signal<string | undefined>;
 
 function widgetDetail(model: SwarmReadModel, budget?: number, native = false): string {
 	if (model.stalled()) return "stalled — waiting for you · /swarm";
@@ -34,6 +37,7 @@ export function widgetLine(model: SwarmReadModel, webUrl?: string, columns?: num
 		const line = `swarm · ${widgetDetail(model)}`;
 		return columns === undefined ? line : fit(line, columns);
 	}
+	webUrl = sanitizeLine(webUrl);
 	const label = `swarm · ${webUrl}`;
 	if (columns === undefined) return `${label} · ${widgetDetail(model)}`;
 	const room = columns - width(label);
@@ -43,31 +47,36 @@ export function widgetLine(model: SwarmReadModel, webUrl?: string, columns?: num
 	return `${label} · ${fit(widgetDetail(model, detailBudget), detailBudget)}`;
 }
 
-export function widgetComponent(model: SwarmReadModel, tui: TuiLike, webUrl: () => string | undefined) {
+export function widgetComponent(
+	model: SwarmReadModel,
+	_ui: ExtensionUiHost,
+	webUrl: () => string | undefined,
+): UiNode {
 	let timer: Timer | undefined;
-	const native = new NativeCache();
+	const revision = signal(0);
 	const unsubscribe = model.onChange(() => {
 		if (timer) return;
 		timer = setTimeout(() => {
 			timer = undefined;
-			tui.requestRender();
+			revision.update(n => n + 1);
 		}, 250);
 		timer.unref?.();
 	});
-	return {
-		render(width: number): string[] {
-			return [widgetLine(model, webUrl(), width)];
-		},
-		describe(cx: DescribeContext): NativeNode | null {
-			if (!cx.supports("text")) return null;
-			const link = webUrl();
-			return native.get(`${model.version}|${link ?? ""}`, () => text("widget", [
-				span("Swarm", "strong"), ...(link ? [span(` · ${link}`, "mono")] : []), span(` · ${widgetDetail(model, undefined, true)}`, "muted"),
-			], undefined, "omp.swarm.widget"));
-		},
-		dispose(): void {
-			unsubscribe();
-			clearTimeout(timer);
-		},
+	const widget = col("swarm-status", () => nativeRendering()
+		? text("widget", () => {
+			revision();
+			const link = sanitizeLine(webUrl());
+			return [span("Swarm", "strong"), ...(link ? [span(` · ${link}`, "mono")] : []), span(` · ${widgetDetail(model, undefined, true)}`, "muted")];
+		}, undefined, "omp.swarm.widget")
+		: node("canvas", "widget", { paint: width => { revision(); return [widgetLine(model, webUrl(), width)]; } }));
+	let disposed = false;
+	const dispose = () => {
+		if (disposed) return;
+		disposed = true;
+		unsubscribe();
+		clearTimeout(timer);
 	};
+	onCleanup(dispose);
+	widget.onDispose(dispose);
+	return widget;
 }

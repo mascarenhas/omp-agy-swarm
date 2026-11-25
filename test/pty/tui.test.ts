@@ -154,7 +154,7 @@ describe("omp TUI with the swarm plugin", () => {
 		await t.waitForNative(doc => JSON.stringify(doc ?? "").includes("Message swarm~lens"), "native worker focus");
 	}, 60_000);
 
-	test("/swarm with no swarm, then an idle coordinator woken by a worker; widget; overlay at 80×24 → 40×12; escapes sanitized", async () => {
+	test("/swarm with no swarm, then an idle coordinator woken by a worker; widget; fullscreen resize and safe text", async () => {
 		t = new PtyOmp(script());
 		await ready(t);
 		t.mark();
@@ -177,6 +177,14 @@ describe("omp TUI with the swarm plugin", () => {
 		t.mark();
 		t.resize(40, 12);
 		await t.waitFor(text => text.includes("1Ovw") && text.includes("2Brd"), 10_000, "narrow tabs after resize");
+		t.mark();
+		t.resize(40, 8);
+		await t.waitFor(text => text.includes("1Ovw") && text.includes("2Brd"), 10_000, "compact fullscreen after resize");
+		t.mark();
+		t.resize(20, 8);
+		await t.waitFor(text => text.includes("terminal too"), 10_000, "minimum-width guard");
+		t.resize(40, 12);
+		await t.waitFor(text => text.includes("1Ovw"), 10_000, "fullscreen restored after minimum-width guard");
 		t.mark();
 		t.write("3");
 		await t.waitFor(text => text.includes("w · waiting") || text.includes("w · working"), 5000, "members view");

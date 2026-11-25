@@ -1,14 +1,12 @@
 // One-line renderCall/renderResult for the main-session tools (§10.3).
 
+import type { ExtensionRows } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/render-types";
 import { fit, sanitizeLine } from "../ui/sanitize.ts";
 
-export interface LineComponent {
-	render(width: number): string[];
-}
-
-export function lineComponent(text: string): LineComponent {
+export function lineComponent(text: string): ExtensionRows | undefined {
 	const line = sanitizeLine(text);
-	return { render: (w: number) => [fit(line, w)] };
+	// Terminal-only summary. A semantic node would replace the host's full tool body in Tern.
+	return line ? { render: width => [fit(line, width)] } : undefined;
 }
 
 function shortModel(m: unknown): string {
@@ -17,6 +15,10 @@ function shortModel(m: unknown): string {
 }
 
 export function callLine(tool: string, args: Record<string, unknown>): string {
+	return sanitizeLine(callText(tool, args));
+}
+
+function callText(tool: string, args: Record<string, unknown>): string {
 	const name = typeof args.name === "string" ? args.name.trim() : "";
 	const channel = typeof args.channel === "string" ? args.channel.trim() : "";
 	switch (tool) {
@@ -49,6 +51,10 @@ export function callLine(tool: string, args: Record<string, unknown>): string {
 }
 
 export function resultLine(tool: string, details: Record<string, unknown> | undefined): string {
+	return sanitizeLine(resultText(tool, details));
+}
+
+function resultText(tool: string, details: Record<string, unknown> | undefined): string {
 	if (!details) return "";
 	if (typeof details.error === "string") return `error: ${details.error}`;
 	switch (tool) {

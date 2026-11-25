@@ -1,35 +1,36 @@
 // Transcript rows from the plugin render as plain text: persisted content can contain
 // terminal escapes, even for messages whose live source is trusted.
 
-import { Box, type Component, Spacer, Text, type Theme } from "@oh-my-pi/pi-tui";
-import type { DescribeContext } from "@oh-my-pi/pi-tui/native/node";
-import { sanitize } from "../sanitize.ts";
+import type { ExtensionTheme } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/render-types";
+import { nativeRendering, type JSXNode } from "@oh-my-pi/pi-tui";
+import { fit, pad, sanitize, wrap } from "../sanitize.ts";
 import { textOf } from "../transcript.ts";
-import { group, NativeCache, nativeKey, text } from "./native.ts";
+import { col, node, text } from "./native.ts";
 
-function sanitizedCustomMessage(role: string, heading: string, label: (theme: Theme) => string) {
-	return (message: { content: unknown }, _options: { expanded: boolean }, theme: Theme): Component => {
+function notice(role: string, heading: string, label: (theme: ExtensionTheme) => string) {
+	return (message: { content: unknown }, _options: { expanded: boolean }, theme: ExtensionTheme): JSXNode => {
 		const body = sanitize(textOf(message.content));
-		const native = new NativeCache();
-		const box = new Box(1, 1, text => theme.bg("customMessageBg", text), {
-			chars: theme.boxRound,
-			color: text => theme.fg("borderMuted", text),
-		});
-		box.addChild(new Text(theme.fg("customMessageLabel", theme.bold(label(theme))), 0, 0));
-		box.addChild(new Spacer(1));
-		box.addChild(new Text(theme.fg("customMessageText", body), 0, 0));
-		return {
-			render: width => box.render(width),
-			invalidate: () => box.invalidate(),
-			describe(cx: DescribeContext) {
-				if (!cx.supports("text")) return null;
-				return native.get(nativeKey(cx), () => cx.supports("col") || cx.supports("row")
-					? group(cx, "notice", [text("heading", heading, "strong"), text("body", body)], role)
-					: text("notice", `${heading}\n${body}`, undefined, role));
-			},
-		};
+		return () => nativeRendering()
+			? col("notice", [text("heading", heading, "strong"), text("body", body)], role)
+			: node("canvas", "notice", {
+				paint: width => {
+					if (width < 5) return [fit(heading, width)];
+					const { topLeft, topRight, bottomLeft, bottomRight, horizontal, vertical } = theme.symbols.box;
+					const border = (line: string) => theme.bg("customMessageBg", theme.fg("borderMuted", line));
+					const edge = border(vertical);
+					const room = width - 4;
+					const line = (value: string) => `${edge}${theme.bg("customMessageBg", ` ${pad(value, room)} `)}${edge}`;
+					return [
+						border(topLeft + horizontal.repeat(width - 2) + topRight),
+						line(theme.fg("customMessageLabel", theme.bold(label(theme)))),
+						line(""),
+						...wrap(body, room).map(part => line(theme.fg("customMessageText", part))),
+						border(bottomLeft + horizontal.repeat(width - 2) + bottomRight),
+					];
+				},
+			});
 	};
 }
 
-export const renderWakeMessage = sanitizedCustomMessage("omp.swarm.wake", "Swarm wake", theme => `${theme.icon.package} swarm`);
-export const renderWebBoardMessage = sanitizedCustomMessage("omp.swarm.webNotice", "Swarm web board", () => "Swarm web board");
+export const renderWakeMessage = notice("omp.swarm.wake", "Swarm wake", theme => `${theme.symbols.icon("package")} swarm`.trim());
+export const renderWebBoardMessage = notice("omp.swarm.webNotice", "Swarm web board", () => "Swarm web board");

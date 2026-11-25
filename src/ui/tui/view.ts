@@ -1,11 +1,11 @@
 // Shared contract between the /swarm overlay and its four views.
 
-import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import { nativeSupports, signal, type Accessor, type KeyEvent, type UiEvent, type UiNode } from "@oh-my-pi/pi-tui";
 import type { SwarmReadModel, ViewFiles } from "../model.ts";
 import type { Keys, ThemeLike } from "./keys.ts";
 import { sanitize } from "../sanitize.ts";
 import { printable } from "./keys.ts";
-import { text } from "./native.ts";
+import { input, span, text } from "./native.ts";
 
 export type ViewId = "overview" | "board" | "members" | "transcript";
 
@@ -22,6 +22,8 @@ export interface ViewHost {
 	open(view: ViewId, target?: OpenTarget): void;
 	/** Returns to the view (and selection) the transcript was opened from. */
 	back(): boolean;
+	/** Runs an action from the currently visible view unless help or a text field owns the input. */
+	interact(view: View, action: () => void): void;
 	requestRender(): void;
 }
 
@@ -33,17 +35,15 @@ export interface View {
 	/** Key hints that fit the width. */
 	hints(native?: boolean): string[];
 	/** Returns true when the key was consumed. */
-	handleInput(data: string, native?: boolean): boolean;
+	handleInput(key: KeyEvent, native?: boolean): boolean;
 	/** True while a text input or detail pane owns Esc. */
 	capturing(native?: boolean): boolean;
 	/** Called when the view is shown with a target. */
 	show(target?: OpenTarget): void;
-	describe(cx: DescribeContext): NativeNode;
-	handleNativeEvent(event: NativeUiEvent, key: string): boolean;
-	/** The actual text field lives in the overlay's dock while capturing input. */
-	describeField?(cx: DescribeContext): NativeNode | undefined;
-	handleFieldEvent?(event: NativeUiEvent): boolean;
-	nativeStatus(cx: DescribeContext): string;
+	native(revision: Accessor<number>): UiNode;
+	/** The native page presents this field while capturing input. */
+	field?(): Capture | undefined;
+	nativeStatus(): string;
 }
 
 /** One bounded edit buffer for PTY keys and TSP selection edits. */
@@ -53,19 +53,20 @@ export class Capture {
 	readonly #digits: boolean;
 	#text: string;
 	#cursor: number;
-	#undo: { text: string; cursor: number }[] = [];
-	#revision = 0;
+	readonly #undo: { text: string; cursor: number }[] = [];
+	readonly #revision = signal(0);
+	readonly #changed: ((inserted: boolean) => void) | undefined;
 
-	constructor(key: string, prompt: string, initial: string, digits = false) {
+	constructor(key: string, prompt: string, initial: string, digits = false, changed?: (inserted: boolean) => void) {
 		this.#key = key;
 		this.#prompt = prompt;
 		this.#digits = digits;
+		this.#changed = changed;
 		this.#text = this.#clean(initial);
 		this.#cursor = this.#text.length;
 	}
 
 	get value(): string { return this.#text; }
-	get stamp(): string { return `${this.#key}:${this.#revision}`; }
 
 	#clean(value: string): string {
 		const plain = sanitize(value).replace(/\n/g, " ");
@@ -97,11 +98,11 @@ export class Capture {
 		}
 		this.#text = next;
 		this.#cursor = caret;
-		this.#revision++;
+		this.#revision.update(n => n + 1);
 		return true;
 	}
 
-	handleKey(keys: Keys, data: string): boolean {
+	handleKey(keys: Keys, data: KeyEvent): boolean {
 		if (keys.backspace(data) && this.#cursor > 0) {
 			const from = this.#offset(this.#text, this.#cursor - 1);
 			return this.#replace(from, this.#cursor, "", from);
@@ -110,22 +111,38 @@ export class Capture {
 		return !!ch && this.#replace(this.#cursor, this.#cursor, ch, this.#cursor + ch.length);
 	}
 
-	handleEvent(event: NativeUiEvent): boolean {
-		if (event.key !== this.#key) return false;
-		if (event.type === "edit" && event.len === this.#text.length) return this.#replace(event.from, event.to, event.text, event.cursor);
-		if (event.type !== "undo") return false;
-		const previous = this.#undo.pop();
-		if (!previous) return false;
-		this.#text = previous.text;
-		this.#cursor = previous.cursor;
-		this.#revision++;
+	paste(text: string): boolean {
+		if (!this.#replace(this.#cursor, this.#cursor, text, this.#cursor + text.length)) return false;
+		this.#changed?.(true);
 		return true;
 	}
 
-	describe(cx: DescribeContext): NativeNode {
-		return cx.supports("input")
-			? { k: "input", key: this.#key, p: { prompt: this.#prompt, text: this.#text, cursor: this.#cursor, sendable: false } }
-			: text(this.#key, `${this.#prompt}: ${this.#text}▏`, "mono");
+	#edit(event: Extract<UiEvent, { type: "edit" }>): void {
+		if (event.len === this.#text.length && this.#replace(event.from, event.to, event.text, event.cursor)) this.#changed?.(!!event.text);
+	}
+
+	#undoEdit(): void {
+		const previous = this.#undo.pop();
+		if (!previous) return;
+		this.#text = previous.text;
+		this.#cursor = previous.cursor;
+		this.#revision.update(n => n + 1);
+		this.#changed?.(false);
+	}
+
+	native(): UiNode {
+		if (!nativeSupports("input")) return text(this.#key, () => {
+			this.#revision();
+			return [span(`${this.#prompt}: ${this.#text}▏`, "mono")];
+		});
+		return input(this.#key, {
+			prompt: `${this.#prompt}: `,
+			text: () => { this.#revision(); return this.#text; },
+			cursor: () => { this.#revision(); return this.#cursor; },
+			sendable: false,
+			onEdit: event => this.#edit(event),
+			onUndo: () => this.#undoEdit(),
+		});
 	}
 }
 

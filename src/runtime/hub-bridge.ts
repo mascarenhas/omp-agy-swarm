@@ -5,7 +5,7 @@ import {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	type SubagentLifecyclePayload,
 	type SubagentProgressPayload,
-} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+} from "@oh-my-pi/pi-coding-agent/task/session-observer-registry";
 import { describeToolCall, oneLine } from "./activity.ts";
 
 type Progress = SubagentProgressPayload["progress"];

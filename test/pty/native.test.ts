@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { encodeTspJson, encodeTspMessage, splitTspMessage } from "@oh-my-pi/pi-tui/native/encode";
+import { encodeTsp, encodeTspJson, parseTspApc } from "@oh-my-pi/pi-tui/native/apc";
 import type { TspFrame, TspNode } from "@oh-my-pi/pi-wire";
 import type { Script } from "../e2e/mock-llm/server.ts";
 import { NativePeer, PtyOmp } from "../helpers/pty.ts";
@@ -61,18 +61,18 @@ function coordinatorTurns(p: PtyOmp): number {
 test("native peer replies to hello before DA1 and acknowledges complete chunked UTF-8 frames", () => {
 	const peer = new NativePeer({}, 100);
 	const hello = encodeTspJson("q", { q: "hello" });
-	const frame = encodeTspMessage("f", JSON.stringify({ sf: "s:9", s: 4, ops: ["界🐙", "quotes;f=x;".repeat(24)] }), undefined, 25);
+	const frame = encodeTsp("f", JSON.stringify({ sf: "s:9", s: 4, ops: ["界🐙", "quotes;f=x;".repeat(24)] }), undefined, 25);
 	const bytes = Buffer.from(`\x1b[6n${hello}\x1b[c${frame}`);
 	const replies: string[] = [];
 	for (let i = 0; i < bytes.length; i++) peer.read(bytes.subarray(i, i + 1), s => replies.push(s));
 	expect(replies).toHaveLength(4);
 	expect(replies[0]).toBe("\x1b[1;1R");
-	expect(JSON.parse(splitTspMessage(replies[1]!)!.body)).toMatchObject({ r: "hello", term: "test", credits: 8 });
+	expect(JSON.parse(parseTspApc(replies[1]!)!.body)).toMatchObject({ r: "hello", term: "test", credits: 8 });
 	expect(replies[2]).toBe("\x1b[?62;22c");
-	expect(JSON.parse(splitTspMessage(replies[3]!)!.body)).toEqual({ ev: "ack", sf: "s:9", s: 4 });
+	expect(JSON.parse(parseTspApc(replies[3]!)!.body)).toEqual({ ev: "ack", sf: "s:9", s: 4 });
 });
 
-test("native /swarm owns a screen, edits its dock, and returns to semantic inline notices and widget", async () => {
+test("native /swarm owns a screen, focuses its inputs, and returns to semantic inline notices and widget", async () => {
 	const late = Promise.withResolvers<void>();
 	releaseWorker = late.resolve;
 	const worker = SCRIPT["worker-a"]!;
@@ -134,12 +134,29 @@ test("native /swarm owns a screen, edits its dock, and returns to semantic inlin
 	expect(!!find(appended.doc, n => n.id === posts.id && n.k === "list" && n.p?.selected === older.id)).toBe(true);
 	expect(!!find(appended.doc, n => n.id === latest.id)).toBe(true);
 	expect(appended.rows).toBe(0);
-	const field = await p.waitForNative(doc => !!find(region(doc, "dock"), n => n.k === "input"), "native search field in dock");
-	const input = find(region(field.doc, "dock"), n => n.k === "input")!;
+	const field = await p.waitForNative(doc => !!find(region(doc, "main"), n => n.k === "input"), "native search field in the focused page");
+	const input = find(region(field.doc, "main"), n => n.k === "input")!;
+	p.nativeEvent({ ev: "focus", sf, id: input.id });
 	p.nativeEvent({ ev: "edit", sf, id: input.id, from: 0, to: 0, text: "NATIVE-RESULT", cursor: 13, len: 0 });
 	await p.waitForNative(doc => !!find(doc, n => n.id === input.id && n.k === "input" && n.p?.text === "NATIVE-RESULT"), "native field edit");
 	p.write("\r");
 	await p.waitForNative(doc => includes(role(doc, "dock"), "/NATIVE-RESULT") && !find(doc, n => n.k === "input"), "search committed via PTY Enter");
+	const debugDoc = await p.debug({ op: "doc" });
+	expect(debugDoc).toMatchObject({ ok: true, native: true, doc: { main: expect.any(Array), dock: expect.any(Array), layer: expect.any(Array), focus: "layer:swarm/page" } });
+
+	p.write("/");
+	const rawSearch = await p.waitForNative(doc => !!find(region(doc, "main"), n => n.k === "input"), "raw slash opens the search field");
+	const rawInput = find(region(rawSearch.doc, "main"), n => n.k === "input")!;
+	expect(rawInput.id).not.toBe(input.id);
+	await p.type("ja");
+	await p.waitForNative(doc => !!find(doc, n => n.id === rawInput.id && n.k === "input" && n.p?.text === "NATIVE-RESULTja"), "raw keys edit the visible search field");
+	p.write("\x1b");
+	await p.waitForNative(doc => !find(doc, n => n.k === "input") && !includes(role(doc, "dock"), "/NATIVE-RESULTja"), "raw Escape clears search");
+	await p.type("/APPEND");
+	await p.waitForNative(doc => !!find(doc, n => n.k === "input" && n.p?.text === "APPEND"), "raw keys enter a fresh search");
+	p.write("\r");
+	await p.waitForNative(doc => !find(doc, n => n.k === "input") && includes(role(doc, "dock"), "/APPEND"), "raw Enter commits search");
+
 	p.nativeEvent({ ev: "features", features: ["edit", "undo", "send"] });
 	p.nativeEvent({ ev: "theme", dark: false });
 	p.nativeEvent({ ev: "motion", reduce: true });
@@ -177,13 +194,15 @@ test("native /swarm owns a screen, edits its dock, and returns to semantic inlin
 	const reply = await p.debug({ op: "tsp", n: 64 });
 	const frames = (reply.frames as readonly TspFrame[]).filter(f => f.sf === sf);
 	expect(frames.length).toBeGreaterThan(8); // crosses the credit window
-	expect(frames.some(f => f.ops.some(op => op[0] === "focus" && op[1] === input.id))).toBe(true);
+	expect(frames.some(f => f.ops.some(op => op[0] === "text" && op[1] === input.id && op[3] === "NATIVE-RESULT"))).toBe(true);
+	const focus = frames.flatMap(f => f.ops.flatMap(op => op[0] === "focus" ? [op[1]] : []));
+	expect(focus.slice(0, 4)).toEqual([input.id, null, rawInput.id, null]);
 	expect(frames.some(f => f.ops.some(op => op[0] === "add" && !!rows(op[4])))).toBe(false);
 	for (const tab of ["overview", "members", "transcript"] as const) {
 		const activated = frames.find(f => f.ops.some(op => op[0] === "add" && op[4].k === "tabs" && op[4].p?.active === tab));
 		expect(activated).toBeDefined();
 		expect(activated?.ops.some(op => op[0] === "add" && !!role(op[4], tab))).toBe(true);
-		expect(activated?.ops.some(op => op[0] === "del" && op[1].includes(".tabs:"))).toBe(true);
+		expect(activated?.ops.some(op => op[0] === "del" && op[1].includes("/tabs:"))).toBe(true);
 		expect(p.native?.lastAck.get(sf) ?? 0).toBeGreaterThanOrEqual(activated?.s ?? Infinity);
 	}
 
@@ -207,13 +226,13 @@ test("native /swarm owns a screen, edits its dock, and returns to semantic inlin
 	p.write("q");
 	await p.waitForNative(doc => doc?.id === inline.id && !!editor(doc), "return from the second Swarm screen");
 	for (let i = 0; i < 3; i++) {
-		const prior = await p.debug({ op: "doc" });
-		const old = editor(prior.doc as TspNode | undefined);
+		const old = editor(p.native?.document());
+		const previousText = old?.k === "editor" ? old.p?.text : undefined;
 		if (old?.k === "editor" && old.p?.text === draft) break;
 		p.write("\x1b[A");
 		await p.waitForNative(doc => {
 			const next = editor(doc);
-			return next?.k === "editor" && (old?.k !== "editor" || next.p?.text !== old.p?.text);
+			return next?.k === "editor" && next.p?.text !== previousText;
 		}, "recall the displaced inline draft");
 	}
 	await p.waitForNative(doc => !!find(region(doc, "dock"), n => n.k === "editor" && n.p?.text === draft), "unsubmitted draft preserved in local recall");
@@ -231,11 +250,41 @@ test("a reduced native peer still has a semantic screen and keyboard navigation"
 	p.write("2");
 	await p.waitForNative(doc => !!role(doc, "board"), "reduced Board");
 	p.write("/");
-	await p.waitForNative(doc => includes(role(doc, "dock"), "Search posts:"), "text-only search capture");
+	await p.waitForNative(doc => includes(role(doc, "page"), "Search posts:"), "text-only search capture");
 	p.write("\x1b");
-	await p.waitForNative(doc => !includes(role(doc, "dock"), "Search posts:") && !!role(doc, "board"), "text-only search dismissed");
+	await p.waitForNative(doc => !includes(role(doc, "page"), "Search posts:") && !!role(doc, "board"), "text-only search dismissed");
 	p.write("q");
 	await p.waitForNative(doc => !!editor(doc), "reduced inline compositor restored");
+}, 60_000);
+
+test("a reduced peer with buttons can switch tabs and dismiss inline help", async () => {
+	const p = tty = new PtyOmp(SCRIPT, 100, 32, {}, { kinds: ["col", "text", "button", "editor", "rows"] });
+	await p.waitForNative(doc => !!editor(doc), "reduced native editor");
+	await submit(p, "native-swarm-start");
+	await p.waitForNative(doc => !!editor(doc) && !!role(doc, "widget"), "reduced native widget");
+	await submit(p, "/swarm");
+	const action = (doc: TspNode | undefined, name: string) => find(doc, n => n.k === "button" && n.p?.actions?.click === `swarm.${name}`);
+	const overview = await p.waitForNative(doc => !!role(doc, "overview") && !!action(doc, "board"), "tab button fallback");
+	expect(overview.rows).toBe(0);
+	const sf = overview.doc.id;
+	const selectBoard = action(overview.doc, "board")!;
+	expect(find(overview.doc, n => n.k === "tabs")).toBeUndefined();
+	p.nativeEvent({ ev: "action", sf, id: selectBoard.id, act: "swarm.board" });
+	const board = await p.waitForNative(doc => includes(role(doc, "board"), "NATIVE-RESULT"), "fallback Board tab clicked and shows worker post");
+	expect(board.doc.id).toBe(sf);
+	expect(board.rows).toBe(0);
+	expect(find(board.doc, n => !["col", "text", "button"].includes(n.k))).toBeUndefined();
+	expect(includes(role(board.doc, "header"), "Spend")).toBe(true);
+
+	p.write("?");
+	const help = await p.waitForNative(doc => !!role(region(doc, "main"), "help") && !!action(doc, "close-help"), "inline help and dismissal button");
+	expect(help.rows).toBe(0);
+	expect(role(region(help.doc, "layer"), "help")).toBeUndefined();
+	const dismiss = action(help.doc, "close-help")!;
+	p.nativeEvent({ ev: "action", sf, id: dismiss.id, act: "swarm.close-help" });
+	await p.waitForNative(doc => !role(doc, "help") && !!role(doc, "board"), "inline help dismissed without switching views");
+	p.write("q");
+	await p.waitForNative(doc => !!editor(doc), "close the reduced native screen");
 }, 60_000);
 
 test("compiled TUI coordinator receives a worker mention at its next foreground tool boundary", async () => {

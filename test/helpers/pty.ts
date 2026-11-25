@@ -1,18 +1,20 @@
 // A real omp TUI in a pseudo-terminal (H22) against the scripted mock provider.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { connect } from "node:net";
 import { join } from "node:path";
-import { encodeTspJson, splitTspMessage, TSP_PREFIX } from "@oh-my-pi/pi-tui/native/encode";
-import { TSP_KINDS, TSP_VERSION, type TspClose, type TspEvent, type TspKind, type TspNode, type TspOpen } from "@oh-my-pi/pi-wire";
+import { encodeTspJson, parseTspApc, TspChunkReader, type TspHelloReply } from "@oh-my-pi/pi-tui/native/apc";
+import { TSP_APC_ID, TSP_KINDS, TSP_VERSION, type TspClose, type TspEvent, type TspFrame, type TspKind, type TspNode, type TspOpen } from "@oh-my-pi/pi-wire";
 import { resolveOmpBin, stripNodeModulesBins } from "../../scripts/omp-bin.ts";
 import { listeningSockets } from "../e2e/check.ts";
 import { MockLlm, type Script } from "../e2e/mock-llm/server.ts";
 import { REPO } from "./harness.ts";
 
 const PROVIDER = join(REPO, "test", "e2e", "mock-llm", "provider.ts");
+const TSP_PREFIX = `\x1b_${TSP_APC_ID};`;
+const TSP_OR_QUERY = new RegExp(`${TSP_PREFIX}|\\x1b\\[(?:0?c|6n)`, "g");
 
 // biome-ignore lint/suspicious/noControlCharactersInRegex: terminal control stripping
 const ANSI = /\u001b\[[0-9;?<>=]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[PX^_][^\u001b]*\u001b\\|\u001b[=>()][0-9A-Za-z]?/g;
@@ -24,6 +26,98 @@ interface NativeTestSession {
 	apc?: number;
 }
 
+interface PeerNode {
+	id: string;
+	k: TspKind;
+	p?: Record<string, unknown>;
+	c: PeerNode[];
+}
+
+/** Replay 19.2's actual wire IDs and layer hoists. Debug `doc` has only key-based region arrays. */
+class PeerDocument {
+	readonly root: PeerNode;
+	readonly #nodes = new Map<string, PeerNode>();
+	readonly #parents = new Map<string, PeerNode>();
+
+	constructor(id: string) {
+		this.root = this.#index({ id, k: "col" });
+	}
+
+	#index(node: TspNode): PeerNode {
+		const copy: PeerNode = { id: node.id, k: node.k, ...(node.p && { p: { ...node.p } }), c: [] };
+		this.#nodes.set(node.id, copy);
+		for (const child of node.c ?? []) {
+			copy.c.push(this.#index(child));
+			this.#parents.set(child.id, copy);
+		}
+		return copy;
+	}
+
+	#detach(id: string): PeerNode | undefined {
+		const node = this.#nodes.get(id);
+		const parent = this.#parents.get(id);
+		if (!node || !parent) return node;
+		parent.c.splice(parent.c.indexOf(node), 1);
+		this.#parents.delete(id);
+		return node;
+	}
+
+	#drop(node: PeerNode): void {
+		for (const child of node.c) this.#drop(child);
+		this.#nodes.delete(node.id);
+		this.#parents.delete(node.id);
+	}
+
+	remove(id: string): void {
+		const node = this.#detach(id);
+		if (node) this.#drop(node);
+	}
+
+	frame({ ops }: TspFrame): void {
+		for (const op of ops) {
+			switch (op[0]) {
+				case "add":
+				case "move": {
+					const [, id, parentId, before] = op;
+					const parent = this.#nodes.get(parentId);
+					if (!parent) throw new Error(`Unknown native parent: ${parentId}`);
+					const child = op[0] === "add" ? this.#index(op[4]) : this.#detach(id);
+					if (!child) throw new Error(`Unknown native child: ${id}`);
+					const at = before === null ? parent.c.length : parent.c.findIndex(n => n.id === before);
+					if (at < 0) throw new Error(`Unknown native sibling: ${before}`);
+					parent.c.splice(at, 0, child);
+					this.#parents.set(id, parent);
+					break;
+				}
+				case "del":
+					this.remove(op[1]);
+					break;
+				case "set":
+				case "text":
+				case "splice": {
+					const node = this.#nodes.get(op[1]);
+					if (!node) throw new Error(`Unknown native update target: ${op[1]}`);
+					const props = node.p ??= {};
+					const text = typeof props.text === "string" ? props.text : "";
+					if (op[0] === "text") props.text = op[2] === "append" ? text + op[3] : op[3];
+					else if (op[0] === "splice") props.text = text.slice(0, op[2]) + op[4] + text.slice(op[2] + op[3]);
+					else for (const [key, value] of Object.entries(op[2])) {
+						if (value === null) delete props[key];
+						else props[key] = value;
+					}
+					break;
+				}
+			}
+		}
+	}
+}
+
+function countRows(node: TspNode): number {
+	let count = Number(node.k === "rows");
+	for (const child of node.c ?? []) count += countRows(child);
+	return count;
+}
+
 /** Terminal-side TSP simulation, before any ANSI interpretation or stripping. */
 export class NativePeer {
 	readonly opens: TspOpen[] = [];
@@ -31,22 +125,31 @@ export class NativePeer {
 	readonly lastAck = new Map<string, number>();
 	readonly #hello: string;
 	readonly #decoder = new TextDecoder();
-	readonly #chunks = new Map<string, string[]>();
+	readonly #chunks = new TspChunkReader();
+	readonly #docs = new Map<string, PeerDocument>();
+	readonly #open = new Set<string>();
 	#carry = "";
 
 	constructor(options: NativeTestSession, cols: number) {
-		this.#hello = encodeTspJson("r", { r: "hello", v: TSP_VERSION, term: "test", kinds: options.kinds ?? TSP_KINDS,
-			features: ["tray", "edit", "undo", "send", "scroll"], cols, apc: options.apc ?? 1_048_576, dark: true, credits: 8 });
+		const hello: TspHelloReply = { r: "hello", v: TSP_VERSION, term: "test", kinds: options.kinds ?? TSP_KINDS,
+			features: ["tray", "edit", "undo", "send", "scroll"], cols, apc: options.apc ?? 1_048_576, dark: true, credits: 8 };
+		this.#hello = encodeTspJson("r", hello);
+	}
+
+	document(): TspNode | undefined {
+		const id = [...this.#open].at(-1);
+		return id ? this.#docs.get(id)?.root as TspNode | undefined : undefined;
 	}
 
 	read(data: Uint8Array, reply: (s: string) => void): void {
 		const stream = this.#carry + this.#decoder.decode(data, { stream: true });
-		const tokens = /\x1b(?:_tsp;|\[(?:0?c|6n))/g;
-		this.#carry = stream.slice(-5);
+		const tokens = new RegExp(TSP_OR_QUERY);
+		const keep = TSP_PREFIX.length - 1;
+		this.#carry = stream.slice(-keep);
 		for (let token = tokens.exec(stream); token; token = tokens.exec(stream)) {
 			if (token[0] !== TSP_PREFIX) {
 				reply(token[0] === "\x1b[6n" ? "\x1b[1;1R" : "\x1b[?62;22c");
-				this.#carry = stream.slice(Math.max(tokens.lastIndex, stream.length - 5));
+				this.#carry = stream.slice(Math.max(tokens.lastIndex, stream.length - keep));
 				continue;
 			}
 			const end = stream.indexOf("\x1b\\", tokens.lastIndex);
@@ -54,38 +157,40 @@ export class NativePeer {
 				this.#carry = stream.slice(token.index);
 				return;
 			}
-			const packet = splitTspMessage(stream.slice(token.index, end + 2));
+			const chunk = parseTspApc(stream.slice(token.index, end + 2));
 			tokens.lastIndex = end + 2;
-			this.#carry = stream.slice(Math.max(tokens.lastIndex, stream.length - 5));
+			this.#carry = stream.slice(Math.max(tokens.lastIndex, stream.length - keep));
+			const packet = chunk && this.#chunks.feed(chunk);
 			if (!packet) continue;
-			const { verb, params } = packet;
-			if (verb !== "q" && verb !== "f" && verb !== "o" && verb !== "x") continue;
-			let body = packet.body;
-			if (params.c) {
-				const chunk = `${verb}:${params.c}`;
-				const parts = this.#chunks.get(chunk) ?? [];
-				parts.push(body);
-				if (params.m === "1") {
-					this.#chunks.set(chunk, parts);
-					continue;
-				}
-				this.#chunks.delete(chunk);
-				body = parts.join("");
-			}
+			const { verb, body } = packet;
 			if (verb === "q") {
 				const query = JSON.parse(body) as { q: string };
 				if (query.q === "hello") reply(this.#hello);
 			} else if (verb === "f") {
-				const { sf, s } = JSON.parse(body) as { sf: string; s: number };
-				reply(encodeTspJson("e", { ev: "ack", sf, s }));
-				this.lastAck.set(sf, s);
-			} else if (verb === "o") this.opens.push(JSON.parse(body) as TspOpen);
-			else this.closes.push(JSON.parse(body) as TspClose);
+				const frame = JSON.parse(body) as TspFrame;
+				this.#docs.get(frame.sf)?.frame(frame);
+				reply(encodeTspJson("e", { ev: "ack", sf: frame.sf, s: frame.s }));
+				this.lastAck.set(frame.sf, frame.s);
+			} else if (verb === "o") {
+				const open = JSON.parse(body) as TspOpen;
+				this.opens.push(open);
+				if (!open.adopt || !this.#docs.has(open.id)) this.#docs.set(open.id, new PeerDocument(open.id));
+				this.#open.add(open.id);
+			} else if (verb === "x") {
+				const close = JSON.parse(body) as TspClose;
+				this.closes.push(close);
+				this.#open.delete(close.id);
+				if (!close.keep) this.#docs.delete(close.id);
+				else {
+					this.#docs.get(close.id)?.remove("dock");
+					this.#docs.get(close.id)?.remove("layer");
+				}
+			}
 		}
 	}
 }
 
-export interface NativeDebugDocument {
+interface NativeWireDocument {
 	doc: TspNode;
 	rows: number;
 }
@@ -227,17 +332,15 @@ export class PtyOmp {
 		return promise;
 	}
 
-	async waitForNative(pred: (doc: TspNode | undefined, rows: number | undefined) => boolean, what: string, ms = 15_000): Promise<NativeDebugDocument> {
-		const socket = this.debugSocket;
-		if (!socket) throw new Error("TUI debug socket was not enabled");
+	async waitForNative(pred: (doc: TspNode | undefined, rows: number | undefined) => boolean, what: string, ms = 15_000): Promise<NativeWireDocument> {
+		const peer = this.native;
+		if (!peer) throw new Error("The PTY does not have a native peer");
 		const end = Date.now() + ms;
 		while (Date.now() < end && this.proc.exitCode === null) {
-			if (existsSync(socket)) {
-				const result = await this.debug({ op: "doc" });
-				if (result.ok === true) {
-					const { doc, rows } = result as unknown as NativeDebugDocument;
-					if (pred(doc, rows)) return { doc, rows };
-				}
+			const doc = peer.document();
+			if (doc) {
+				const rows = countRows(doc);
+				if (pred(doc, rows)) return { doc: structuredClone(doc), rows };
 			}
 			await Bun.sleep(25);
 		}

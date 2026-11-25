@@ -1,12 +1,12 @@
 import { appendFileSync, existsSync } from "node:fs";
 import { AgentRegistry, AgentSession, type AgentRef, type ExtensionAPI, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent";
+import { progressMetrics } from "@oh-my-pi/pi-coding-agent/modes/view-model/overlays/agent-hub-projection";
 import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { SessionObserverRegistry, TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL, type SubagentLifecyclePayload } from "@oh-my-pi/pi-coding-agent/task/session-observer-registry";
 import { cfgTaskAgentModelOverrides, cfgTaskEnableEffort, cfgTaskMaxConcurrency, cfgTaskWorkerThreads } from "@oh-my-pi/pi-coding-agent/task/settings";
 import { TASK_SUBAGENT_EVENT_CHANNEL, type SubagentEventPayload } from "@oh-my-pi/pi-coding-agent/task/types";
-import { isRemoteScoutSession } from "../../src/runtime/omp-adapter.ts";
-import { SessionObserverRegistry, TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL, type SubagentLifecyclePayload } from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
-import { progressMetrics } from "@oh-my-pi/pi-tui/overlays/agent-hub-projection";
 import { z } from "@oh-my-pi/omptype/zod";
+import { isRemoteScoutSession } from "../../src/runtime/omp-adapter.ts";
 
 const spendDetails = z.object({ spend: z.object({ cost: z.number(), tokens: z.number(), unknown: z.string().optional() }) });
 

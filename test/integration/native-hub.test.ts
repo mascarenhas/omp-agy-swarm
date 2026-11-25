@@ -57,7 +57,7 @@ test("compiled Headless: real CAS and reservations, board wait, stop-gate, termi
 		symlinkSync(physicalSessions, ctx.sessions, "dir");
 		const home = join(root, "home");
 		mkdirSync(home);
-		writeFileSync(join(ctx.agent, "config.yml"), "retry:\n  maxRetries: 1\n  baseDelayMs: 20\n");
+		writeFileSync(join(ctx.agent, "config.yml"), "retry:\n  maxRetries: 1\n  baseDelayMs: 20\ntask:\n  crossInstance: true\n");
 		mock.start();
 		const launch = {
 			pluginArgs: ["--no-extensions", "-e", join(REPO, "test/fixtures/hub-probe.ts"), "-e", REPO],
@@ -77,6 +77,7 @@ test("compiled Headless: real CAS and reservations, board wait, stop-gate, termi
 		expect(row("init-failure")).toMatchObject({ rolledBack: true, initError: "injected initializeExtensions rejection", sameId: true });
 		const parked = row("parked");
 		expect(parked).toMatchObject({ status: "running", activity: "waiting on board", parentless: true, raw: true, ownsFocus: true, contextStatus: "active", mainWakeAgents: [], inRoot: true });
+		expect(parked).toMatchObject({ mainCrossInstance: true, workerCrossInstance: false, workerAdvertisesPeers: false });
 		expect(String(parked?.file).startsWith(`${ctx.sessions}/`)).toBe(true);
 		expect(parked?.history).toBe(parked?.file);
 		expect(snapshots.some(s => s.stage === "session-stop" && s.runningWorker === true)).toBe(true);
