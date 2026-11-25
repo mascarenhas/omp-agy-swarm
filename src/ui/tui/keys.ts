@@ -1,83 +1,42 @@
 // Key handling for the /swarm overlay: navigation through the host's keybinding ids; literal keys
 // only for app actions (§10.2).
 
-import { type KeyId, matchesKey } from "@oh-my-pi/pi-tui";
+import type { ExtensionTheme } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/render-types";
+import type { KeyEvent } from "@oh-my-pi/pi-tui";
+
+type SelectionAction = `tui.select.${"up" | "down" | "pageUp" | "pageDown" | "confirm" | "cancel"}`;
 
 export interface KeybindingMatcher {
-	matches(data: string, id: string): boolean;
+	matches(event: KeyEvent, action: SelectionAction): boolean;
 }
 
-export interface ThemeLike {
-	fg(color: string, text: string): string;
-	bold(text: string): string;
-	inverse(text: string): string;
+export type ThemeLike = ExtensionTheme;
+
+export function isKey(key: KeyEvent, id: string): boolean {
+	return key.kind !== "release" && key.id === id;
 }
 
 export class Keys {
-	readonly #kb: KeybindingMatcher | undefined;
+	constructor(private readonly kb: KeybindingMatcher | undefined) {}
 
-	constructor(kb: KeybindingMatcher | undefined) {
-		this.#kb = kb;
-	}
-
-	#m(data: string, id: string, fallback: string): boolean {
-		try {
-			if (this.#kb?.matches(data, id)) return true;
-		} catch {}
-		try {
-			return matchesKey(data, fallback as KeyId);
-		} catch {
-			return false;
-		}
+	#matches(key: KeyEvent, action: SelectionAction, fallback: string): boolean {
+		return key.kind !== "release" && (key.id === fallback || this.kb?.matches(key, action) === true);
 	}
 
-	up(d: string): boolean {
-		return this.#m(d, "tui.select.up", "up");
-	}
-	down(d: string): boolean {
-		return this.#m(d, "tui.select.down", "down");
-	}
-	pageUp(d: string): boolean {
-		return this.#m(d, "tui.select.pageUp", "pageUp");
-	}
-	pageDown(d: string): boolean {
-		return this.#m(d, "tui.select.pageDown", "pageDown");
-	}
-	confirm(d: string): boolean {
-		return this.#m(d, "tui.select.confirm", "enter");
-	}
-	cancel(d: string): boolean {
-		return this.#m(d, "tui.select.cancel", "escape");
-	}
-	home(d: string): boolean {
-		return safeMatch(d, "home");
-	}
-	end(d: string): boolean {
-		return safeMatch(d, "end");
-	}
-	tab(d: string): boolean {
-		return d === "\t";
-	}
-	shiftTab(d: string): boolean {
-		return d === "\x1b[Z" || safeMatch(d, "shift+tab");
-	}
-	backspace(d: string): boolean {
-		return d === "\x7f" || d === "\b" || safeMatch(d, "backspace");
-	}
+	up(key: KeyEvent): boolean { return this.#matches(key, "tui.select.up", "up"); }
+	down(key: KeyEvent): boolean { return this.#matches(key, "tui.select.down", "down"); }
+	pageUp(key: KeyEvent): boolean { return this.#matches(key, "tui.select.pageUp", "pageUp"); }
+	pageDown(key: KeyEvent): boolean { return this.#matches(key, "tui.select.pageDown", "pageDown"); }
+	confirm(key: KeyEvent): boolean { return this.#matches(key, "tui.select.confirm", "enter"); }
+	cancel(key: KeyEvent): boolean { return this.#matches(key, "tui.select.cancel", "escape"); }
+	home(key: KeyEvent): boolean { return isKey(key, "home"); }
+	end(key: KeyEvent): boolean { return isKey(key, "end"); }
+	tab(key: KeyEvent): boolean { return isKey(key, "tab"); }
+	shiftTab(key: KeyEvent): boolean { return isKey(key, "shift+tab"); }
+	backspace(key: KeyEvent): boolean { return isKey(key, "backspace"); }
 }
 
-function safeMatch(d: string, key: string): boolean {
-	try {
-		return matchesKey(d, key as KeyId);
-	} catch {
-		return false;
-	}
-}
-
-/** A printable single character typed by the user (for search and jump inputs). */
-export function printable(d: string): string | undefined {
-	if (d.length === 0 || d.startsWith("\x1b")) return undefined;
-	const cp = d.codePointAt(0) ?? 0;
-	if (cp < 0x20 || cp === 0x7f) return undefined;
-	return [...d].length === 1 ? d : undefined;
+/** Text produced by a key, including kitty and non-ASCII keys but never releases. */
+export function printable(key: KeyEvent): string | undefined {
+	return key.kind === "release" ? undefined : key.text;
 }

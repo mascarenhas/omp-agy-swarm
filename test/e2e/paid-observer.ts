@@ -7,7 +7,7 @@ import { TASK_SUBAGENT_EVENT_CHANNEL, type SubagentEventPayload } from "@oh-my-p
 import {
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL,
 	type SubagentLifecyclePayload, type SubagentProgressPayload,
-} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+} from "@oh-my-pi/pi-coding-agent/task/session-observer-registry";
 import { getAgentDbPath, getAgentDir, getTerminalSessionsDir } from "@oh-my-pi/pi-utils/dirs";
 import { contentText, type TraceBody, usageTokens } from "./paid-evidence.ts";
 

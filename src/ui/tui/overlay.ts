@@ -1,23 +1,20 @@
 // Read-only fullscreen /swarm. Native surfaces split the page and dock; ANSI keeps cell rendering.
 
-import type { Component } from "@oh-my-pi/pi-tui";
-import type { DescribeContext, NativeNode, NativeScreen, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import type { ExtensionUiHost } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/render-types";
+import { createRoot, nativeRendering, nativeSupports, signal, structural, type KeyEvent, type PasteEvent, type UiNode } from "@oh-my-pi/pi-tui";
 import { basename } from "node:path";
 import { TIMING } from "../../env.ts";
 import { project, type SwarmReadModel, type ViewFiles } from "../model.ts";
 import { fit, pad, sanitizeLine, width } from "../sanitize.ts";
-import { type KeybindingMatcher, Keys, type ThemeLike } from "./keys.ts";
-import { badge, button, facts, group, NativeCache, nativeKey, presentedEvent, semantic, span, strip, text } from "./native.ts";
+import { type KeybindingMatcher, Keys, printable, type ThemeLike } from "./keys.ts";
+import { badge, button, col, facts, node, overlay, row, span, tabs, text } from "./native.ts";
 import type { OpenTarget, View, ViewHost, ViewId } from "./view.ts";
 import { BoardView } from "./views/board.ts";
 import { MembersView } from "./views/members.ts";
 import { OverviewView } from "./views/overview.ts";
 import { TranscriptView } from "./views/transcript.ts";
 
-export interface TuiLike {
-	terminal?: { rows?: number; columns?: number };
-	requestRender(): void;
-}
+type ViewSize = Pick<ExtensionUiHost, "size">;
 
 const ORDER: ViewId[] = ["overview", "board", "members", "transcript"];
 const TAB_WIDE: Record<ViewId, string> = { overview: "1 Overview", board: "2 Board", members: "3 Members", transcript: "4 Transcript" };
@@ -49,21 +46,11 @@ export class SwarmOverlay implements ViewHost {
 	readonly model: SwarmReadModel;
 	readonly theme: ThemeLike;
 	readonly keys: Keys;
-	readonly #tui: TuiLike;
+	readonly #ui: ViewSize;
 	readonly #done: () => void;
-	readonly #views: Record<ViewId, View>;
-	readonly #body: Component = {
-		render: width => this.render(width),
-		describe: cx => this.#describeBody(cx),
-		handleNativeEvent: event => this.#bodyEvent(event),
-	};
-	readonly #screen: NativeScreen = { role: "omp.swarm", main: [this.#body], dock: [this] };
-	readonly #fallback: NativeScreen = { role: "omp.swarm", main: [this], dock: [] };
-	readonly #nativeHeader = new NativeCache();
-	readonly #nativeTabs = new NativeCache();
-	readonly #nativeBody = new NativeCache();
-	readonly #nativeDock = new NativeCache();
-	#nativeMode = false;
+	readonly #views: Record<ViewId, View> & { members: MembersView };
+	readonly #revision = signal(0);
+	#disposeNodes: (() => void) | undefined;
 	#disposed = false;
 	#active: ViewId;
 	#stack: { view: ViewId; target?: OpenTarget }[] = [];
@@ -73,9 +60,9 @@ export class SwarmOverlay implements ViewHost {
 	#poll: Timer | undefined;
 	#viewFiles: ViewFiles;
 
-	constructor(model: SwarmReadModel, tui: TuiLike, theme: ThemeLike, kb: KeybindingMatcher | undefined, done: () => void, initial: ViewId, target?: OpenTarget) {
+	constructor(model: SwarmReadModel, ui: ViewSize, theme: ThemeLike, kb: KeybindingMatcher | undefined, done: () => void, initial: ViewId, target?: OpenTarget) {
 		this.model = model;
-		this.#tui = tui;
+		this.#ui = ui;
 		this.theme = theme;
 		this.keys = new Keys(kb);
 		this.#done = done;
@@ -88,133 +75,125 @@ export class SwarmOverlay implements ViewHost {
 		};
 		this.#active = initial;
 		this.#views[initial].show(target);
-		this.#unsubscribe = model.onChange(() => this.requestRender());
+		this.#unsubscribe = model.onChange(() => this.#scheduleUpdate());
 		this.#poll = setInterval(() => {
 			const files = model.files();
 			if (files.key === this.#viewFiles.key) return;
 			this.#viewFiles = files;
-			this.requestRender();
+			this.#scheduleUpdate();
 		}, TIMING.uiFilePollMs);
 		this.#poll.unref?.();
 	}
 
 	get viewFiles(): ViewFiles { return this.#viewFiles; }
 
-	describeScreen(cx: DescribeContext): NativeScreen {
-		this.#nativeMode = semantic(cx);
-		return this.#nativeMode ? this.#screen : this.#fallback;
+	component(): UiNode {
+		return createRoot(dispose => {
+			this.#disposeNodes = dispose;
+			if (nativeRendering()) return this.#nativePage();
+			return node("canvas", "swarm", {
+				paint: width => { this.#revision(); return this.render(width); },
+				onKey: key => this.#handleKey(key, false),
+				onPaste: paste => this.#paste(paste),
+			});
+		});
 	}
 
-	#describeBody(cx: DescribeContext): NativeNode | null {
-		if (!semantic(cx)) return null;
-		const profile = nativeKey(cx);
-		const version = this.model.version;
-		const files = this.#viewFiles;
-		const header = this.#nativeHeader.get(`${profile}|${cx.hour12}|${version}|${files.key}`, () => {
-			const v = project(this.model, files, { hour12: cx.hour12 });
-			const { working, waiting, stopped, failed } = v.counts;
-			const spend = this.model.spend();
-			const spent = spend.unknown ? "unknown" : `$${spend.cost.toFixed(4)}`;
-			const counts = facts(cx, "counts", [
+	#nativePage(): UiNode {
+		const revision = this.#revision;
+		const active = structural(() => { revision(); return this.#active; });
+		const help = structural(() => { revision(); return this.#help; });
+		const headerKey = structural(() => { revision(); return `${this.model.version}|${this.#viewFiles.key}`; });
+		const field = structural(() => { revision(); return this.#help ? undefined : this.#views[this.#active].field?.(); });
+		const content = col("page", [
+			() => { headerKey(); return this.#nativeHeader(); },
+			() => tabs(TABS, active(), view => {
+				if (view !== this.#active) this.interact(this.#views[this.#active], () => this.#show(view));
+			}),
+			// The host focuses this page. TSP focuses its first input without changing program focus.
+			() => field()?.native(),
+			() => !nativeSupports("overlay") && help()
+				? text("inline-help", `Swarm keys\n${NATIVE_HELP}`, undefined, "omp.swarm.help")
+				: this.#views[active()].native(revision),
+		], "omp.swarm.page");
+		const dock = col("dock", [
+			() => { revision(); return text("status", help() ? "Read-only keyboard reference" : this.#views[active()].nativeStatus(), "muted"); },
+			() => {
+				revision();
+				const hints = help() ? ["? or Esc closes help"] : this.#views[active()].hints(true);
+				const legend = text("keys", hints.flatMap((hint, i) => [...(i ? [span("  ")] : []), span(hint, "key")]));
+				if (help()) return row("commands", [legend, ...(!nativeSupports("overlay") ? [button("close-help", "Close help", "Esc", () => this.#setHelp(false))] : [])]);
+				return row("commands", field() ? [legend] : [
+					legend,
+					button("help", "Keys", "?", () => this.#setHelp(true)),
+					...(this.#stack.length ? [button("back", "Back", "Esc", () => this.interact(this.#views[this.#active], () => this.back()))] : []),
+					button("close", "Close", "q", () => this.#close()),
+				]);
+			},
+			// In TSP, overlays under dock are hoisted into layer with their structural event path intact.
+			() => help() && nativeSupports("overlay") && overlay("help", {
+				role: "omp.swarm.help", modal: true, head: [span("Swarm keys", "strong")], size: "lg", anchor: "center",
+				children: [text("instructions", NATIVE_HELP), button("close-help", "Close help", "Esc", () => this.#setHelp(false))],
+			}),
+		], "omp.swarm.dock");
+		return overlay("swarm", {
+			size: "full", page: { role: "omp.swarm", dock: 1 }, children: [content, dock],
+			onKey: key => this.#handleKey(key, true),
+			onPaste: paste => this.#paste(paste),
+			// Keep program focus on the stable page when the peer interacts with a transient child.
+			onFocus: () => {},
+		});
+	}
+
+	#nativeHeader(): UiNode {
+		// ExtensionUiHost does not expose the peer's clock preference. Use the locale's
+		// time format and the saved wait deadline, never a repaint-time countdown.
+		const v = project(this.model, this.#viewFiles, {});
+		const { working, waiting, stopped, failed } = v.counts;
+		const spend = this.model.spend();
+		const spent = spend.unknown ? "unknown" : `$${spend.cost.toFixed(4)}`;
+		return col("header", [
+			row("title-row", [
+				text("title", [span("Swarm  ", "strong"), span(sanitizeLine(this.model.title) || "untitled", "title strong")]),
+				badge("mode", this.model.mode, "info"), text("head", `#${this.model.head}`, "num"),
+			]),
+			node("text", "directory", { spans: [span(`…/${basename(this.model.swarmDir)}`, "muted path")], wrap: "none", truncate: "middle" }),
+			facts("counts", [
 				["Working", String(working), "num"], ["Waiting", String(waiting), "num"], ["Stopped", String(stopped), "num"],
 				["Spend", `${spent}${spend.ceiling === null ? "" : ` / $${spend.ceiling}`}`, spend.unknown ? "warning" : "num"],
-			], true);
-			return group(cx, "header", [
-				strip(cx, "title-row", [
-					text("title", [span("Swarm  ", "strong"), span(sanitizeLine(this.model.title) || "untitled", "title strong")]),
-					badge(cx, "mode", this.model.mode, "info"), text("head", `#${this.model.head}`, "num"),
-				]),
-				{ k: "text", key: "directory", p: { spans: [span(`…/${basename(this.model.swarmDir)}`, "muted path")], wrap: "none", truncate: "middle" } },
-				counts,
-				strip(cx, "state", [
-					badge(cx, "outcome", headerReason(v.stateLine), v.stateLine.startsWith("incomplete") ? "error" : v.stateLine.startsWith("complete") ? "success" : "neutral"),
-					...(failed ? [badge(cx, "failed", `${failed} failed`, "error")] : []),
-					badge(cx, "attention", `${v.attention.length} attention`, v.attention.length ? "warning" : "muted"),
-				]),
-				...(spend.unknown ? [text("unpriced", headerReason(spend.unknown), "warning")] : []),
-			], "omp.swarm.header");
-		});
-		// Tern can paint a patched `tabs.active` one frame late. Remount just
-		// this control on tab switches so its initial state agrees with the view.
-		const tabs = this.#nativeTabs.get(`${profile}|${this.#active}`, () => cx.supports("tabs")
-			? { k: "tabs", key: `tabs:${this.#active}`, p: { items: TABS, active: this.#active, variant: "underline" } }
-			: strip(cx, "tabs", TABS.map((tab, i) => button(cx, tab.id, tab.label.slice(2), String(i + 1), { on: tab.id === this.#active }))));
-		const helpInline = this.#help && !cx.supports("overlay");
-		const view = helpInline ? undefined : this.#views[this.#active].describe(cx);
-		return this.#nativeBody.get(`${profile}|${cx.hour12}|${version}|${files.key}|${this.#active}|${helpInline}`, () => group(cx, "page", [
-			header, tabs, view ?? text("inline-help", `Swarm keys\n${NATIVE_HELP}`, undefined, "omp.swarm.help"),
-		], "omp.swarm.page"), view);
+			], true),
+			row("state", [
+				badge("outcome", headerReason(v.stateLine), v.stateLine.startsWith("incomplete") ? "error" : v.stateLine.startsWith("complete") ? "success" : "neutral"),
+				...(failed ? [badge("failed", `${failed} failed`, "error")] : []),
+				badge("attention", `${v.attention.length} attention`, v.attention.length ? "warning" : "muted"),
+			]),
+			...(spend.unknown ? [text("unpriced", headerReason(spend.unknown), "warning")] : []),
+		], "omp.swarm.header");
 	}
 
-	describe(cx: DescribeContext): NativeNode | null {
-		if (!semantic(cx)) return null;
-		const view = this.#views[this.#active];
-		const field = this.#help ? undefined : view.describeField?.(cx);
-		const status = this.#help ? "Read-only keyboard reference" : view.nativeStatus(cx);
-		return this.#nativeDock.get(`${nativeKey(cx)}|${this.#active}|${this.#help}|${!!this.#stack.length}|${status}`, () => {
-			const legend = text("keys", (this.#help ? ["? or Esc closes help"] : view.hints(true)).flatMap((hint, i) => [
-				...(i ? [span("  ")] : []), span(hint, "key"),
-			]));
-			const commands = this.#help
-				? cx.supports("overlay") ? [] : [button(cx, "close-help", "Close help", "Esc")]
-				: field ? [] : [
-					button(cx, "help", "Keys", "?"),
-					...(this.#stack.length ? [button(cx, "back", "Back", "Esc")] : []),
-					button(cx, "close", "Close", "q"),
-				];
-			const dock: NativeNode[] = [text("status", status, "muted")];
-			if (field) dock.push(field);
-			dock.push(strip(cx, "commands", [legend, ...commands]));
-			if (this.#help && cx.supports("overlay")) dock.push({
-				k: "overlay", key: "help", p: { role: "omp.swarm.help", modal: true, head: [span("Swarm keys", "strong")], size: "lg", anchor: "center" },
-				c: [text("instructions", NATIVE_HELP), button(cx, "close-help", "Close help", "Esc")],
-			});
-			return group(cx, "dock", dock, "omp.swarm.dock");
-		}, field);
-	}
-
-	#bodyEvent(event: NativeUiEvent): void {
-		const view = this.#views[this.#active];
-		if (this.#disposed || !this.#nativeMode || this.#help || view.capturing(true)) return;
-		if (!presentedEvent(this.#nativeBody.node, event)) return;
-		const tab = (event.type === "select" || event.type === "activate") && event.key === `tabs:${this.#active}`
-			? ORDER.find(id => id === event.item)
-			: event.type === "action" ? ORDER.find(id => event.key === `tabs/${id}` && event.act === `swarm.${id}`) : undefined;
-		if (tab) {
-			if (tab !== this.#active) this.#show(tab);
-			return;
-		}
-		const prefix = `${this.#active}/`;
-		if (event.key.startsWith(prefix) && view.handleNativeEvent(event, event.key.slice(prefix.length))) this.#tui.requestRender();
-	}
-
-	handleNativeEvent(event: NativeUiEvent): void {
-		if (this.#disposed || !this.#nativeMode || !presentedEvent(this.#nativeDock.node, event)) return;
-		if (this.#help) {
-			if (event.type === "action" && event.act === "swarm.close-help" && (event.key === "help/close-help" || event.key === "commands/close-help")) this.#setHelp(false);
-			return;
-		}
-		const view = this.#views[this.#active];
-		if (view.capturing(true)) {
-			if (view.handleFieldEvent?.(event)) this.#tui.requestRender();
-			return;
-		}
-		if (event.type !== "action") return;
-		if (event.key === "commands/help" && event.act === "swarm.help") this.#setHelp(true);
-		if (event.key === "commands/back" && event.act === "swarm.back" && this.#stack.length) this.handleInput("\x1b");
-		if (event.key === "commands/close" && event.act === "swarm.close") this.handleInput("q");
+	interact(view: View, action: () => void): void {
+		if (this.#disposed || this.#help || this.#views[this.#active] !== view || view.capturing(true)) return;
+		action();
+		this.#refresh();
 	}
 
 	#setHelp(show: boolean): void {
+		if (this.#help === show || this.#disposed || show && this.#views[this.#active].capturing(true)) return;
 		this.#help = show;
-		this.#tui.requestRender();
+		this.#refresh();
 	}
 
-	requestRender(): void {
+	#refresh(): void {
+		if (!this.#disposed) this.#revision.update(n => n + 1);
+	}
+
+	requestRender(): void { this.#refresh(); }
+
+	#scheduleUpdate(): void {
 		if (this.#disposed || this.#renderTimer) return;
 		this.#renderTimer = setTimeout(() => {
 			this.#renderTimer = undefined;
-			this.#tui.requestRender();
+			this.#refresh();
 		}, TIMING.uiRenderCoalesceMs);
 		this.#renderTimer.unref?.();
 	}
@@ -222,7 +201,7 @@ export class SwarmOverlay implements ViewHost {
 	/** Follows a link from the current view (Enter, o, t): Esc returns to where it came from. */
 	open(view: ViewId, target?: OpenTarget): void {
 		const from = this.#active;
-		const sel = from === "members" ? { member: (this.#views.members as MembersView).selected() } : undefined;
+		const sel = from === "members" ? { member: this.#views.members.selected() } : undefined;
 		if (view !== from) this.#stack.push({ view: from, target: sel });
 		this.#show(view, target);
 	}
@@ -230,7 +209,7 @@ export class SwarmOverlay implements ViewHost {
 	#show(view: ViewId, target?: OpenTarget): void {
 		this.#active = view;
 		this.#views[view].show(target);
-		this.requestRender();
+		this.#refresh();
 	}
 
 	/** Returns to the view (and selection) the current one was opened from; false at the top. */
@@ -273,8 +252,7 @@ export class SwarmOverlay implements ViewHost {
 	}
 
 	render(width: number): string[] {
-		this.#nativeMode = false;
-		const rows = Math.max(1, this.#tui.terminal?.rows ?? 24);
+		const rows = Math.max(1, this.#ui.size().rows);
 		const cols = width;
 		if (rows < 6 || cols < 24) {
 			const out = [fit(`swarm: terminal too small (${cols}x${rows})`, cols)];
@@ -301,33 +279,42 @@ export class SwarmOverlay implements ViewHost {
 		return out.slice(0, rows);
 	}
 
-	handleInput(data: string): void {
-		if (this.#disposed) return;
+	#handleKey(key: KeyEvent, native: boolean): boolean {
+		if (this.#disposed || key.kind === "release") return false;
+		const ch = printable(key);
 		const view = this.#views[this.#active];
 		if (this.#help) {
-			if (data === "?" || this.keys.cancel(data) || data === "q") this.#setHelp(false);
-			return;
+			if (ch === "?" || this.keys.cancel(key) || ch === "q") this.#setHelp(false);
+			return true;
 		}
-		if (view.capturing(this.#nativeMode)) {
-			view.handleInput(data, this.#nativeMode);
-			this.#tui.requestRender();
-			return;
-		}
-		if (view.handleInput(data, this.#nativeMode)) {
-			this.#tui.requestRender();
-			return;
+		const captured = view.capturing(native);
+		if (view.handleInput(key, native) || captured) {
+			this.#refresh();
+			return true;
 		}
 		const idx = ORDER.indexOf(this.#active);
 		// Switching views directly (digits, Tab) is not a link: it does not grow the back stack.
-		if (/^[1-4]$/.test(data)) this.#show(ORDER[Number(data) - 1]!);
-		else if (this.keys.tab(data)) this.#show(ORDER[(idx + 1) % ORDER.length] as ViewId);
-		else if (this.keys.shiftTab(data)) this.#show(ORDER[(idx + ORDER.length - 1) % ORDER.length] as ViewId);
-		else if (data === "?") return this.#setHelp(true);
-		else if (data === "q" || (this.keys.cancel(data) && !this.back())) {
-			this.dispose();
-			return this.#done();
-		}
-		this.#tui.requestRender();
+		if (ch && /^[1-4]$/.test(ch)) this.#show(ORDER[Number(ch) - 1]!);
+		else if (this.keys.tab(key)) this.#show(ORDER[(idx + 1) % ORDER.length]!);
+		else if (this.keys.shiftTab(key)) this.#show(ORDER[(idx + ORDER.length - 1) % ORDER.length]!);
+		else if (ch === "?") this.#setHelp(true);
+		else if (ch === "q") this.#close();
+		else if (this.keys.cancel(key)) { if (!this.back()) this.#close(); }
+		else return false;
+		return true;
+	}
+
+	#paste(paste: PasteEvent): boolean {
+		if (this.#disposed || this.#help) return false;
+		const field = this.#views[this.#active].field?.();
+		if (!field) return false;
+		if (field.paste(paste.text)) this.#refresh();
+		return true;
+	}
+
+	#close(): void {
+		if (this.#disposed || this.#help || this.#views[this.#active].capturing(true)) return;
+		try { this.#done(); } finally { this.dispose(); }
 	}
 
 	dispose(): void {
@@ -336,44 +323,45 @@ export class SwarmOverlay implements ViewHost {
 		this.#unsubscribe();
 		clearTimeout(this.#renderTimer);
 		clearInterval(this.#poll);
+		this.#disposeNodes?.();
 	}
 }
 
 /** The no-swarm state shown when /swarm runs before any swarm exists. */
 export class EmptyOverlay {
-	readonly #tui: TuiLike;
+	readonly #ui: ViewSize;
 	readonly #keys: Keys;
 	readonly #done: () => void;
 	readonly #reason: string | undefined;
-	readonly #screen: NativeScreen = { role: "omp.swarm", main: [this], dock: [] };
-	readonly #native = new NativeCache();
 	#closed = false;
+	#disposeNodes: (() => void) | undefined;
 
-	constructor(tui: TuiLike, kb: KeybindingMatcher | undefined, done: () => void, reason?: string) {
-		this.#tui = tui;
+	constructor(ui: ViewSize, kb: KeybindingMatcher | undefined, done: () => void, reason?: string) {
+		this.#ui = ui;
 		this.#keys = new Keys(kb);
 		this.#done = done;
 		this.#reason = reason;
 	}
 
-	describeScreen(): NativeScreen { return this.#screen; }
-
-	describe(cx: DescribeContext): NativeNode | null {
-		if (!semantic(cx)) return null;
-		return this.#native.get(nativeKey(cx), () => group(cx, "empty", [
-			text("title", this.#reason ? "Swarm could not attach" : "No swarm in this session", "title strong"),
-			text("reason", this.#reason ?? 'The coordinator creates one with swarm{action:"add", …}.', this.#reason ? "warning" : "muted"),
-			button(cx, "close", "Close", "q"),
-			text("keys", "q or Esc closes", "key"),
-		], this.#reason ? "omp.swarm.refused" : "omp.swarm.empty"));
-	}
-
-	handleNativeEvent(event: NativeUiEvent): void {
-		if (event.type === "action" && event.key === "close" && event.act === "swarm.close") this.handleInput("q");
+	component(): UiNode {
+		return createRoot(dispose => {
+			this.#disposeNodes = dispose;
+			if (!nativeRendering()) return node("canvas", "swarm", { paint: width => this.render(width), onKey: key => this.#handleKey(key) });
+			return overlay("swarm", {
+				size: "full", page: { role: "omp.swarm", dock: 0 }, onKey: key => this.#handleKey(key),
+				onFocus: () => {},
+				children: [col("empty", [
+					text("title", this.#reason ? "Swarm could not attach" : "No swarm in this session", "title strong"),
+					text("reason", this.#reason ?? 'The coordinator creates one with swarm{action:"add", …}.', this.#reason ? "warning" : "muted"),
+					button("close", "Close", "q", () => this.#close()),
+					text("keys", "q or Esc closes", "key"),
+				], this.#reason ? "omp.swarm.refused" : "omp.swarm.empty")],
+			});
+		});
 	}
 
 	render(width: number): string[] {
-		const rows = Math.max(1, this.#tui.terminal?.rows ?? 24);
+		const rows = Math.max(1, this.#ui.size().rows);
 		const out = [
 			fit("swarm · no swarm in this session", width),
 			"",
@@ -385,11 +373,21 @@ export class EmptyOverlay {
 		return out.slice(0, rows);
 	}
 
-	handleInput(data: string): void {
-		if (this.#closed || data !== "q" && !this.#keys.cancel(data)) return;
-		this.#closed = true;
-		this.#done();
+	#handleKey(key: KeyEvent): boolean {
+		if (this.#closed || printable(key) !== "q" && !this.#keys.cancel(key)) return false;
+		this.#close();
+		return true;
 	}
 
-	dispose(): void { this.#closed = true; }
+	#close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		try { this.#done(); } finally { this.dispose(); }
+	}
+
+	dispose(): void {
+		this.#closed = true;
+		this.#disposeNodes?.();
+		this.#disposeNodes = undefined;
+	}
 }

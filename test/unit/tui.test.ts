@@ -1,27 +1,47 @@
 // /swarm overlay rendering and keyboard paths over a real runtime's read model (§10.2, T5).
 
 import { afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { getThemeByName, visibleWidth } from "@oh-my-pi/pi-tui";
+import { KeybindingsManager } from "@oh-my-pi/pi-coding-agent/config/keybindings/keybindings";
+import { batch, createSurface, getOwner, type UiNode } from "@oh-my-pi/pi-tui";
+import { bubbleKey } from "@oh-my-pi/pi-tui/dispatch";
+import { decodeKey } from "@oh-my-pi/pi-tui/driver/input/keys";
+import { visibleWidth } from "@oh-my-pi/pi-tui/text/width";
+import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
+import { bold, inverse, italic, strikethrough, underline } from "@oh-my-pi/pi-tui/theme/theme";
 import { RuntimeReadModel } from "../../src/runtime/read-model.ts";
 import { project } from "../../src/ui/model.ts";
 import { renderWebBoardMessage } from "../../src/ui/tui/custom-message.ts";
-import { SwarmOverlay } from "../../src/ui/tui/overlay.ts";
+import { Keys, printable } from "../../src/ui/tui/keys.ts";
+import { EmptyOverlay, SwarmOverlay } from "../../src/ui/tui/overlay.ts";
 import { widgetLine } from "../../src/ui/tui/widget.ts";
 import { fastTimers, Harness, until } from "../helpers/harness.ts";
 
 let h: Harness;
+const dispose: (() => void)[] = [];
 beforeAll(() => fastTimers());
 afterEach(async () => {
+	for (const cleanup of dispose.splice(0)) cleanup();
 	await h?.close();
 });
 
-const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t, inverse: (t: string) => t };
+const theme = Object.assign(loadThemeSync("dark"), { bold, inverse, italic, strikethrough, underline });
+const decode = (raw: string) => decodeKey(raw, { kitty: false, backspaceIsCtrl: false });
 
 function overlay(model: RuntimeReadModel, rows: number, view: "overview" | "board" | "members" | "transcript" = "overview") {
-	const tui = { terminal: { rows, columns: 80 }, requestRender: () => {} };
+	const size = { rows, columns: 80 };
 	let closed = false;
-	const o = new SwarmOverlay(model, tui, theme, undefined, () => (closed = true), view);
-	return { o, tui, closed: () => closed };
+	const overlay = new SwarmOverlay(model, { size: () => size }, theme, undefined, () => { closed = true; }, view);
+	const canvas = overlay.component() as UiNode<"canvas">;
+	dispose.push(() => overlay.dispose());
+	return {
+		size,
+		closed: () => closed,
+		paint: (width: number) => canvas.props().paint(width),
+		key(raw: string) {
+			const key = decode(raw);
+			if (key) batch(() => bubbleKey([canvas], key));
+		},
+	};
 }
 
 async function populated(posts = 40) {
@@ -38,55 +58,61 @@ async function populated(posts = 40) {
 }
 
 describe("overlay", () => {
-	test("renders exactly the terminal rows at 80x24 and 40x12; never wider; no raw escapes from content", async () => {
+	test("renders exactly the terminal rows at wide, narrow, and compact sizes without exceeding the width", async () => {
 		const model = await populated();
 		for (const [cols, rows] of [
 			[80, 24],
 			[40, 12],
+			[30, 8],
 		] as const) {
 			for (const v of ["overview", "board", "members", "transcript"] as const) {
-				const { o } = overlay(model, rows, v);
-				const lines = o.render(cols);
+				const lines = overlay(model, rows, v).paint(cols);
 				expect(lines.length).toBe(rows);
 				for (const l of lines) expect(visibleWidth(l)).toBeLessThanOrEqual(cols);
 				const joined = lines.join("\n");
 				expect(joined.includes("\x1b[2J")).toBe(false);
 				expect(joined.includes("\x1b]0;")).toBe(false);
 				expect(joined.includes("\u202e")).toBe(false);
-				o.dispose();
 			}
 		}
-		const tiny = overlay(model, 5).o.render(30);
+		const board = overlay(model, 8, "board");
+		for (const key of "/no-such-post\r") board.key(key);
+		const noMatches = board.paint(30)[1]!;
+		expect(noMatches).toContain("No posts match the filters");
+		expect(visibleWidth(noMatches)).toBeLessThanOrEqual(30);
+
+		const responsive = overlay(model, 24);
+		responsive.size.rows = 5;
+		const tiny = responsive.paint(30);
 		expect(tiny[0]).toContain("terminal too small");
 		expect(tiny.length).toBe(5);
 	});
 
 	test("keyboard path: search → #seq jump (filters suspended) → o → t → Esc → Esc → b → q", async () => {
 		const model = await populated();
-		const { o, closed } = overlay(model, 24, "overview");
-		const key = (d: string) => o.handleInput(d);
+		const { paint, key, closed } = overlay(model, 24, "overview");
 		key("2");
 		for (const c of "/fail") key(c);
 		key("\r");
-		let status = o.render(80)[22] ?? "";
+		let status = paint(80)[22] ?? "";
 		expect(status).toContain("/fail");
 		for (const c of "#10") key(c);
 		key("\r");
-		status = o.render(80)[22] ?? "";
+		status = paint(80)[22] ?? "";
 		expect(status).toContain("#10 · filters off · b back");
 		key("o");
-		let lines = o.render(80);
+		let lines = paint(80);
 		expect(lines[1]).toContain("3 Members");
 		expect(lines.join("\n")).toContain("coordinator");
 		key("t");
-		lines = o.render(80);
+		lines = paint(80);
 		expect(lines[2]).toContain("coordinator");
 		key("\x1b");
-		expect(o.render(80)[22]).toContain("coordinator");
+		expect(paint(80)[22]).toContain("coordinator");
 		key("\x1b");
-		expect(o.render(80)[22]).toContain("#10 · filters off · b back");
+		expect(paint(80)[22]).toContain("#10 · filters off · b back");
 		key("b");
-		expect(o.render(80)[22]).toContain("/fail");
+		expect(paint(80)[22]).toContain("/fail");
 		key("q");
 		expect(closed()).toBe(true);
 	});
@@ -94,15 +120,15 @@ describe("overlay", () => {
 	test("a 5 000-post board renders in under 50 ms; a new post never moves a non-following board", async () => {
 		const model = await populated(10);
 		for (let i = 0; i < 5000; i++) h.rt.commitPost(h.rt.coordinator, `bulk ${i}`);
-		const { o } = overlay(model, 24, "board");
-		o.render(80);
-		o.handleInput("\x1b[A");
-		o.handleInput("\x1b[A");
+		const { paint, key } = overlay(model, 24, "board");
+		paint(80);
+		key("\x1b[A");
+		key("\x1b[A");
 		const t0 = performance.now();
-		const before = o.render(80);
+		const before = paint(80);
 		expect(performance.now() - t0).toBeLessThan(50);
 		h.rt.commitPost(h.rt.coordinator, "a newer post");
-		const after = o.render(80);
+		const after = paint(80);
 		expect(after.slice(2, 20)).toEqual(before.slice(2, 20));
 	});
 
@@ -145,11 +171,43 @@ describe("overlay", () => {
 	});
 });
 
-test("persistent web board renderer strips escapes from persisted content", async () => {
-	const dark = await getThemeByName("dark");
-	expect(dark).toBeDefined();
+test("closing either ANSI overlay disposes its nodes when the host built it without an owner", async () => {
+	const model = await populated(0);
+	const ui = { size: () => ({ rows: 24, columns: 80 }) };
+	let closes = 0;
+	const done = () => { closes++; };
+	const overlays = [new EmptyOverlay(ui, undefined, done), new SwarmOverlay(model, ui, theme, undefined, done, "overview")];
+	for (const overlay of overlays) dispose.push(() => overlay.dispose());
+	expect(getOwner()).toBeNull();
+	for (const overlay of overlays) {
+		const canvas = overlay.component() as UiNode<"canvas">;
+		expect(canvas.kind).toBe("canvas");
+		expect(canvas.props().paint(80)).toHaveLength(24);
+		expect(canvas.disposed).toBe(false);
+		expect(bubbleKey([canvas], decode("q")!)).toBe(true);
+		expect(canvas.disposed).toBe(true);
+	}
+	expect(closes).toBe(2);
+});
+
+test("19.2 key events honor selection bindings and ignore release events", () => {
+	const key = decode("\x1b[106;5u")!;
+	const bindings = KeybindingsManager.inMemory({ "tui.select.down": "ctrl+j" });
+	const keys = new Keys(bindings);
+	expect(keys.down(key)).toBe(true);
+	expect(keys.down({ ...key, kind: "release" })).toBe(false);
+	expect(keys.down(decode("\x1b[B")!)).toBe(true);
+	expect(keys.shiftTab(decode("\x1b[Z")!)).toBe(true);
+	expect(printable(decode("\x1b[107;2u")!)).toBe("K");
+	expect(printable({ id: "q", text: "q", raw: "q", kind: "release" })).toBeUndefined();
+});
+
+test("persistent web board renderer strips escapes from persisted content", () => {
 	const message = { content: "http://127.0.0.1:40593/\x1b[2J\nssh -L\x1b]0;PWNED\x07 40593:127.0.0.1:40593 <host>\u202e" };
-	const output = renderWebBoardMessage(message, { expanded: false }, dark!).render(80).join("\n");
+	const surface = createSurface(() => ({ main: renderWebBoardMessage(message, { expanded: false }, theme) }));
+	const canvas = surface.main()[0] as UiNode<"canvas">;
+	const output = canvas.props().paint(80).join("\n");
+	surface.dispose();
 	expect(output).toContain("Swarm web board");
 	expect(output).toContain("http://127.0.0.1:40593/");
 	expect(output).toContain("ssh -L 40593:127.0.0.1:40593 <host>");

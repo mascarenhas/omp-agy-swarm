@@ -1,15 +1,15 @@
 import { afterEach, beforeEach, expect, test, vi } from "bun:test";
-import type { Effort, AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Effort } from "@oh-my-pi/pi-ai";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { usageContextTokens } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import {
 	SessionObserverRegistry,
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL as LIFE,
 	TASK_SUBAGENT_PROGRESS_CHANNEL as PROGRESS,
 	type SubagentLifecyclePayload,
 	type SubagentProgressPayload,
-} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+} from "@oh-my-pi/pi-coding-agent/task/session-observer-registry";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { HubBridge } from "../../src/runtime/hub-bridge.ts";
 
 const ID = "swarm~parser";
@@ -23,7 +23,9 @@ function setup(registry = new AgentRegistry(), id = ID) {
 	bus.on(PROGRESS, frame => frames.push(frame as SubagentProgressPayload));
 	bus.on(LIFE, frame => frames.push(frame as SubagentLifecyclePayload));
 	const ref = registry.register({ id, displayName: "parser", kind: "sub", session: null, status: "running", sessionFile: FILE });
-	const model = { resolvedModel: "mock/parser:low", resolvedModelIdentity: "mock/parser", resolvedThinkingLevel: "low" as Effort, contextWindow: 1000 };
+	const model = {
+		resolvedModel: "mock/parser:low", resolvedModelIdentity: "mock/parser", resolvedThinkingLevel: "low" as Effort, contextWindow: 1000,
+	};
 	const bridge = new HubBridge({
 		id, name: "parser", role: "worker", brief: "Parse\x1b safely", sessionFile: FILE, bus,
 		ownsRef: () => registry.get(id) === ref,
@@ -101,7 +103,7 @@ test("frames are bounded, coalesced, per-run and fenced by exact ownership", () 
 	}
 	bridge.event({ type: "message_end", message: assistant("first assistant") });
 	model.resolvedModel = "mock/parser:high";
-	model.resolvedThinkingLevel = "high" as Effort;
+	model.resolvedThinkingLevel = "high" as Effort.High;
 	bridge.event({ type: "thinking_level_changed", thinkingLevel: model.resolvedThinkingLevel });
 	bridge.event({ type: "message_end", message: assistant(`line one\n${"z".repeat(900)}\x1b\n last\u202e line `, "error") });
 	bridge.event({ type: "agent_pause", messages: [], yielded: true, awaiting: true });

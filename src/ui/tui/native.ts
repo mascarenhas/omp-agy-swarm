@@ -1,112 +1,100 @@
 // Pure projections for the native TUI. All untrusted content becomes literal text, never markup.
-import type { DescribeContext, NativeNode, NativeUiEvent, TspSpan } from "@oh-my-pi/pi-tui/native/node";
-import type { TspTone } from "@oh-my-pi/pi-wire";
+import { jsx, type JSX, type JSXNode, nativeSupports, type UiKind, type UiNode } from "@oh-my-pi/pi-tui";
+import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
 import type { BoardMessage } from "../../board/types.ts";
 import type { MemberView } from "../model.ts";
 import { sanitize, sanitizeLine } from "../sanitize.ts";
 
-const KINDS = ["col", "row", "text", "kv", "badge", "tabs", "button", "list", "item", "card", "section", "input", "overlay"] as const;
-export function nativeKey(cx: DescribeContext): number {
-	let key = 0;
-	for (const kind of KINDS) key = (key << 1) | Number(cx.supports(kind));
-	return key;
-}
-
-export function semantic(cx: DescribeContext): boolean {
-	return cx.supports("text") && (cx.supports("col") || cx.supports("row"));
-}
-
-export class NativeCache {
-	#key: string | number | undefined;
-	#node: NativeNode | undefined;
-	#dependency: NativeNode | undefined;
-
-	get node(): NativeNode | undefined { return this.#node; }
-
-	get(key: string | number, build: () => NativeNode, dependency?: NativeNode): NativeNode {
-		if (this.#node && this.#key === key && this.#dependency === dependency) return this.#node;
-		this.#key = key;
-		this.#dependency = dependency;
-		return this.#node = build();
-	}
-}
-
-/** The host routes by owner even for removed descendants. Require a control we actually described. */
-export function presentedEvent(root: NativeNode | undefined, event: NativeUiEvent): boolean {
-	let node = root;
-	for (const key of event.key.split("/")) {
-		node = node?.c?.find((child): child is NativeNode => "k" in child && child.key === key);
-		if (!node) return false;
-	}
-	switch (event.type) {
-		case "action": return node?.k === "button" && !node.p?.disabled && node.p?.actions?.click === event.act;
-		case "edit":
-		case "undo": return node?.k === "input";
-		case "toggle": return node?.k === "card" && node.p?.collapsible === true;
-		case "select":
-		case "activate":
-			if (node?.k === "tabs") return node.p?.items.some(item => item.id === event.item) ?? false;
-			return node?.k === "list" && (node.c?.some(c => "k" in c && c.k === "item" && c.key === event.item && !c.p?.disabled) ?? false);
-		default: return false;
-	}
+export function node<K extends UiKind>(kind: K, key: string, props: JSX.IntrinsicElements[K]): UiNode<K> {
+	// The JSX runtime always returns a UiNode of this kind for a lowercase tag.
+	return jsx(kind, { ...props }, key) as UiNode<K>;
 }
 
 export function span(value: unknown, s?: string): TspSpan {
 	return { t: sanitize(value), s };
 }
 
-export function text(key: string, value: string | readonly TspSpan[], style?: string, role?: string): NativeNode {
-	return { k: "text", key, p: { role, spans: typeof value === "string" ? [span(value, style)] : value, wrap: "word" } };
+export function text(key: string, value: string | readonly TspSpan[] | (() => readonly TspSpan[]), style?: string, role?: string): UiNode<"text"> {
+	return node("text", key, { role, spans: typeof value === "string" ? [span(value, style)] : value, wrap: "word" });
 }
 
-export function group(cx: DescribeContext, key: string, c: readonly NativeNode[], role?: string): NativeNode {
-	return cx.supports("col") ? { k: "col", key, p: { role, gap: "sm" }, c } : { k: "row", key, p: { role, gap: "sm", wrap: true }, c };
+export function col(key: string, children: JSXNode, role?: string, reveal?: JSX.IntrinsicElements["col"]["reveal"]): UiNode<"col"> {
+	return node("col", key, { role, gap: "sm", children, reveal });
 }
 
-export function strip(cx: DescribeContext, key: string, c: readonly NativeNode[], role?: string): NativeNode {
-	return cx.supports("row") ? { k: "row", key, p: { role, gap: "sm", align: "center", wrap: true }, c } : group(cx, key, c, role);
+export function row(key: string, children: JSXNode): UiNode {
+	return nativeSupports("row") ? node("row", key, { gap: "sm", align: "center", wrap: true, children }) : col(key, children);
 }
 
-export function section(cx: DescribeContext, key: string, head: string, c: readonly NativeNode[]): NativeNode {
-	return cx.supports("section") ? { k: "section", key, p: { head: [{ t: sanitizeLine(head), s: "strong" }] }, c } : group(cx, key, [text("heading", head, "strong"), ...c]);
+export function section(key: string, head: string, children: JSXNode): UiNode {
+	return nativeSupports("section") ? node("section", key, { head: [span(sanitizeLine(head), "strong")], children }) : col(key, [text("heading", sanitizeLine(head), "strong"), children]);
 }
 
-export function card(cx: DescribeContext, key: string, head: string, c: readonly NativeNode[], collapsed?: boolean): NativeNode {
-	if (cx.supports("card")) return { k: "card", key, p: { head: [{ t: sanitizeLine(head), s: "strong" }], collapsible: collapsed !== undefined, collapsed, preview: collapsed ? { lines: 6 } : undefined }, c };
-	return section(cx, key, head, c);
+export function card(key: string, head: string, children: JSXNode, fold?: { collapsed: boolean; toggle: (collapsed: boolean) => void }): UiNode {
+	return nativeSupports("card")
+		? node("card", key, { head: [span(sanitizeLine(head), "strong")], children, collapsible: !!fold, collapsed: fold?.collapsed, preview: fold?.collapsed ? { lines: 6 } : undefined, onToggle: fold?.toggle })
+		: section(key, head, children);
 }
 
-export function facts(cx: DescribeContext, key: string, entries: readonly (readonly [string, string, string?])[], inline = false): NativeNode {
-	if (cx.supports("kv")) return { k: "kv", key, p: { layout: inline ? "inline" : "grid", items: entries.map(([k, v, style]) => ({ k: sanitizeLine(k), v: [span(v, style)] })) } };
-	return text(key, entries.map(([k, v]) => `${sanitizeLine(k)}: ${sanitize(v)}`).join(inline ? " · " : "\n"));
+export function facts(key: string, entries: readonly (readonly [string, string, string?])[], inline = false): UiNode {
+	return nativeSupports("kv")
+		? node("kv", key, { layout: inline ? "inline" : "grid", items: entries.map(([k, v, style]) => ({ k: sanitizeLine(k), v: [span(v, style)] })) })
+		: text(key, entries.map(([k, v]) => `${sanitizeLine(k)}: ${sanitize(v)}`).join(inline ? " · " : "\n"));
 }
 
-export function badge(cx: DescribeContext, key: string, label: string, tone: TspTone): NativeNode {
-	return cx.supports("badge") ? { k: "badge", key, p: { text: sanitizeLine(label), tone } } : text(key, label, tone);
+export function badge(key: string, label: string, tone: TspTone): UiNode {
+	return nativeSupports("badge") ? node("badge", key, { text: sanitizeLine(label), tone }) : text(key, label, tone);
 }
 
-export function button(cx: DescribeContext, id: string, label: string, key?: string, options?: { primary?: boolean; on?: boolean; disabled?: boolean }): NativeNode {
-	return cx.supports("button")
-		? { k: "button", key: id, p: { text: sanitizeLine(label), keys: key ? [key] : undefined, size: "sm", variant: options?.primary ? "primary" : "quiet", actions: { click: `swarm.${id}` }, on: options?.on, disabled: options?.disabled } }
-		: text(id, key ? `${key} ${label}` : label, options?.on ? "strong" : "muted");
+export function button(key: string, label: string, shortcut: string | undefined, click: () => void, options?: { primary?: boolean; on?: boolean; disabled?: boolean }): UiNode {
+	const act = `swarm.${key}`;
+	return nativeSupports("button")
+		? node("button", key, { text: sanitizeLine(label), keys: shortcut ? [shortcut] : undefined, size: "sm",
+			variant: options?.primary ? "primary" : "quiet", actions: { click: act }, on: options?.on, disabled: options?.disabled,
+			onAction: action => { if (!options?.disabled && action === act) click(); } })
+		: text(key, shortcut ? `${shortcut} ${label}` : label, options?.on ? "strong" : "muted");
 }
 
-export type ListItem = Extract<NativeNode, { k: "item" }> & { key: string; p: NonNullable<Extract<NativeNode, { k: "item" }>["p"]> };
-
-export function item(key: string, label: readonly TspSpan[], detail?: readonly TspSpan[], tone?: TspTone): ListItem {
-	return { k: "item", key, p: { label, detail, tone } };
+export function item(key: string, label: readonly TspSpan[], detail?: readonly TspSpan[], tone?: TspTone, disabled?: boolean): UiNode<"item"> {
+	return node("item", key, { label, detail, tone, disabled });
 }
 
-export function list(cx: DescribeContext, key: string, items: readonly ListItem[], selected: string | undefined, empty: string, maxLines?: number): NativeNode {
+export function list(key: string, items: readonly UiNode<"item">[], selected: string | undefined, empty: string, choose: (item: string, activate: boolean) => void, maxLines?: number): UiNode {
 	if (!items.length) return text(key, empty, "muted");
-	if (cx.supports("list") && cx.supports("item")) return { k: "list", key, p: { selected, max: maxLines === undefined ? undefined : { lines: maxLines }, virtual: items.length > 24 }, c: items };
-	return group(cx, key, items.map(({ key, p }) => {
-		const label = typeof p.label === "string" ? p.label : p.label.map(s => s.t).join("");
-		const detail = typeof p.detail === "string" ? p.detail : p.detail?.map(s => s.t).join("");
-		return p.disabled ? text(key, label, "accent strong") : button(cx, key, `${label}${detail ? ` · ${detail}` : ""}`, undefined, { on: key === selected });
+	const pick = (item: string, activate: boolean): void => {
+		if (items.some(n => n.key() === item && !n.props().disabled)) choose(item, activate);
+	};
+	if (nativeSupports("list") && nativeSupports("item")) return node("list", key, {
+		selected, max: maxLines === undefined ? undefined : { lines: maxLines }, virtual: items.length > 24,
+		children: items, onSelect: item => pick(item, false), onActivate: item => pick(item, true),
+	});
+	return col(key, items.map(n => {
+		const { label, detail, disabled } = n.props();
+		const plain = (value: string | readonly TspSpan[]) => typeof value === "string" ? value : value.map(s => s.t).join("");
+		const id = n.key()!;
+		return disabled ? text(id, plain(label), "accent strong")
+			: button(id, `${plain(label)}${detail ? ` · ${plain(detail)}` : ""}`, undefined, () => pick(id, false), { on: id === selected });
 	}));
 }
 
+export function tabs<Key extends string>(items: readonly { id: Key; label: string }[], active: Key, select: (key: Key) => void): UiNode {
+	const pick = (id: string): void => {
+		const tab = items.find(item => item.id === id);
+		if (tab) select(tab.id);
+	};
+	// Tern paints a patched active tab one frame late. Remount only the tabs on a switch.
+	return nativeSupports("tabs") ? node("tabs", `tabs:${active}`, {
+		items, active, variant: "underline", onSelect: pick, onActivate: pick,
+	}) : row("tabs", items.map((tab, i) => button(tab.id, tab.label.slice(2), String(i + 1), () => select(tab.id), { on: tab.id === active })));
+}
+
+export function input(key: string, props: JSX.IntrinsicElements["input"]): UiNode<"input"> {
+	return node("input", key, props);
+}
+
+export function overlay(key: string, props: JSX.IntrinsicElements["overlay"]): UiNode<"overlay"> {
+	return node("overlay", key, props);
+}
 /** Domain identifiers are not displayed or interpreted as paths. */
 export function id(value: string): string {
 	return encodeURIComponent(value.replace(/\p{Surrogate}/gu, "\ufffd"));
@@ -123,8 +111,8 @@ export function stateTone(state: string): TspTone {
 	}
 }
 
-export function memberFacts(cx: DescribeContext, m: MemberView, swarmDir: string): NativeNode {
-	return facts(cx, "member-facts", [
+export function memberFacts(m: MemberView, swarmDir: string): UiNode {
+	return facts("member-facts", [
 		["Role", m.role], ["State", `${m.failure ? "failed · " : ""}${m.state} · ${m.detail}`],
 		["Model", `${m.model || "?"}${m.effort ? ` · ${m.effort}` : ""}`, "mono"], ["Added by", m.addedBy || "—"],
 		["Channels", m.channels.join(", ")], ["Activity", m.activity || "—"], ["Wakes on", m.wakeMode],
@@ -142,7 +130,7 @@ export function memberFacts(cx: DescribeContext, m: MemberView, swarmDir: string
 	]);
 }
 
-export function postSummary(m: BoardMessage): ListItem {
+export function postSummary(m: BoardMessage): UiNode<"item"> {
 	const fragment = sanitizeLine(m.text.slice(0, 240)).slice(0, 160).replace(/[\ud800-\udbff]$/, "");
 	return item(`post:${m.seq}`, [
 		span(`#${m.seq} `, "num"), span(m.agent, "strong"), span(` · #${m.channel || "main"}`, "muted"),

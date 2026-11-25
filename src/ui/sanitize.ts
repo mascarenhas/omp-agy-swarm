@@ -1,7 +1,7 @@
 // Untrusted text → terminal-safe text, and width helpers (SW-12). Every title, post, activity
 // line, tool output, model id and file content passes sanitize() before any styling.
 
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@oh-my-pi/pi-tui";
+import { truncate, visibleWidth, wrap as wrapText } from "@oh-my-pi/pi-tui/text/width";
 
 // ESC/CSI/OSC/DCS sequences, C0/C1 controls (except \n and \t handled separately), bidi overrides
 // and isolates, and other invisible format characters that can reorder or hide text.
@@ -34,7 +34,7 @@ export function width(text: string): number {
 /** Cuts to `cols` visible columns (ellipsis when cut). */
 export function fit(text: string, cols: number): string {
 	if (cols <= 0) return "";
-	return truncateToWidth(text, cols);
+	return truncate(text, cols);
 }
 
 /** Cuts and pads to exactly `cols` visible columns. */
@@ -49,7 +49,7 @@ export function wrap(text: string, cols: number): string[] {
 	const out: string[] = [];
 	for (const line of text.split("\n")) {
 		if (line === "") out.push("");
-		else out.push(...wrapTextWithAnsi(line, cols));
+		else out.push(...wrapText(line, cols));
 	}
 	return out;
 }

@@ -1,10 +1,10 @@
 // Overview: goal and where it stands, outcome threads, attention, reel captions (§10.1).
 
-import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import type { Accessor, KeyEvent, UiNode } from "@oh-my-pi/pi-tui";
 import { createHash } from "node:crypto";
 import { project } from "../../model.ts";
 import { fit, pad, sanitizeLine } from "../../sanitize.ts";
-import { button, card, group, id, item, list, NativeCache, nativeKey, section, span, stateTone, text } from "../native.ts";
+import { button, card, col, id, item, list, section, span, stateTone, text } from "../native.ts";
 import { GLYPH, type OpenTarget, type View, type ViewHost } from "../view.ts";
 
 interface Line {
@@ -46,9 +46,7 @@ function unique(keys: Map<string, number>, key: string): string {
 export class OverviewView implements View {
 	readonly #host: ViewHost;
 	#sel = "";
-	readonly #native = new NativeCache();
 	#blocksKey = "";
-	#hour12: boolean | undefined;
 	#blocks: Block[] = [];
 	#choices: Choice[] = [];
 	#omittedUnaddressed = 0;
@@ -122,61 +120,46 @@ export class OverviewView implements View {
 		return true;
 	}
 
-	describe(cx: DescribeContext): NativeNode {
-		this.#hour12 = cx.hour12;
-		const v = this.#snapshot({ hour12: cx.hour12 });
-		const selected = this.#selected();
-		const { model, viewFiles: files } = this.#host;
-		return this.#native.get(`${nativeKey(cx)}|${v.key}|${this.#sel}`, () => {
-			const out: NativeNode[] = [text("goal", [span("Goal: ", "strong"), span(v.goal)])];
-			if (v.empty) out.push(text("empty", 'No members yet. The coordinator adds workers with swarm{action:"add"}.'));
-			const restored = model.restored();
-			if (restored) out.push(text("restored", `Restored after a restart: ${restored.stopped} stopped, ${restored.owed} with unread posts (swarm revive)`, "warning"));
-			if (!files.plan && !files.view) out.push(text("no-plan", "No plan.json and no narrator: showing every task member.", "muted"));
-			for (const [key, error] of [["plan", files.planError], ["narrator", files.viewError], ["narrator-html", files.htmlError]] as const) {
-				if (error) out.push(text(`warning:${key}`, `${key}: ${error}`, "warning"));
-			}
-			for (const block of this.#blocks) {
-				if (!block.rows.length && block.key !== "attention") continue;
-				const rows = block.rows.filter(r => r.target).map(r => item(r.key,
-					[span(r.label, "strong"), ...(block.key.startsWith("thread:") ? [span(` · ${r.state}`, stateTone(r.state ?? ""))] : [])],
-					r.detail ? [span(r.detail, "muted")] : undefined, stateTone(r.state ?? "")));
-				const detail = block.rows.filter(r => !r.target).map(r => text(r.key, `${r.label}${r.detail ? ` — ${r.detail}` : ""}`, stateTone(r.state ?? "")));
-				if (rows.length || !detail.length) detail.unshift(list(cx, "choices", rows, selected?.block === block.key ? selected.row.key : undefined, "No attention items."));
-				if (block.key === "attention" && this.#omittedUnaddressed) detail.push(text("omitted", `${this.#omittedUnaddressed} more unaddressed posts not shown.`, "muted"));
-				out.push(section(cx, block.key, block.label, detail));
-			}
-			if (selected?.row.target) {
-				const { target, label, detail } = selected.row;
-				out.push(card(cx, `detail:${selected.block}:${selected.row.key}`, label, [
-					text("detail", detail || (target.seq ? `Board post #${target.seq}` : `Member ${target.member}`)),
-					button(cx, "open", target.seq ? `Open post #${target.seq}` : "Inspect member", "Enter", { primary: true }),
-				]));
-			}
-			return group(cx, "overview", out, "omp.swarm.overview");
-		});
+	native(revision: Accessor<number>): UiNode {
+		return col("overview", () => { revision(); return this.#nativeContent(); }, "omp.swarm.overview");
 	}
 
-	handleNativeEvent(event: NativeUiEvent, key: string): boolean {
-		this.#snapshot({ hour12: this.#hour12 });
+	#nativeContent(): UiNode[] {
+		const v = this.#snapshot({});
 		const selected = this.#selected();
-		if (event.type === "action" && event.act === "swarm.open") {
-			return !!selected && key === `detail:${selected.block}:${selected.row.key}/open` && this.#activate(selected.row.target);
+		const { model, viewFiles: files } = this.#host;
+		const out: UiNode[] = [text("goal", [span("Goal: ", "strong"), span(v.goal)])];
+		if (v.empty) out.push(text("empty", 'No members yet. The coordinator adds workers with swarm{action:"add"}.'));
+		const restored = model.restored();
+		if (restored) out.push(text("restored", `Restored after a restart: ${restored.stopped} stopped, ${restored.owed} with unread posts (swarm revive)`, "warning"));
+		if (!files.plan && !files.view) out.push(text("no-plan", "No plan.json and no narrator: showing every task member.", "muted"));
+		for (const [key, error] of [["plan", files.planError], ["narrator", files.viewError], ["narrator-html", files.htmlError]] as const) {
+			if (error) out.push(text(`warning:${key}`, `${key}: ${error}`, "warning"));
 		}
 		for (const block of this.#blocks) {
-			const prefix = `${block.key}/choices`;
-			const pick = event.type === "select" || event.type === "activate"
-				? key === prefix ? event.item : ""
-				: event.type === "action" && key.startsWith(`${prefix}/`) ? key.slice(prefix.length + 1) : "";
-			const row = pick && block.rows.find(r => r.key === pick && r.target);
-			if (!row || (event.type === "action" && event.act !== `swarm.${row.key}`)) continue;
-			const selection = selectionKey(block.key, row.key);
-			if (event.type === "activate") { this.#sel = selection; return this.#activate(row.target); }
-			if (selection === this.#sel) return false;
-			this.#sel = selection;
-			return true;
+			if (!block.rows.length && block.key !== "attention") continue;
+			const rows = block.rows.filter(r => r.target).map(r => item(r.key,
+				[span(r.label, "strong"), ...(block.key.startsWith("thread:") ? [span(` · ${r.state}`, stateTone(r.state ?? ""))] : [])],
+				r.detail ? [span(r.detail, "muted")] : undefined, stateTone(r.state ?? "")));
+			const detail: UiNode[] = block.rows.filter(r => !r.target).map(r => text(r.key, `${r.label}${r.detail ? ` — ${r.detail}` : ""}`, stateTone(r.state ?? "")));
+			if (rows.length || !detail.length) detail.unshift(list("choices", rows, selected?.block === block.key ? selected.row.key : undefined, "No attention items.",
+				(pick, activate) => this.#host.interact(this, () => {
+					const chosen = block.rows.find(r => r.key === pick && r.target);
+					if (!chosen) return;
+					this.#sel = selectionKey(block.key, pick);
+					if (activate) this.#activate(chosen.target);
+				})));
+			if (block.key === "attention" && this.#omittedUnaddressed) detail.push(text("omitted", `${this.#omittedUnaddressed} more unaddressed posts not shown.`, "muted"));
+			out.push(section(block.key, block.label, detail));
 		}
-		return false;
+		if (selected?.row.target) {
+			const { target, label, detail } = selected.row;
+			out.push(card(`detail:${selected.block}:${selected.row.key}`, label, [
+				text("detail", detail || (target.seq ? `Board post #${target.seq}` : `Member ${target.member}`)),
+				button("open", target.seq ? `Open post #${target.seq}` : "Inspect member", "Enter", () => this.#host.interact(this, () => this.#activate(target)), { primary: true }),
+			]));
+		}
+		return out;
 	}
 
 	render(width: number, rows: number): string[] {
@@ -222,8 +205,8 @@ export class OverviewView implements View {
 		return this.#status(this.#snapshot().attention.length);
 	}
 
-	nativeStatus(cx: DescribeContext): string {
-		return this.#status(this.#snapshot({ hour12: cx.hour12 }).attention.length);
+	nativeStatus(): string {
+		return this.#status(this.#snapshot({}).attention.length);
 	}
 
 	#status(n: number): string {
@@ -240,11 +223,11 @@ export class OverviewView implements View {
 
 	show(): void {}
 
-	handleInput(data: string, native = false): boolean {
+	handleInput(data: KeyEvent, native = false): boolean {
 		const { keys } = this.#host;
 		const delta = keys.up(data) ? -1 : keys.down(data) ? 1 : 0;
 		if (!delta && !keys.confirm(data)) return false;
-		this.#snapshot(native ? { hour12: this.#hour12 } : undefined);
+		this.#snapshot(native ? {} : undefined);
 		const selected = this.#selected();
 		if (delta) {
 			const at = selected ? this.#choices.indexOf(selected) : 0;

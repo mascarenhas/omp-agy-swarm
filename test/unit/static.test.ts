@@ -61,30 +61,30 @@ describe("dependency rules (§2)", () => {
 		}
 	});
 
-	test("host values and native selector parsing stay in the adapter; TUI rendering stays in UI or the observer bridge", () => {
+	test("host values stay in the adapter or observer bridge; TUI values stay at rendering boundaries", () => {
 		for (const f of all) {
 			for (const i of imports(f)) {
 				if (i.typeOnly) continue;
-				if (i.spec.startsWith("@oh-my-pi/pi-coding-agent") || i.spec.startsWith("@oh-my-pi/pi-catalog")
-					|| i.spec === "@oh-my-pi/pi-tui/overlays/model-selector")
-					expect(rel(f)).toBe("runtime/omp-adapter.ts");
-				if (i.spec === "@oh-my-pi/pi-tui/overlays/session-observer-registry") {
-					expect(rel(f)).toBe("runtime/hub-bridge.ts");
-				} else if (i.spec.startsWith("@oh-my-pi/pi-tui") && i.spec !== "@oh-my-pi/pi-tui/overlays/model-selector") {
-					expect(rel(f).startsWith("ui/tui/") || rel(f) === "ui/sanitize.ts").toBe(true);
+				const file = rel(f);
+				if (i.spec === "@oh-my-pi/pi-coding-agent/task/session-observer-registry") {
+					expect(["runtime/omp-adapter.ts", "runtime/hub-bridge.ts"]).toContain(file);
+				} else if (i.spec.startsWith("@oh-my-pi/pi-coding-agent") || i.spec.startsWith("@oh-my-pi/pi-catalog")) {
+					expect(file).toBe("runtime/omp-adapter.ts");
+				} else if (i.spec.startsWith("@oh-my-pi/pi-tui")) {
+					expect(file.startsWith("ui/tui/") || file === "ui/sanitize.ts").toBe(true);
 				}
 			}
 		}
 	});
 
 
-	test("native rendering uses type-only host internals, never deep native builders or wire values", () => {
+	test("no terminal-driver imports, native builder values, or wire values in src", () => {
 		for (const f of all) {
 			for (const i of imports(f)) {
+				expect([rel(f), i.spec.startsWith("@oh-my-pi/pi-tui/driver/")]).toEqual([rel(f), false]);
 				if (i.spec.startsWith("@oh-my-pi/pi-tui/native") || i.spec.startsWith("@oh-my-pi/pi-wire")) {
 					expect([rel(f), i.spec, i.typeOnly]).toEqual([rel(f), i.spec, true]);
 				}
-				if (rel(f) === "ui/tui/native.ts" && i.spec.startsWith("@oh-my-pi/")) expect(i.typeOnly).toBe(true);
 			}
 		}
 	});

@@ -1,10 +1,11 @@
 // Members: coordinator, task workers (groups, helpers under their adder), role workers; killed
 // hidden until K. Detail in place, or in a right-hand column on wide terminals (§10.2).
 
-import type { DescribeContext, NativeNode, NativeUiEvent } from "@oh-my-pi/pi-tui/native/node";
+import type { Accessor, KeyEvent, UiNode } from "@oh-my-pi/pi-tui";
 import type { MemberView } from "../../model.ts";
 import { fit, pad, sanitizeLine } from "../../sanitize.ts";
-import { button, card, group, id, item, list, memberFacts, NativeCache, nativeKey, span, stateTone, strip } from "../native.ts";
+import { printable } from "../keys.ts";
+import { button, card, col, id, item, list, memberFacts, row, span, stateTone } from "../native.ts";
 import { GLYPH, type OpenTarget, type View, type ViewHost } from "../view.ts";
 
 interface Row {
@@ -19,7 +20,6 @@ export class MembersView implements View {
 	#top = 0;
 	#detail = false;
 	#showKilled = false;
-	readonly #native = new NativeCache();
 	#orderedKey = "";
 	#rows: Row[] = [];
 
@@ -91,48 +91,37 @@ export class MembersView implements View {
 		return true;
 	}
 
-	describe(cx: DescribeContext): NativeNode {
-		const ordered = this.#ordered();
-		const selected = ordered[this.#selection(ordered)]?.member;
-		return this.#native.get(`${nativeKey(cx)}|${this.#orderedKey}|${this.#selName}`, () => {
-			const nodes = ordered.map(({ member: m, text: groupLabel, indent }) => {
-				if (!m) {
-					const row = item(`group:${id(groupLabel.split(" ")[0]!)}`, [span(groupLabel, "accent strong")]);
-					return { ...row, p: { ...row.p, disabled: true } };
-				}
-				const state = m.failure ? "failed" : m.state;
-				return item(`member:${id(m.name)}`, [span(m.name, "strong"), span(` · ${state}`, stateTone(state))],
-					[span(`${m.role === "worker" && indent && m.addedBy !== "coordinator" ? `Helper of ${m.addedBy} · ` : ""}${m.role} · `, "muted"),
-						span(`${m.model || "?"}${m.effort ? ` · ${m.effort}` : ""}`, "mono"),
-						span(` · ${m.unread} unread · ${m.owed.length} owed`, "num")], stateTone(state));
-			});
-			const left = list(cx, "roster", nodes, selected ? `member:${id(selected.name)}` : undefined, "No members.");
-			const content = selected ? strip(cx, "roster-pane", [
-				left,
-				card(cx, `detail:${id(selected.name)}`, selected.name, [
-					memberFacts(cx, selected, this.#host.model.swarmDir),
-					button(cx, "transcript", "View transcript", "Enter", { primary: true }),
-				]),
-			]) : strip(cx, "roster-pane", [left]);
-			return group(cx, "members", [button(cx, "killed", this.#showKilled ? "Hide killed" : "Show killed", "K", { on: this.#showKilled }), content], "omp.swarm.members");
-		});
+	native(revision: Accessor<number>): UiNode {
+		return col("members", () => { revision(); return this.#nativeContent(); }, "omp.swarm.members");
 	}
 
-	handleNativeEvent(event: NativeUiEvent, key: string): boolean {
-		const rows = this.#ordered();
-		const selected = rows[this.#selection(rows)]?.member;
-		if (event.type === "action" && key === "killed" && event.act === "swarm.killed") return this.handleInput("K");
-		if (event.type === "action" && selected && key === `roster-pane/detail:${id(selected.name)}/transcript` && event.act === "swarm.transcript") return this.#openTranscript(selected);
-		const roster = "roster-pane/roster";
-		const pick = event.type === "select" || event.type === "activate" ? key === roster ? event.item : ""
-			: event.type === "action" && key.startsWith(`${roster}/`) ? key.slice(roster.length + 1) : "";
-		if (!pick) return false;
-		const member = rows.find(r => r.member && pick === `member:${id(r.member.name)}`)?.member;
-		if (!member || (event.type === "action" && event.act !== `swarm.${pick}`)) return false;
-		const changed = this.#selName !== member.name;
-		this.#selName = member.name;
-		if (event.type === "activate") return this.#openTranscript(member);
-		return changed;
+	#nativeContent(): UiNode[] {
+		const ordered = this.#ordered();
+		const selected = ordered[this.#selection(ordered)]?.member;
+		const nodes = ordered.map(({ member: m, text: groupLabel, indent }) => {
+			if (!m) return item(`group:${id(groupLabel.split(" ")[0]!)}`, [span(groupLabel, "accent strong")], undefined, undefined, true);
+			const state = m.failure ? "failed" : m.state;
+			return item(`member:${id(m.name)}`, [span(m.name, "strong"), span(` · ${state}`, stateTone(state))],
+				[span(`${m.role === "worker" && indent && m.addedBy !== "coordinator" ? `Helper of ${m.addedBy} · ` : ""}${m.role} · `, "muted"),
+					span(`${m.model || "?"}${m.effort ? ` · ${m.effort}` : ""}`, "mono"),
+					span(` · ${m.unread} unread · ${m.owed.length} owed`, "num")], stateTone(state));
+		});
+		const left = list("roster", nodes, selected ? `member:${id(selected.name)}` : undefined, "No members.",
+			(pick, activate) => this.#host.interact(this, () => {
+				const member = ordered.find(r => r.member && pick === `member:${id(r.member.name)}`)?.member;
+				if (!member) return;
+				this.#selName = member.name;
+				if (activate) this.#openTranscript(member);
+			}));
+		const content = row("roster-pane", [left, selected && card(`detail:${id(selected.name)}`, selected.name, [
+			memberFacts(selected, this.#host.model.swarmDir),
+			button("transcript", "View transcript", "Enter", () => this.#host.interact(this, () => this.#openTranscript(selected)), { primary: true }),
+		])]);
+		return [
+			button("killed", this.#showKilled ? "Hide killed" : "Show killed", "K",
+				() => this.#host.interact(this, () => { this.#showKilled = !this.#showKilled; }), { on: this.#showKilled }),
+			content,
+		];
 	}
 
 	nativeStatus(): string {
@@ -234,7 +223,7 @@ export class MembersView implements View {
 		}
 	}
 
-	handleInput(data: string, native = false): boolean {
+	handleInput(data: KeyEvent, native = false): boolean {
 		const { keys } = this.#host;
 		const rows = this.#ordered();
 		const selected = rows[this.#selection(rows)]?.member;
@@ -265,8 +254,9 @@ export class MembersView implements View {
 			this.#detail = !this.#detail;
 			return true;
 		}
-		if (data === "t") return this.#openTranscript(selected);
-		if (data === "K") {
+		const ch = printable(data);
+		if (ch === "t") return this.#openTranscript(selected);
+		if (ch === "K") {
 			this.#showKilled = !this.#showKilled;
 			return true;
 		}
