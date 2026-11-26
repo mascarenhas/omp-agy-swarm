@@ -2,7 +2,7 @@
 // hidden until K. Detail in place, or in a right-hand column on wide terminals (§10.2).
 
 import type { Accessor, KeyEvent, UiNode } from "@oh-my-pi/pi-tui";
-import type { MemberView } from "../../model.ts";
+import { type MemberView, spendText } from "../../model.ts";
 import { fit, pad, sanitizeLine } from "../../sanitize.ts";
 import { printable } from "../keys.ts";
 import { button, card, col, id, item, list, memberFacts, row, span, stateTone } from "../native.ts";
@@ -162,7 +162,7 @@ export class MembersView implements View {
 		lines.push(
 			kv("cursor", `#${m.lastReadSeq} · ${m.unread} unread · owed ${m.owed.map(s => `#${s}`).join(" ") || "none"}`),
 			kv("posts", `${m.posts}${m.lastPostSeq ? ` · last #${m.lastPostSeq}` : ""}`),
-			kv("spend", `${m.tokens} tokens · $${m.cost.toFixed(4)}`),
+			kv("spend", spendText(m)),
 			kv("brief", m.briefSeq ? `#${m.briefSeq}` : "—"),
 		);
 		if (m.task) lines.push(kv("slice", m.task));

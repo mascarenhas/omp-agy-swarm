@@ -66,6 +66,9 @@ export interface RequestBill {
 	readonly usage: RequestUsage;
 }
 
+/** Who made a billed request: the member itself, or one of its native scouts. */
+export type UsageKind = "own" | "scout";
+
 export interface SpendRefusal {
 	readonly spent: number;
 	readonly cap: number;
@@ -198,7 +201,7 @@ export interface CreateWorkerOptions {
 	/** A shared, live limit, checked at native spawn and provider dispatch. */
 	checkSwarmSpend?: () => SpendRefusal | undefined;
 	/** Applies to this owned generation even while its turn or owner is being torn down. */
-	onOwnedUsage?(bill: RequestBill): void;
+	onOwnedUsage?(bill: RequestBill, kind?: UsageKind): void;
 	toolNames: string[];
 	customTools: unknown[];
 	appendSystemPrompt: string;
@@ -209,7 +212,7 @@ export interface CreateWorkerOptions {
 export interface SessionFactory {
 	create(options: CreateWorkerOptions): Promise<WorkerSession>;
 	setPrintWake(active: boolean): void;
-	observeCoordinatorUsage?(onUsage: (bill: RequestBill) => void): void;
+	observeCoordinatorUsage?(onUsage: (bill: RequestBill, kind?: UsageKind) => void): void;
 	dispose(deadlineAt: number): Promise<void>;
 }
 

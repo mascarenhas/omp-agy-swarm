@@ -29,13 +29,13 @@ import {
 	wakePendingFor,
 } from "../runtime/delivery.ts";
 import { completionLabel, INCOMPLETE_RESULT, liveTaskWork, mentionsNobody } from "../runtime/gate.ts";
-import type { ClaimReason, Member } from "../runtime/member.ts";
+import { type ClaimReason, type Member, roleDefaultMode } from "../runtime/member.ts";
 import { effortsOf, resolveEffort, resolveSpec, type SwitchEntry, switchMember } from "../runtime/models.ts";
 import { type CoordinatorPort, type ModelInfo, modelKey, type ThinkingCaps } from "../runtime/ports.ts";
-import { HEADLESS_HINT, nudgeText, QUIESCENT_NOTE, STALL_NOTE } from "../runtime/prompts.ts";
+import { endTurnNote, HEADLESS_HINT, nudgeText, QUIESCENT_NOTE, STALL_NOTE } from "../runtime/prompts.ts";
 import type { AddGroup, ReserveSpec, SwarmRuntime } from "../runtime/runtime.ts";
 import { nudgeDue, closeCycle } from "../runtime/settle.ts";
-import { arm, remainingSeconds } from "../runtime/waits.ts";
+import { arm, remainingSeconds, standsByAtTurnEnd } from "../runtime/waits.ts";
 import { helperDepth, permitted } from "./permissions.ts";
 
 // ---------------------------------------------------------------------------
@@ -56,6 +56,7 @@ export const WOKE = [
 	"killed",
 	"closing",
 	"not_parked",
+	"end_turn",
 	"no_swarm",
 ] as const;
 export type Woke = (typeof WOKE)[number];
@@ -75,6 +76,7 @@ export const USELESS_WOKE: Readonly<Record<Woke, boolean>> = {
 	killed: true,
 	closing: true,
 	not_parked: true,
+	end_turn: true,
 	no_swarm: true,
 };
 
@@ -868,7 +870,7 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 	if (!d?.addressedSeqs && nudgeDue(rt, m) && m.cycle) {
 		m.cycle.nudged = true;
 		m.stats.nudges++;
-		return ok({ woke: "nudge", note: nudgeText(m.addedBy) });
+		return ok({ woke: "nudge", note: nudgeText(m.addedBy, standsByAtTurnEnd(rt, m)) });
 	}
 	const pending = wakePendingFor(rt, m, mode, 1);
 	const quiescentUnread = isCoord && !liveTaskWork(rt).length ? rt.board.gateUnread(pageFloor(m), m.addressedRead) : [];
@@ -885,6 +887,12 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 	}
 	if (!isCoord && m.session?.wakeSources?.queued)
 		return ok({ woke: "job", note: "Background work is ready; omp delivers it after this tool returns." });
+	// A turn-end provider bills a turn only when it ends, so standby in the idle wake mode ends the
+	// turn instead of parking. Once per run: a model that calls again still parks.
+	if (p.timeout_seconds === undefined && mode === roleDefaultMode(m.role) && m.endTurnRun !== m.runId && standsByAtTurnEnd(rt, m)) {
+		m.endTurnRun = m.runId;
+		return ok({ woke: "end_turn", note: endTurnNote(isCoord, mode, !isCoord && !!m.session?.wakeSources) }, true);
+	}
 	closeCycle(m);
 	if (isCoord) rt.gate.refusals = 0;
 	const started = Date.now();

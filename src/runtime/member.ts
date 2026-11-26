@@ -103,7 +103,9 @@ export interface Notice {
 
 export type ReminderKey = "compacted" | "resume" | "restored" | "switched";
 
-export interface LiveStats extends MemberStats {
+export interface LiveStats extends Omit<MemberStats, "scout_tokens" | "scout_cost"> {
+	scoutTokens: number;
+	scoutCost: number;
 	runs: number;
 	posts: number;
 	wakes: number;
@@ -186,6 +188,8 @@ export class Member {
 	/** The session's cost-cap refusal when the current run started (a newer one ends the run as a cost failure). */
 	costRefusalSeen: unknown;
 	nudgePending = false;
+	/** The run whose untimed swarm_wait already answered woke:"end_turn"; a second wait in that run parks. */
+	endTurnRun = -1;
 	stuckNotified = false;
 	lastFailureNoticeAt = 0;
 	/** Set when an exec-approved action in this binding started or revived the member (SW-09). */
@@ -198,7 +202,7 @@ export class Member {
 	/** Last detached generation's stop result; only pending disposal delays explicit revival. */
 	drain: { promise: Promise<void>; pending: boolean } | undefined;
 	readonly tracker = new ActivityTracker();
-	stats: LiveStats = { steps: 0, tokens: 0, cost: 0, runs: 0, posts: 0, wakes: 0, nudges: 0, failures: 0 };
+	stats: LiveStats = { steps: 0, tokens: 0, cost: 0, scoutTokens: 0, scoutCost: 0, runs: 0, posts: 0, wakes: 0, nudges: 0, failures: 0 };
 	/** Model/effort the runtime expects the session to run (out-of-band change detection). */
 	expectedModel = "";
 	expectedEffort = "";
@@ -270,6 +274,16 @@ export class Member {
 		}
 	}
 
+	restoreStats(rec: MemberRecord): void {
+		const s = rec.stats;
+		if (!s) return;
+		this.stats.steps = Number(s.steps) || 0;
+		this.stats.tokens = Number(s.tokens) || 0;
+		this.stats.cost = Number(s.cost) || 0;
+		this.stats.scoutTokens = Number(s.scout_tokens) || 0;
+		this.stats.scoutCost = Number(s.scout_cost) || 0;
+	}
+
 	pruneAddressedRead(ceiling = Infinity): void {
 		const seen = this.addressedRead;
 		if (!seen) return;
@@ -312,7 +326,8 @@ export class Member {
 			r.killed_at = this.killedAt;
 			r.failure = this.failure;
 		}
-		r.stats = { steps: this.stats.steps, tokens: this.stats.tokens, cost: this.stats.cost };
+		const s = this.stats;
+		r.stats = { steps: s.steps, tokens: s.tokens, cost: s.cost, scout_tokens: s.scoutTokens, scout_cost: s.scoutCost };
 		if (this.wakeFloor > 0) r.wake_floor = this.wakeFloor;
 		if (this.addressedRead) r.addressed_read_seqs = Array.from(this.addressedRead).sort((a, b) => a - b);
 		if (this.addedSeq > 0) r.added_seq = this.addedSeq;
@@ -355,10 +370,6 @@ export function memberFromRecord(name: string, rec: MemberRecord): Member {
 	if (rec.wake_mode === "mentions" || rec.wake_mode === "anything") {
 		m.lastPark = { mode: rec.wake_mode, since: Number(rec.wait_since) || 0, until: rec.wait_until ?? null };
 	} else m.lastPark = rec.last_park ?? null;
-	if (rec.stats) {
-		m.stats.steps = Number(rec.stats.steps) || 0;
-		m.stats.tokens = Number(rec.stats.tokens) || 0;
-		m.stats.cost = Number(rec.stats.cost) || 0;
-	}
+	m.restoreStats(rec);
 	return m;
 }

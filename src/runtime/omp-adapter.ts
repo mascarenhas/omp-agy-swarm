@@ -50,6 +50,7 @@ import type {
 	SessionFactory,
 	RequestBill,
 	ThinkingCaps,
+	UsageKind,
 	TranscriptEntry,
 	WakeSources,
 	WorkerEvent,
@@ -176,7 +177,7 @@ const loggedMissing = new Set<string>();
 
 type WorkerBus = ExtensionAPI["events"];
 
-type BillSink = (bill: RequestBill) => void;
+type BillSink = (bill: RequestBill, kind: UsageKind) => void;
 type Owner = { ref: AgentRef; bill: BillSink; children: Set<AgentRef>; costGate?: AgentSession["costGate"] };
 
 // The compiled host does not expose a runtime import for the mirror class.
@@ -210,7 +211,7 @@ class ScoutJournal {
 	record(id: string, entry: RequestBill): void {
 		if (this.seen.has(id)) return;
 		this.seen.add(id);
-		reportBill(this.bill, this.log, entry);
+		reportBill(this.bill, this.log, entry, "scout");
 	}
 
 	scan(entries: readonly SessionEntry[]): void {
@@ -222,8 +223,8 @@ class ScoutJournal {
 	}
 }
 
-function reportBill(bill: BillSink, log: (line: string) => void, entry: RequestBill): void {
-	try { bill(entry); } catch (error) { log(`omp-agy-swarm: model usage accounting failed: ${String(error)}`); }
+function reportBill(bill: BillSink, log: (line: string) => void, entry: RequestBill, kind: UsageKind): void {
+	try { bill(entry, kind); } catch (error) { log(`omp-agy-swarm: model usage accounting failed: ${String(error)}`); }
 }
 
 /** Stateless eval and other auxiliary calls are journaled, not assistant events. */
@@ -236,7 +237,7 @@ function observeAuxiliaryUsage(
 		const entryId = append.call(manager, usage, owner);
 		if (entryId !== undefined) {
 			if (journal) journal.record(entryId, usage);
-			else reportBill(bill, log, usage);
+			else reportBill(bill, log, usage, "own");
 		}
 		return entryId;
 	};
@@ -355,7 +356,7 @@ class ScoutUsage {
 				const owner = this.#own(ref);
 				if (!owner) return;
 				this.#requests.add(event.message);
-				reportBill(owner.bill, this.log, event.message);
+				reportBill(owner.bill, this.log, event.message, "scout");
 			}),
 		];
 	}
@@ -412,8 +413,8 @@ class ScoutUsage {
 		this.#mainSid = sid;
 		this.#main = { ref, bill, children: new Set() };
 		const manager = ref.session.sessionManager;
-		this.#off.push(observeAuxiliaryUsage(manager, usage => {
-			if (manager.getSessionId() === sid) bill(usage);
+		this.#off.push(observeAuxiliaryUsage(manager, (usage, kind) => {
+			if (manager.getSessionId() === sid) bill(usage, kind);
 		}, this.log));
 	}
 
@@ -422,7 +423,7 @@ class ScoutUsage {
 		this.#roots.set(ref.id, owner);
 		const offUsage = observeAuxiliaryUsage(raw.sessionManager, bill, this.log);
 		const offDirect = raw.subscribe(event => {
-			if (event.type === "message_end" && event.message.role === "assistant") reportBill(bill, this.log, event.message);
+			if (event.type === "message_end" && event.message.role === "assistant") reportBill(bill, this.log, event.message, "own");
 		});
 		this.#aux.set(ref, () => { offUsage(); offDirect(); });
 		return owner;

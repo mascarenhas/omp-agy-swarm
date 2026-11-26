@@ -298,9 +298,12 @@ console.log("JUDGE-AUX-RESULT", judgement.ok.bool);
 	expect(early, diagnostic).toHaveLength(3);
 	const earlyPrice = early.reduce((sum, row) => sum + Number(row.price), 0);
 	const earlyTokens = early.reduce((sum, row) => sum + Number(row.tokens), 0);
-	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeCloseTo((last?.directCost ?? 0) + rawChildPrice + earlyPrice, 10);
+	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeCloseTo(last?.directCost ?? 0, 10);
+	expect(roster?.members.worker?.stats?.scout_cost, diagnostic).toBeCloseTo(rawChildPrice + earlyPrice, 10);
 	expect(roster?.members.worker?.stats?.tokens, diagnostic)
-		.toBe((last?.requests.reduce((sum, request) => sum + request.tokens, 0) ?? 0) + child.reduce((sum, row) => sum + Number(row.tokens), 0) + earlyTokens);
+		.toBe(last?.requests.reduce((sum, request) => sum + request.tokens, 0) ?? 0);
+	expect(roster?.members.worker?.stats?.scout_tokens, diagnostic)
+		.toBe(child.reduce((sum, row) => sum + Number(row.tokens), 0) + earlyTokens);
 	expect(requests.filter(r => r.model === "worker-b" && r.rule >= 0).map(r => r.reasoning_effort), diagnostic).toEqual(["low", "low", "low"]);
 	expect(requests.some(r => /REFUSED-(NATIVE|EVAL)-SCOUT/.test(r.last) && r.roles.at(-1) === "user"), diagnostic).toBe(false);
 	expect(requests.some(r => /Cannot spawn 'task'.*Cannot spawn 'extra'/s.test(r.last) && r.last.includes("EVAL-AUX-RESULT")), diagnostic).toBe(true);
@@ -323,7 +326,8 @@ test("compiled scout billing follows exact nested parents, deduplicates old gene
 	}, { config: concurrentConfig, ceiling: "1" });
 	const before = rows.find(r => r.stage === "settled");
 	expect(rows.find(r => r.stage === "injected"), diagnostic).toMatchObject({ workerId: "swarm~worker" });
-	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeCloseTo(Number(before?.directCost) + 0.005, 10);
+	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeCloseTo(Number(before?.directCost), 10);
+	expect(roster?.members.worker?.stats?.scout_cost, diagnostic).toBeCloseTo(0.005, 10);
 	expect(roster?.members.denied, diagnostic).toBeUndefined();
 	expect(metrics?.outcome.value, diagnostic).toBe("incomplete");
 	expect(metrics?.spend.unknown, diagnostic).toMatch(/worker.*mock\/synthetic.*4 tokens without a price/);
@@ -402,10 +406,12 @@ test("compiled scoped scout overrides preserve native profile discovery, setting
 	expect(Number.isFinite(prior?.cost) && Number.isFinite(prior?.tokens), diagnostic).toBe(true);
 	const mainCost = mainLedger.reduce((sum, bill) => sum + (bill.usage.cost.total ?? 0), -Number(prior?.cost));
 	const mainTokens = mainLedger.reduce((sum, bill) => sum + (bill.usage.totalTokens ?? 0), -Number(prior?.tokens));
-	expect(roster?.members.coordinator?.stats?.cost, diagnostic)
-		.toBeCloseTo(mainScouts.reduce((sum, bill) => sum + Number(bill.price), mainCost), 10);
-	expect(roster?.members.coordinator?.stats?.tokens, diagnostic)
-		.toBe(mainScouts.reduce((sum, bill) => sum + Number(bill.tokens), mainTokens));
+	expect(roster?.members.coordinator?.stats?.cost, diagnostic).toBeCloseTo(mainCost, 10);
+	expect(roster?.members.coordinator?.stats?.scout_cost, diagnostic)
+		.toBeCloseTo(mainScouts.reduce((sum, bill) => sum + Number(bill.price), 0), 10);
+	expect(roster?.members.coordinator?.stats?.tokens, diagnostic).toBe(mainTokens);
+	expect(roster?.members.coordinator?.stats?.scout_tokens, diagnostic)
+		.toBe(mainScouts.reduce((sum, bill) => sum + Number(bill.tokens), 0));
 	expect(config, diagnostic).toBe(concurrentConfig);
 	expect(stdout, diagnostic).toContain("ROUTING-FINISHED");
 }, 60_000);
@@ -452,8 +458,8 @@ console.log(await pinned.wait());` })] } },
 	expect(child, diagnostic).toMatchObject({ model: "worker-b", reasoning_effort: "high" });
 	expect(requests.find(r => r.last.includes("PINNED-EVAL-CHILD") && r.roles.at(-1) === "user"), diagnostic)
 		.toMatchObject({ model: "worker-limited", reasoning_effort: "high" });
-	expect(roster?.members.worker?.stats?.cost, diagnostic)
-		.toBeCloseTo(Number(rows.find(r => r.stage === "settled")?.directCost) + children.reduce((sum, row) => sum + Number(row.price), 0), 10);
+	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeCloseTo(Number(rows.find(r => r.stage === "settled")?.directCost), 10);
+	expect(roster?.members.worker?.stats?.scout_cost, diagnostic).toBeCloseTo(children.reduce((sum, row) => sum + Number(row.price), 0), 10);
 }, 60_000);
 
 test("compiled operator revive bills only new scout journal entries from the reopened transcript", async () => {
@@ -486,8 +492,10 @@ test("compiled operator revive bills only new scout journal entries from the reo
 	const finalDirectCost = workerLedger.reduce((sum, usage) => sum + usage.cost.total, 0);
 	const finalDirectTokens = workerLedger.reduce((sum, usage) => sum + usage.totalTokens, 0);
 	const stats = roster?.members.worker?.stats;
-	expect(stats?.cost, diagnostic).toBeCloseTo(finalDirectCost + scoutBills.reduce((sum, bill) => sum + Number(bill.price), 0), 10);
-	expect(stats?.tokens, diagnostic).toBe(finalDirectTokens + scoutBills.reduce((sum, bill) => sum + Number(bill.tokens), 0));
+	expect(stats?.cost, diagnostic).toBeCloseTo(finalDirectCost, 10);
+	expect(stats?.scout_cost, diagnostic).toBeCloseTo(scoutBills.reduce((sum, bill) => sum + Number(bill.price), 0), 10);
+	expect(stats?.tokens, diagnostic).toBe(finalDirectTokens);
+	expect(stats?.scout_tokens, diagnostic).toBe(scoutBills.reduce((sum, bill) => sum + Number(bill.tokens), 0));
 	expect(metrics?.outcome.value, diagnostic).toBe("complete");
 }, 60_000);
 
@@ -560,10 +568,10 @@ for (const parent of ["worker", "main"] as const) {
 			expect(metrics?.spend.unknown, diagnostic).toMatch(/mock-remote\/worker-b reported 7 tokens without a price/);
 		} else {
 			const stats = roster?.members.worker?.stats;
-			expect(stats?.cost, diagnostic).toBeCloseTo(
-				raw.reduce((sum, row) => sum + Number(row.price), 0.1) + workerLedger.reduce((sum, usage) => sum + usage.cost.total, 0), 10);
-			expect(stats?.tokens, diagnostic).toBe(
-				raw.reduce((sum, row) => sum + Number(row.tokens), 14) + workerLedger.reduce((sum, usage) => sum + usage.totalTokens, 0));
+			expect(stats?.cost, diagnostic).toBeCloseTo(workerLedger.reduce((sum, usage) => sum + usage.cost.total, 0), 10);
+			expect(stats?.scout_cost, diagnostic).toBeCloseTo(raw.reduce((sum, row) => sum + Number(row.price), 0.1), 10);
+			expect(stats?.tokens, diagnostic).toBe(workerLedger.reduce((sum, usage) => sum + usage.totalTokens, 0));
+			expect(stats?.scout_tokens, diagnostic).toBe(raw.reduce((sum, row) => sum + Number(row.tokens), 14));
 			expect(rows.find(row => row.stage === "remote-drained")?.received, diagnostic).toBe(count);
 			expect(rows.filter(row => row.stage === "remote-stop-blocked"), diagnostic).toHaveLength(1);
 			expect(metrics?.outcome.value, diagnostic).toBe("quiescent_no_done");
@@ -621,8 +629,8 @@ try {
 		.toMatch(/FIRST-OK.*First paid result.*CHAIN-DENIED.*Swarm spend ceiling/s);
 	expect(requests.filter(r => r.model === "expensive").map(r => r.last), diagnostic).toEqual(["user: FIRST-CAPPED-AUX"]);
 	expect(metrics?.outcome.value, diagnostic).toBe("incomplete");
-	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeGreaterThanOrEqual(15);
-	expect(roster?.members.worker?.stats?.cost, diagnostic).toBeLessThan(16);
+	expect(roster?.members.worker?.stats?.scout_cost, diagnostic).toBeGreaterThanOrEqual(15);
+	expect(roster?.members.worker?.stats?.scout_cost, diagnostic).toBeLessThan(16);
 }, 100_000);
 
 test("compiled cap blocks further worker spawns and native scout-result model turns", async () => {

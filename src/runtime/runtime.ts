@@ -35,11 +35,12 @@ import {
 	type SpendRefusal,
 	type SessionFactory,
 	type ThinkingCaps,
+	type UsageKind,
 	type WorkerSession,
 	WorkerStartupUnstopped,
 } from "./ports.ts";
 import { compactedReminder, deliveryIdOf, onWorkerEvent } from "./settle.ts";
-import { claim } from "./waits.ts";
+import { claim, standsByAtTurnEnd, turnEndModel } from "./waits.ts";
 import { addWorktree, cwdInside, type DisposeResult, discardFreshWorktree, disposeWorkspace, type GitRunner, type PreparedGroup, prepareGroup, verifyWorktree } from "./workspace.ts";
 import { restoredReminder, roleBlock, skillBody, workerContract } from "./prompts.ts";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -206,7 +207,7 @@ export class SwarmRuntime {
 		}
 		rt.#printWakeReleased = binding.headless && completionCurrent(rt);
 		rt.factory.setPrintWake(binding.headless && !rt.#printWakeReleased);
-		rt.factory.observeCoordinatorUsage?.(bill => rt.#recordMeasuredUsage(rt.coordinator, bill.usage, bill.provider, bill.model));
+		rt.factory.observeCoordinatorUsage?.((bill, kind) => rt.#recordMeasuredUsage(rt.coordinator, bill.usage, bill.provider, bill.model, kind));
 		return rt;
 	}
 
@@ -233,9 +234,7 @@ export class SwarmRuntime {
 			if (name === "coordinator") {
 				this.coordinator.restoreReadState(rec);
 				this.coordinator.lastNudgedSeq = Number(rec.last_nudged_seq) || 0;
-				this.coordinator.stats.steps = Number(rec.stats?.steps) || 0;
-				this.coordinator.stats.tokens = Number(rec.stats?.tokens) || 0;
-				this.coordinator.stats.cost = Number(rec.stats?.cost) || 0;
+				this.coordinator.restoreStats(rec);
 				continue;
 			}
 			const m = memberFromRecord(name, rec);
@@ -401,12 +400,13 @@ export class SwarmRuntime {
 		return this.#rosterText;
 	}
 
+	/** Every request the swarm paid for, the members' native scouts included (the ceiling's measure). */
 	totalSpend(): { tokens: number; cost: number } {
 		let tokens = 0;
 		let cost = 0;
 		for (const m of this.members.values()) {
-			tokens += m.stats.tokens;
-			cost += m.stats.cost;
+			tokens += m.stats.tokens + m.stats.scoutTokens;
+			cost += m.stats.cost + m.stats.scoutCost;
 		}
 		return { tokens, cost };
 	}
@@ -446,14 +446,19 @@ export class SwarmRuntime {
 		if (msg.usage) this.#recordMeasuredUsage(m, msg.usage, msg.provider, msg.model);
 	}
 
-	#recordMeasuredUsage(m: Member, usage: RequestUsage, provider?: string, model?: string): void {
+	#recordMeasuredUsage(m: Member, usage: RequestUsage, provider?: string, model?: string, kind: UsageKind = "own"): void {
 		const tokens = tokenCount(usage.totalTokens)
 			|| tokenCount(usage.input) + tokenCount(usage.output) + tokenCount(usage.cacheRead) + tokenCount(usage.cacheWrite);
 		const price = usage.cost?.total;
 		const priced = typeof price === "number" && Number.isFinite(price) && price > 0;
 		if (!tokens && !priced) return;
-		m.stats.tokens += tokens;
-		if (priced) m.stats.cost += price;
+		if (kind === "scout") {
+			m.stats.scoutTokens += tokens;
+			if (priced) m.stats.scoutCost += price;
+		} else {
+			m.stats.tokens += tokens;
+			if (priced) m.stats.cost += price;
+		}
 		if (this.env.maxCostUsd > 0 && tokens > 0 && !priced && this.spendUnknown === undefined)
 			this.spendUnknown = `${m.name}'s ${provider ?? "?"}/${model ?? "?"} reported ${tokens} tokens without a price`;
 		if (this.closing) {
@@ -489,6 +494,8 @@ export class SwarmRuntime {
 				steps: m.stats.steps,
 				tokens: m.stats.tokens,
 				cost: Number(m.stats.cost.toFixed(6)),
+				scout_tokens: m.stats.scoutTokens,
+				scout_cost: Number(m.stats.scoutCost.toFixed(6)),
 				posts: this.board.postsBy(m.name).length,
 				wakes: m.stats.wakes,
 				nudges: m.stats.nudges,
@@ -879,7 +886,7 @@ export class SwarmRuntime {
 			m.workspace = ws;
 			const model = group.model;
 			const toolNames = this.toolNamesFor(m.role);
-			const contract = this.#appendPrompt(m, ws);
+			const contract = this.#appendPrompt(m, ws, model);
 			session = await this.factory.create({
 				name: m.name,
 				role: m.role === "narrator" || m.role === "monitor" ? m.role : "worker",
@@ -894,7 +901,7 @@ export class SwarmRuntime {
 				// Scout settings are snapshotted for this generation, not hot-switched.
 				scoutOverride: this.scoutOverride,
 				checkSwarmSpend: this.env.maxCostUsd > 0 ? () => this.spendRefusal() : undefined,
-				onOwnedUsage: bill => this.#recordMeasuredUsage(m, bill.usage, bill.provider, bill.model),
+				onOwnedUsage: (bill, kind) => this.#recordMeasuredUsage(m, bill.usage, bill.provider, bill.model, kind),
 				toolNames,
 				customTools: this.deps.makeMemberTools(this, m, op.gen),
 				appendSystemPrompt: contract,
@@ -964,7 +971,7 @@ export class SwarmRuntime {
 		return [...new Set([...allowed, ...MEMBER_TOOLS_BY_ROLE[role]])];
 	}
 
-	#appendPrompt(m: Member, ws: WorkspaceRecord): string {
+	#appendPrompt(m: Member, ws: WorkspaceRecord, model: ModelInfo | undefined): string {
 		const contract = workerContract({
 			name: m.name,
 			addedBy: m.addedBy,
@@ -973,6 +980,7 @@ export class SwarmRuntime {
 			baseDesc: describeBase(ws),
 			swarmDir: this.dir,
 			backgroundJobs: m.role === "worker",
+			turnEndStandby: turnEndModel(model),
 		});
 		if (m.role !== "narrator" && m.role !== "monitor") return contract;
 		let body = "";
@@ -1204,10 +1212,10 @@ export class SwarmRuntime {
 				effort: m.effort || undefined,
 				scoutOverride: this.scoutOverride,
 				checkSwarmSpend: this.env.maxCostUsd > 0 ? () => this.spendRefusal() : undefined,
-				onOwnedUsage: bill => this.#recordMeasuredUsage(m, bill.usage, bill.provider, bill.model),
+				onOwnedUsage: (bill, kind) => this.#recordMeasuredUsage(m, bill.usage, bill.provider, bill.model, kind),
 				toolNames,
 				customTools: this.deps.makeMemberTools(this, m, op.gen),
-				appendSystemPrompt: this.#appendPrompt(m, m.workspace),
+				appendSystemPrompt: this.#appendPrompt(m, m.workspace, model),
 				mode: { kind: "revive", file, conversationId: m.conversationId },
 				enableLsp: m.role === "worker",
 			});
@@ -1233,10 +1241,12 @@ export class SwarmRuntime {
 		m.redeliveryExhausted = false;
 		m.redeliveryAttempts = 0;
 		m.notBefore = 0;
+		const endsTurn = standsByAtTurnEnd(this, m);
 		if (m.role === "worker") {
-			m.reminders.resume = "You are live again. Background jobs from the previous session are not resumed (including native scouts); check their outputs before restarting work. For standby, call untimed swarm_wait{}.";
+			m.reminders.resume = `You are live again. Background jobs from the previous session are not resumed (including native scouts); check their outputs before restarting work. For standby, ${endsTurn ? "end your turn" : "call untimed swarm_wait{}"}.`;
 		} else if (m.briefPresented) {
-			m.reminders.resume = "You are live again. Unless the posts below need action, call swarm_wait again.";
+			// The monitor's waits are timed, so they keep parking.
+			m.reminders.resume = `You are live again. Unless the posts below need action, ${endsTurn && m.role === "narrator" ? "end your turn" : "call swarm_wait again"}.`;
 		}
 		this.flushStructural();
 		handoffPrompt(this, m);

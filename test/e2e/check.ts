@@ -50,7 +50,7 @@ export function readJson<T = Record<string, unknown>>(path: string): T | undefin
 
 export interface Metrics {
 	outcome: { value: string; reason: string } | null;
-	members: Record<string, { model: string; effort: string; state: string; failures: number; nudges: number; wakes: number; killed: boolean; tokens: number; cost: number }>;
+	members: Record<string, { model: string; effort: string; state: string; failures: number; nudges: number; wakes: number; killed: boolean; tokens: number; cost: number; scout_tokens: number; scout_cost: number }>;
 	spend: { tokens: number; cost: number; ceiling?: number | null; unknown?: string };
 	coordinator?: { gate_refusals?: number; stall_wakes?: number; tokens?: number; cost?: number };
 }

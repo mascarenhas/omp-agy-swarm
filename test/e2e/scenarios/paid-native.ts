@@ -196,8 +196,9 @@ const R11: PaidScenario = {
 		const m = metrics(c);
 		const direct = directBill(entries(c, "finder"), assistantBills(trace, owner));
 		const reported = m?.members.finder?.cost;
-		k.ok(direct.cost > 0 && !direct.unpriced && reported !== undefined && reported > direct.cost, "positive descendant billing above worker's own direct spend");
-		k.ok(near(reported, direct.cost + childCost), `worker direct + each scout direct exactly once: ${direct.cost} + ${childCost}; metrics ${reported}`);
+		const scouts = m?.members.finder?.scout_cost;
+		k.ok(direct.cost > 0 && !direct.unpriced && near(reported, direct.cost), `worker's own spend is its direct bill: ${direct.cost}; metrics ${reported}`);
+		k.ok(childCost > 0 && near(scouts, childCost), `each scout direct exactly once, apart from the worker's own spend: ${childCost}; metrics ${scouts}`);
 		// Main starts a fresh transcript. The request selecting the first successful
 		// swarm operation is pre-admission; include all later journaled assistant
 		// and model_usage entries (e.g. exec completion and cache warming).

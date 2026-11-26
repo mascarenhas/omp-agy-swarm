@@ -2,10 +2,10 @@
 
 import { EFFORTS, type Effort, isEffort, raceTimeout, TIMING } from "../env.ts";
 import { reconcile } from "./delivery.ts";
-import type { Member } from "./member.ts";
+import { type Member, roleDefaultMode } from "./member.ts";
 import { type CoordinatorPort, type ModelInfo, modelKey, type ThinkingCaps, type UsageLimitView } from "./ports.ts";
 import type { SwarmRuntime } from "./runtime.ts";
-import { claim, remainingSeconds } from "./waits.ts";
+import { claim, remainingSeconds, standsByAtTurnEnd } from "./waits.ts";
 
 export interface Resolved {
 	model: ModelInfo;
@@ -260,11 +260,14 @@ export async function switchMember(
 	const now = `${target.model} (${target.effort || "default"})`;
 	let text: string;
 	if (failure) text = `The switch to ${targetKey} failed (${failure}); you are on ${now}.`;
-	else if (prior)
-		text =
-			`Your model is now ${now}. You were waiting on the board; unless the posts below need action, call ` +
-			`swarm_wait{mentions_only:${prior.mode !== "anything"}${prior.remaining ? `, timeout_seconds:${prior.remaining}` : ""}} again.`;
-	else text = target.failure ? `Your model is now ${now} after a failed turn. Continue where you left off.` : "";
+	else if (prior) {
+		// An untimed wait in the idle wake mode is a turn-end standby on a turn-end provider (waits.ts).
+		const endsTurn = !prior.remaining && prior.mode === roleDefaultMode(target.role) && standsByAtTurnEnd(rt, target);
+		text = endsTurn
+			? `Your model is now ${now}. You were waiting on the board; unless the posts below need action, end your turn.`
+			: `Your model is now ${now}. You were waiting on the board; unless the posts below need action, call ` +
+				`swarm_wait{mentions_only:${prior.mode !== "anything"}${prior.remaining ? `, timeout_seconds:${prior.remaining}` : ""}} again.`;
+	} else text = target.failure ? `Your model is now ${now} after a failed turn. Continue where you left off.` : "";
 	let resumed: boolean;
 	if (prior || (target.failure && !failure)) resumed = resumeAfterChange(rt, target, text);
 	else {

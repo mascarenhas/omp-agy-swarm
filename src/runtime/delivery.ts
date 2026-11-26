@@ -6,6 +6,7 @@ import type { BoardMessage, Page, PageMessage } from "../board/types.ts";
 import { LIMITS, TIMING } from "../env.ts";
 import { type Delivery, type Member, nextDeliveryId, type ReminderKey, roleDefaultMode } from "./member.ts";
 import { firstMessage, nudgeText, wakeText } from "./prompts.ts";
+import { standsByAtTurnEnd } from "./waits.ts";
 import type { SwarmRuntime } from "./runtime.ts";
 import { settleRun, startCycle } from "./settle.ts";
 
@@ -366,7 +367,9 @@ export function dispatch(rt: SwarmRuntime, m: Member, id: string): void {
 		const reminderEntries: [ReminderKey, string][] = midTurn
 			? m.reminders.compacted === undefined ? [] : [["compacted", m.reminders.compacted]]
 			: Object.entries(m.reminders) as [ReminderKey, string][];
-		const nudge = d.nudge && m.role === "worker" ? nudgeText(m.addedBy) : undefined;
+		// The monitor rearms a timed wait, so it keeps the swarm_wait wording.
+		const turnEnd = m.role !== "monitor" && standsByAtTurnEnd(rt, m);
+		const nudge = d.nudge && m.role === "worker" ? nudgeText(m.addedBy, turnEnd) : undefined;
 		if (!page.messages.length && !notices.length && !reminderEntries.length && !nudge) return cancel(rt, m, d);
 		const trigger = midTurn ? undefined : wakePendingFor(rt, m, roleDefaultMode(m.role), 1)[0]?.seq;
 		const noticeTexts = notices.map(n => n.text);
@@ -381,6 +384,7 @@ export function dispatch(rt: SwarmRuntime, m: Member, id: string): void {
 			triggerSeq: trigger,
 			midTurn,
 			nudge,
+			turnEnd,
 		});
 		d.through = page.next_since;
 		if (d.addressedSeqs) for (const p of page.messages) d.addressedSeqs.push(p.seq);
