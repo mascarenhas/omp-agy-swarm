@@ -1,7 +1,7 @@
 // Worker contract, role block, first message and every runtime-authored text (§8.6, §6.5, §7).
 // PURE: node builtins and board types only.
 
-import type { BoardMessage, WorkspaceRecord } from "../board/types.ts";
+import type { BoardMessage, WakeMode, WorkspaceRecord } from "../board/types.ts";
 
 export interface ContractInput {
 	name: string;
@@ -11,6 +11,8 @@ export interface ContractInput {
 	baseDesc: string;
 	swarmDir: string;
 	backgroundJobs?: boolean;
+	/** The member's provider bills a turn only when it ends, so standby ends the turn (see waits.ts). */
+	turnEndStandby?: boolean;
 }
 
 export function workspaceParagraph(ws: WorkspaceRecord, cwd: string, baseDesc: string): string {
@@ -25,6 +27,25 @@ export function workspaceParagraph(ws: WorkspaceRecord, cwd: string, baseDesc: s
 
 export function workerContract(c: ContractInput): string {
 	const by = c.addedBy || "coordinator";
+	const jobWoke = c.backgroundJobs ? `, or woke:"job" if omp has background work ready to deliver next` : "";
+	const waitTool = c.turnEndStandby
+		? `- swarm_wait{mentions_only?, timeout_seconds}: wake yourself on a deadline: sleep until a post names you
+  (mentions_only:false: any post you can see) or timeout_seconds pass. It returns the new posts${jobWoke}.
+  Without timeout_seconds it returns woke:"end_turn" at once: on your model, standby ends the turn. Call it on its
+  own: it must be the only tool call of its response.`
+		: `- swarm_wait{mentions_only?, timeout_seconds?}: sleep until a post names you (mentions_only:false: any post you can
+  see; timeout_seconds: at the latest then). It returns the new posts${jobWoke}. Call it on its own:
+  it must be the only tool call of its response.`;
+	const standby = c.turnEndStandby
+		? `5. For standby after posting, end your turn: reply with one short line and no tool call. A post that names you${c.backgroundJobs ? " or your own managed background job finishing" : ""}
+   wakes you with a new message. Use swarm_wait with timeout_seconds only if you must wake yourself on a deadline.
+6. After a wake or swarm_wait result, read any remaining pages with read_board if the result says more posts
+   follow. Act on what is addressed to you, post the outcome, and end your turn again.`
+		: `5. For ordinary standby after posting, end your turn or use untimed swarm_wait{}. Set a timeout only if you must
+   wake yourself on a deadline.${c.backgroundJobs ? " Both directed board posts and the results of your own managed background jobs can wake you." : ""}
+6. After an ordinary wake or swarm_wait result, read any remaining pages with read_board if the result says more
+   posts follow. Act on what is addressed to you, post the outcome, and wait again.`;
+	const whileJobsRun = c.turnEndStandby ? "End your turn" : "End your turn or use swarm_wait{}";
 	return `<swarm_worker>
 You are \`${c.name}\`, a member of a swarm coordinated by \`coordinator\`. \`${by}\` added you. You are a full agent in
 your own conversation. The other members see only what you post on the shared message board.
@@ -34,9 +55,7 @@ Board tools
   a peer, a numbered group's prefix, or @#channel for a whole channel). @all wakes everyone: use it only for a rule
   or interface everyone needs. A post that names nobody may be read by nobody.
 - read_board{since?, limit?, channel?}: read posts after your read cursor (or after \`since\`).
-- swarm_wait{mentions_only?, timeout_seconds?}: sleep until a post names you (mentions_only:false: any post you can
-  see; timeout_seconds: at the latest then). It returns the new posts${c.backgroundJobs ? `, or woke:"job" if omp has background work ready to deliver next` : ""}. Call it on its own:
-  it must be the only tool call of its response.
+${waitTool}
 - swarm{action}: "status"; "add" a helper for your own piece (it reports to you and you stay responsible); "kill",
   "revive" or "model" a helper you added; "model" with no name to change your own model or effort.
 
@@ -50,10 +69,7 @@ How you work
 3. Refer to earlier posts by number (#12). Never copy or summarize another member's post into yours.
 4. A mention is a doorbell: mention only who must act next. No thanks, no acknowledgements, no status nobody
    asked for.
-5. For ordinary standby after posting, end your turn or use untimed swarm_wait{}. Set a timeout only if you must
-   wake yourself on a deadline.${c.backgroundJobs ? " Both directed board posts and the results of your own managed background jobs can wake you." : ""}
-6. After an ordinary wake or swarm_wait result, read any remaining pages with read_board if the result says more
-   posts follow. Act on what is addressed to you, post the outcome, and wait again.
+${standby}
 7. Addressed posts (@name, group prefix, @all, or @#channel you subscribe to) can arrive as swarm messages between
    tool batches or at the stop boundary. Handle them within your role and continue your current work unless the
    message changes it. Further addressed pages are pushed automatically; unaddressed posts still arrive through
@@ -61,7 +77,7 @@ How you work
 
 You are not a task subagent: there is no \`yield\` and no parent reading your reply. Run the builds and tests your
 brief asks for yourself. Your output is your files and your board posts.
-${c.backgroundJobs ? `For long or noisy commands, use managed background bash (async:true) rather than blocking. Your jobs share your working copy while you edit. Use read proc:// to list your jobs, read proc://<id> to inspect one, or write proc://<id>/kill with empty content to cancel it. End your turn or use swarm_wait{} while work runs; omp delivers results, so do not poll.\n` : ""}\
+${c.backgroundJobs ? `For long or noisy commands, use managed background bash (async:true) rather than blocking. Your jobs share your working copy while you edit. Use read proc:// to list your jobs, read proc://<id> to inspect one, or write proc://<id>/kill with empty content to cancel it. ${whileJobsRun} while work runs; omp delivers results, so do not poll.\n` : ""}\
 ${workspaceParagraph(c.workspace, c.cwd, c.baseDesc)}
 Swarm directory (shared files; save screenshots under its shots/ folder): ${c.swarmDir}
 </swarm_worker>`;
@@ -134,6 +150,8 @@ export interface WakeTextInput {
 	triggerSeq?: number;
 	nudge?: string;
 	midTurn?: boolean;
+	/** The reader stands by by ending its turn rather than with swarm_wait. */
+	turnEnd?: boolean;
 }
 
 export function wakeText(w: WakeTextInput): string {
@@ -153,17 +171,24 @@ export function wakeText(w: WakeTextInput): string {
 	if (w.posts.length) {
 		lines.push(w.midTurn
 			? "Handle these addressed posts within your role; continue your current work."
-			: 'Act on the posts marked "→ @you", post the outcome, then call swarm_wait.');
+			: `Act on the posts marked "→ @you", post the outcome, then ${w.turnEnd ? "end your turn" : "call swarm_wait"}.`);
 	}
 	return lines.join("\n");
 }
 
-export function nudgeText(addedBy: string): string {
+export function nudgeText(addedBy: string, turnEnd = false): string {
 	return (
 		"[swarm] You were asked something and have not posted. Nobody reads your reply text. Post your result with " +
-		`post_message (start with @${addedBy || "coordinator"}; "[done]" if finished), or call swarm_wait if there is ` +
+		`post_message (start with @${addedBy || "coordinator"}; "[done]" if finished), or ${turnEnd ? "end your turn" : "call swarm_wait"} if there is ` +
 		"truly nothing to report."
 	);
+}
+
+/** swarm_wait's answer when standby ends the turn (see waits.ts). */
+export function endTurnNote(coordinator: boolean, mode: WakeMode, jobs: boolean): string {
+	if (coordinator) return "Nothing is waiting for you. End your turn now with a short status for the user; a post that names you wakes you.";
+	const waker = mode === "anything" ? "Any post you can see" : `A post that names you${jobs ? " or your background work finishing" : ""}`;
+	return `Nothing is waiting for you. End your turn now: reply with one short line and no tool call. ${waker} wakes you with a new message.`;
 }
 
 export function waitText(reasons: string[]): string {

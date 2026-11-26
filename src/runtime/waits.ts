@@ -4,7 +4,24 @@
 
 import type { WakeMode } from "../board/types.ts";
 import type { ClaimReason, Member, Waiter } from "./member.ts";
+import type { ModelInfo } from "./ports.ts";
 import type { SwarmRuntime } from "./runtime.ts";
+
+/**
+ * omp records an antigravity-cli request's usage only when its ACP turn ends, and a member parked
+ * in swarm_wait holds that turn open. On these providers an untimed standby ends the turn instead.
+ */
+const TURN_END_PROVIDERS: Readonly<Record<string, true>> = { "antigravity-cli": true };
+
+export function turnEndModel(model: ModelInfo | undefined): boolean {
+	return model !== undefined && TURN_END_PROVIDERS[model.provider] === true;
+}
+
+/** Interactive coordinators and members on a turn-end provider stand by by ending their turn. */
+export function standsByAtTurnEnd(rt: SwarmRuntime, m: Member): boolean {
+	if (m.role === "coordinator") return !rt.binding.headless && turnEndModel(rt.binding.model());
+	return turnEndModel(m.session?.model);
+}
 
 const TOOL_INTERRUPT = "pi-agent-core.tool-interrupt";
 

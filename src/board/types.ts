@@ -95,8 +95,12 @@ export interface PendingDeliveryRecord {
 
 export interface MemberStats {
 	steps: number;
+	/** The member's own model requests. Rosters written before scout_tokens existed also counted scouts here. */
 	tokens: number;
 	cost: number;
+	/** Model requests of the member's native scouts. */
+	scout_tokens?: number;
+	scout_cost?: number;
 }
 
 /** A `members.json` member entry. Paths are never read back from here except `workspace` (verified). */

@@ -36,7 +36,9 @@ fine. Keep your own turns short so you stay free to respond to the user — brie
 reply, and end the turn. In an interactive session, ending a turn already parks
 you (a post naming you wakes you), so a turn that answers the user needs no
 `swarm_wait`; call `swarm_wait` to park with nothing to say, and always in a
-headless run (see **Headless runs**). Never sit inside a long task of your own
+headless run (see **Headless runs**). On `antigravity-cli` in an interactive
+session, an untimed `swarm_wait` returns `woke: "end_turn"` instead of parking:
+end your turn. Never sit inside a long task of your own
 while the user waits. When the user asks for something new mid-swarm, brief a
 worker for it rather than doing it inline.
 
@@ -500,6 +502,11 @@ Call `swarm_wait` rather than polling `read_board` in a loop. Waiting consumes n
     later idle wake is still possible and the switch can apply when that turn
     ends).
   - `nudge` (workers only): woken to post a missing result.
+  - `end_turn`: on `antigravity-cli`, which bills a turn only when it ends,
+    an untimed wait in your default wake mode (interactive coordinators and
+    members alike) ends the turn instead of parking. Reply with one short line
+    and no tool call; the posts that would have woken the wait start a new turn.
+    A second untimed wait in the same turn parks as usual.
   - `interrupted`: a wake is already queued (read it instead of parking) or the
     wait was interrupted.
   - `not_parked`, `aborted`, `killed`, `closing`, `no_swarm`: wait did not

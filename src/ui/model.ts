@@ -25,8 +25,11 @@ export interface MemberView {
 	activity: string;
 	activityKind: string;
 	failure?: { kind: string; text: string };
+	/** The member's own requests; its native scouts are counted in scoutTokens/scoutCost. */
 	tokens: number;
 	cost: number;
+	scoutTokens: number;
+	scoutCost: number;
 	killed: boolean;
 	conversationId: string;
 	sessionFile?: string;
@@ -294,6 +297,12 @@ export function project(model: SwarmReadModel, files = model.files(), absoluteTi
 	const projected = { key, counts, goal: goal || "(no goal yet)", threads, attention, reel, stateLine, empty };
 	memo.set(model, projected);
 	return projected;
+}
+
+/** `N tokens · $X`, plus the member's native scouts when they spent anything. */
+export function spendText(m: Pick<MemberView, "tokens" | "cost" | "scoutTokens" | "scoutCost">): string {
+	const own = `${m.tokens} tokens · $${m.cost.toFixed(4)}`;
+	return m.scoutTokens || m.scoutCost ? `${own} · scouts ${m.scoutTokens} tokens · $${m.scoutCost.toFixed(4)}` : own;
 }
 
 export function countMembers(members: readonly MemberView[]): SwarmView["counts"] {

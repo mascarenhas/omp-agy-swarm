@@ -2,7 +2,7 @@
 import { jsx, type JSX, type JSXNode, nativeSupports, type UiKind, type UiNode } from "@oh-my-pi/pi-tui";
 import type { TspSpan, TspTone } from "@oh-my-pi/pi-wire";
 import type { BoardMessage } from "../../board/types.ts";
-import type { MemberView } from "../model.ts";
+import { type MemberView, spendText } from "../model.ts";
 import { sanitize, sanitizeLine } from "../sanitize.ts";
 
 export function node<K extends UiKind>(kind: K, key: string, props: JSX.IntrinsicElements[K]): UiNode<K> {
@@ -122,7 +122,7 @@ export function memberFacts(m: MemberView, swarmDir: string): UiNode {
 		...(m.workspace.cleanup ? [["Cleanup", m.workspace.cleanup] as const] : []),
 		["Read cursor", `#${m.lastReadSeq} · ${m.unread} unread · ${m.owed.length} owed${m.owed.length ? `: ${m.owed.map(s => `#${s}`).join(" ")}` : ""}`, "num"],
 		["Work", `${m.steps} steps · ${m.posts} posts${m.lastPostSeq ? ` · last #${m.lastPostSeq}` : ""}`, "num"],
-		["Spend", `${m.tokens} tokens · $${m.cost.toFixed(4)}`, "num"],
+		["Spend", spendText(m), "num"],
 		...(m.briefSeq ? [["Brief", `#${m.briefSeq}`, "num"] as const] : []),
 		...(m.task ? [["Task", m.task] as const] : []),
 		...(m.sessionFile ? [["Transcript", m.sessionFile, "path"] as const] : []),

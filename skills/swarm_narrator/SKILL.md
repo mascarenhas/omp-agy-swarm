@@ -63,7 +63,9 @@ block. You own:
    is already queued, `swarm_wait` returns `woke: "interrupted"` instead of
    parking; a cursor `read_board{limit: 200}` (omit `since`; a literal
    `since < cursor` requests history) returns the other unread posts and
-   excludes only queued/receipted ones.
+   excludes only queued/receipted ones. On `antigravity-cli` it returns
+   `woke: "end_turn"` instead of parking: end your turn with one short line and
+   no tool call; any post starts your next turn, so continue at step 2.
 2. Process the `messages` returned in the `swarm_wait` result and update `LAST`;
    call `read_board{limit: 200}` (omit `since` for cursor reads) **only** while
    `more` is `true`. Addressed `@narrator` posts can also arrive mid-turn as a

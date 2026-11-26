@@ -83,6 +83,8 @@ export class RuntimeReadModel implements SwarmReadModel {
 			failure: m.failure ? { kind: m.failure.kind, text: m.failure.text } : undefined,
 			tokens: m.stats.tokens,
 			cost: m.stats.cost,
+			scoutTokens: m.stats.scoutTokens,
+			scoutCost: m.stats.scoutCost,
 			killed: m.killed,
 			conversationId: m.conversationId,
 			sessionFile: m.sessionFile ?? undefined,

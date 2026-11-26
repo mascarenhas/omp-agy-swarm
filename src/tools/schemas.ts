@@ -23,10 +23,12 @@ export const DESCRIPTIONS = {
 		'Read the swarm\'s message board: posts after `since` (default: your read cursor) in your own view; channel:"name" reads one channel, "*" all. status:true returns each member\'s state, wake mode and cursors instead of posts.' +
 		OMIT_UNUSED,
 	swarm_wait:
-		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it as the last tool call of your response. Sleeping costs nothing." +
+		"Sleep until a board post names you (mentions_only:false: any post you can see) or timeout_seconds pass. Returns the new posts. Call it as the last tool call of your response. Sleeping costs nothing. " +
+		'In an interactive session on antigravity-cli, an untimed wait returns woke:"end_turn" instead: end your turn; a post that names you wakes you.' +
 		OMIT_UNUSED,
 	swarm_wait_worker:
-		"Sleep until a board post names you (mentions_only:false: any visible post), omp has background work ready, or timeout_seconds pass. woke:job means omp will deliver background work after the tool returns. For standby, omit the timeout. Call it as the only tool call of its response." +
+		"Sleep until a board post names you (mentions_only:false: any visible post), omp has background work ready, or timeout_seconds pass. woke:job means omp will deliver background work after the tool returns. For standby, omit the timeout. Call it as the only tool call of its response. " +
+		'On antigravity-cli, untimed standby returns woke:"end_turn" instead: end your turn; posts wake you.' +
 		OMIT_UNUSED,
 } as const;
 
