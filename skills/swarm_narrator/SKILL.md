@@ -161,19 +161,18 @@ never by agent:
   sits in exactly one thread too; the Overview only shows asks listed by a
   thread. Keep thread ids stable as work evolves.
 
-### Progress reel (UI changes only)
+### Progress reel
 
-Include a top-level `reel` **only** when the user asked for a visible change
-(UI, layout, visuals) and workers saved screenshots under `SWARM_DIR/shots/`.
-Omit `reel` for backend, infra, data, docs, or research work even if a
-screenshot exists.
+Include a top-level `reel` when workers or the coordinator have posted
+meaningful `Progress:` updates or saved screenshots under `SWARM_DIR/shots/`:
 
-- `"reel": {"frames": [{"path": "<absolute path under SWARM_DIR/shots/>", "seq": <board seq>, "caption": "what changed, ≤ 10 words"}]}`.
+- Screenshot frame: `{"path": "<absolute path under SWARM_DIR/shots/>", "seq": <board seq>, "caption": "what changed, ≤ 10 words", "agent": "<author>"}`
+- Markdown progress frame: `{"markdown": "<concise Markdown update, ≤ 2000 chars>", "seq": <board seq>, "caption": "short headline, ≤ 90 chars", "agent": "<author>"}`
 - Only `.png`, `.jpg`, `.jpeg`, and `.webp` files (≤ 8 MB) under `SWARM_DIR`
-  (or `OMP_SWARM_UI_ROOTS`) are served.
-- 2 to 24 frames, oldest first, one per meaningful visual step (baseline,
-  each visible fix, latest). Prefer full-window shots of the same screen, size,
-  and theme; skip crops, diffs, and contact sheets.
+  (or `OMP_SWARM_UI_ROOTS`) are served for screenshot frames.
+- 1 to 24 frames, oldest first, interleaved chronologically. For screenshots,
+  prefer full-window shots of the same screen, size, and theme; skip crops,
+  diffs, and contact sheets.
 
 ### Short copy (read first by the web Overview)
 

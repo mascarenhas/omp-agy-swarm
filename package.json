@@ -1,6 +1,6 @@
 {
   "name": "omp-agy-swarm",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Antigravity-style agent swarm for omp: parallel worker sessions sharing one message board, with a native TUI board and an opt-in web board.",

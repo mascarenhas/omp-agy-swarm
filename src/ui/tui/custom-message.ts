@@ -34,3 +34,4 @@ function notice(role: string, heading: string, label: (theme: ExtensionTheme) =>
 
 export const renderWakeMessage = notice("omp.swarm.wake", "Swarm wake", theme => `${theme.symbols.icon("package")} swarm`.trim());
 export const renderWebBoardMessage = notice("omp.swarm.webNotice", "Swarm web board", () => "Swarm web board");
+export const renderDirectMessage = notice("omp.swarm.dm", "Swarm DM", () => "Swarm DM");

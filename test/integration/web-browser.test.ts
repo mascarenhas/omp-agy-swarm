@@ -2,7 +2,7 @@
 // installed Chrome/Chromium. Skipped with a loud message when none is found.
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { type Browser, chromium, type Page } from "playwright-core";
@@ -90,12 +90,33 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 		await page.waitForFunction(() => (document.getElementById("members")?.textContent ?? "").includes("ui"));
 	});
 
-	test("both reel images decode from same-origin /api/frame as the reel is scrubbed", async () => {
+	test("progress carousel supports screenshots and coordinator markdown without Compare with now", async () => {
+		await h.post("Progress: **Phase 1** status\n- **ui**: landed baseline & fix\n- Safe check: `<script>window.__xss=1</script>` & <img src=x onerror=\"window.__xss=2\">");
 		await page.click('[data-tab="overview"]');
+		// Wait for the coordinator's markdown update to arrive via polling and render as latest frame.
+		await page.waitForSelector('.o2-reel.omp-reel [data-testid="swarm-reel-markdown"]', { timeout: 10_000 });
+		// "Compare with now" and its swipe controls must be absent.
+		expect(await page.locator(".o2-reel .o2-rcmp, .o2-reel .o2-rswipe, .o2-reel .o2-rline, .o2-reel .o2-rnow").count()).toBe(0);
+		expect(await page.locator(".o2-reel").textContent()).not.toContain("Compare with now");
+		// Markdown renders structurally and never executes injected HTML.
+		const md = page.locator('[data-testid="swarm-reel-markdown"]');
+		expect(await md.locator("li strong").first().textContent()).toBe("ui");
+		expect(await md.locator("code").first().textContent()).toBe("<script>window.__xss=1</script>");
+		expect(await md.locator("img, script").count()).toBe(0);
+		expect(await page.evaluate(() => Reflect.get(window, "__xss"))).toBeUndefined();
+		expect(await page.locator(".o2-reel .o2-rmeta").textContent()).toContain("@coordinator");
+		// Scrub back through both screenshot frames and verify both decode from same-origin /api/frame.
+		await page.evaluate(() => {
+			const s = document.querySelector<HTMLInputElement>(".o2-reel .o2-rscrub");
+			if (!s) throw new Error("no scrub control");
+			s.value = "1";
+			s.dispatchEvent(new Event("input", { bubbles: true }));
+		});
 		const image = page.locator(".o2-reel img.o2-rimg");
+		await image.waitFor({ timeout: 10_000 });
 		await image.evaluate(async img => (img as HTMLImageElement).decode());
-		const first = await image.getAttribute("src");
-		expect(first).toMatch(/^\/api\/frame\?/);
+		const secondSrc = await image.getAttribute("src");
+		expect(secondSrc).toMatch(/^\/api\/frame\?/);
 		await page.evaluate(() => {
 			const s = document.querySelector<HTMLInputElement>(".o2-reel .o2-rscrub");
 			if (!s) throw new Error("no scrub control");
@@ -107,11 +128,172 @@ describe.skipIf(!CHROME)("web board in a browser", () => {
 				const src = document.querySelector<HTMLImageElement>(".o2-reel img.o2-rimg")?.getAttribute("src") ?? "";
 				return src.startsWith("/api/frame?") && src !== prev;
 			},
-			first,
+			secondSrc,
 			{ timeout: 10_000 },
 		);
 		await image.evaluate(async img => (img as HTMLImageElement).decode());
+		// Open the full timeline modal and step forward to the markdown frame.
+		await page.click(".o2-reel .o2-rexp");
+		await page.waitForSelector(".o2-tv");
+		await page.keyboard.press("End");
+		await page.waitForSelector(".o2-tv .omp-tv-md");
+		expect(await page.locator(".o2-tv .omp-tv-md").textContent()).toContain("landed baseline & fix");
+		await page.keyboard.press("Escape");
+		await page.waitForSelector(".o2-tv", { state: "detached" });
 	});
+
+	test("progress carousel preserves selection, scroll, and modal sync across polls and invalid narrator frames", async () => {
+		// Post a long markdown progress update so the stage scrolls, then post a newer one to make it non-latest.
+		const longBody = Array.from({ length: 24 }, (_, i) => `- item ${i + 1}: detail line for scroll stability`).join("\n");
+		await h.post(`Progress: Long scrollable update\n${longBody}`);
+		await h.post("Progress: Latest update after scroll target\n- fresh item");
+		// Wait for the latest frame to appear in the carousel.
+		await page.waitForFunction(
+			() => (document.querySelector(".o2-reel .o2-rcap")?.textContent ?? "").includes("Latest update after scroll target"),
+			undefined,
+			{ timeout: 10_000 },
+		);
+		// Step back one frame onto the long scrollable update, scroll down, and focus the previous button.
+		await page.click(".o2-reel .omp-rnav.prev");
+		await page.waitForFunction(
+			() => (document.querySelector(".o2-reel .o2-rcap")?.textContent ?? "").includes("Long scrollable update"),
+			undefined,
+			{ timeout: 10_000 },
+		);
+		const scrolled = await page.evaluate(() => {
+			const st = document.querySelector<HTMLElement>(".o2-reel .o2-rstage");
+			if (!st) return 0;
+			st.scrollTop = 90;
+			st.dispatchEvent(new Event("scroll"));
+			return st.scrollTop;
+		});
+		expect(scrolled).toBeGreaterThan(0);
+		try {
+			// Write invalid narrator reel.frames (blank markdown with image path + non-image file path);
+			// bridge must fall back to board frames while preserving selection and scroll.
+			writeFileSync(
+				join(h.dir, "view.json"),
+				JSON.stringify({
+					version: 1,
+					as_of_seq: h.rt.board.head,
+					headline: "poll update",
+					reel: {
+						frames: [
+							{ kind: "markdown", markdown: "  ", path: join(h.dir, "shots", "a.png"), caption: "invalid" },
+							{ kind: "image", path: join(h.dir, "notes.txt"), caption: "non-image" },
+						],
+					},
+				}),
+			);
+			await h.post("unrelated chatter to force snapshot poll");
+			await page.waitForFunction(
+				() => (document.querySelector("#ov-plain .o2")?.textContent ?? "").includes("poll update"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+			expect(await page.locator(".o2-reel .o2-rcap").textContent()).toContain("Long scrollable update");
+			const scrollAfterPoll = await page.evaluate(() => document.querySelector<HTMLElement>(".o2-reel .o2-rstage")?.scrollTop ?? 0);
+			expect(scrollAfterPoll).toBeGreaterThan(0);
+			// Open modal, step to latest, then post a new progress frame while the modal stays open.
+			await page.click(".o2-reel .o2-rexp");
+			await page.waitForSelector(".o2-tv");
+			await page.keyboard.press("End");
+			await page.waitForFunction(
+				() => (document.querySelector(".o2-tv .o2-tvcap")?.textContent ?? "").includes("Latest update after scroll target"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+			await h.post("Progress: Live update while modal open\n- pushed live");
+			await page.waitForFunction(
+				() => (document.querySelector(".o2-tv .o2-tvcap")?.textContent ?? "").includes("Live update while modal open"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+			// Step back inside the modal and close; the underlying card must stay synced to that frame.
+			await page.keyboard.press("ArrowLeft");
+			await page.waitForFunction(
+				() => (document.querySelector(".o2-tv .o2-tvcap")?.textContent ?? "").includes("Latest update after scroll target"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+			await page.keyboard.press("Escape");
+			await page.waitForSelector(".o2-tv", { state: "detached" });
+			expect(await page.locator(".o2-reel .o2-rcap").textContent()).toContain("Latest update after scroll target");
+			// Single-frame narrator reel hides prev/next buttons and re-renders when a later paragraph changes.
+			const prefix = "Same opening paragraph that spans well beyond sixty four characters without changing.";
+			writeFileSync(
+				join(h.dir, "view.json"),
+				JSON.stringify({
+					version: 1,
+					as_of_seq: h.rt.board.head,
+					headline: "single frame v1",
+					reel: { frames: [{ kind: "markdown", seq: 1, caption: "Edited note", markdown: `${prefix}\n\nOriginal tail` }] },
+				}),
+			);
+			h.rt.changed();
+			await page.waitForFunction(
+				() => (document.querySelector('[data-testid="swarm-reel-markdown"]')?.textContent ?? "").includes("Original tail"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+			expect(await page.locator(".o2-reel .omp-rnav.prev").isVisible()).toBe(false);
+			expect(await page.locator(".o2-reel .omp-rnav.next").isVisible()).toBe(false);
+			writeFileSync(
+				join(h.dir, "view.json"),
+				JSON.stringify({
+					version: 1,
+					as_of_seq: h.rt.board.head,
+					headline: "single frame v2",
+					reel: {
+						frames: [
+							{ kind: "markdown", seq: 1, caption: "Renamed caption", markdown: `${prefix}\n\nUpdated tail` },
+							{ kind: "markdown", seq: 2, caption: "Second frame", markdown: "newer frame" },
+						],
+					},
+				}),
+			);
+			h.rt.changed();
+			await page.waitForFunction(
+				() => (document.querySelector('[data-testid="swarm-reel-markdown"]')?.textContent ?? "").includes("newer frame"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+			// Selecting frame 1 by seq survives a caption rename + tail edit without jumping to latest.
+			await page.click(".o2-reel .omp-rnav.prev");
+			await page.waitForFunction(
+				() =>
+					(document.querySelector(".o2-reel .o2-rcap")?.textContent ?? "").includes("Renamed caption") &&
+					(document.querySelector('[data-testid="swarm-reel-markdown"]')?.textContent ?? "").includes("Updated tail"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+			writeFileSync(
+				join(h.dir, "view.json"),
+				JSON.stringify({
+					version: 1,
+					as_of_seq: h.rt.board.head,
+					headline: "caption edit v3",
+					reel: {
+						frames: [
+							{ kind: "markdown", seq: 1, caption: "Corrected caption", markdown: `${prefix}\n\nUpdated tail v3` },
+							{ kind: "markdown", seq: 2, caption: "Second frame", markdown: "newer frame" },
+						],
+					},
+				}),
+			);
+			h.rt.changed();
+			await page.waitForFunction(
+				() =>
+					(document.querySelector(".o2-reel .o2-rcap")?.textContent ?? "").includes("Corrected caption") &&
+					(document.querySelector('[data-testid="swarm-reel-markdown"]')?.textContent ?? "").includes("Updated tail v3"),
+				undefined,
+				{ timeout: 10_000 },
+			);
+		} finally {
+			if (existsSync(join(h.dir, "view.json"))) unlinkSync(join(h.dir, "view.json"));
+			h.rt.changed();
+		}
+	}, 30_000);
 
 	test("the transcript drawer pages through /api/transcript", async () => {
 		const conv = h.member("ui").conversationId;

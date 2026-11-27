@@ -108,6 +108,12 @@ export interface CustomWakeMessage {
 	details: Record<string, unknown>;
 }
 
+export interface ImageAttachment {
+	readonly type: "image";
+	readonly data: string;
+	readonly mimeType: string;
+}
+
 /** A transcript entry (current branch) as 19.0.1 writes it (session-entries.ts); the fields the UI reads. */
 export interface TranscriptEntry {
 	type: string;
@@ -141,6 +147,8 @@ export interface WorkerSession {
 	readonly model: ModelInfo | undefined;
 	readonly thinkingLevel: string | undefined;
 	readonly isStreaming: boolean;
+	/** User steering messages queued on the host session awaiting delivery. */
+	readonly hasPendingSteering: boolean;
 	readonly isRunActive: boolean;
 	readonly wakeSources: WakeSources | undefined;
 	/** Also includes owned jobs whose result will not wake the session. */
@@ -148,6 +156,7 @@ export interface WorkerSession {
 	/** The latest model request the host's cost gate refused (a new object per refusal). */
 	readonly costCapRefusal: { readonly message: string } | undefined;
 	prompt(text: string): Promise<unknown>;
+	steer(text: string, images?: readonly ImageAttachment[], onAdmitted?: () => void): Promise<boolean>;
 	sendCustomMessage(message: CustomWakeMessage, options: { deliverAs: "aside" }): Promise<boolean>;
 	abort(): Promise<void>;
 	waitForIdle(): Promise<void>;

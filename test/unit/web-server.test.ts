@@ -207,4 +207,42 @@ describe("web board", () => {
 		expect(tr.items.length).toBeGreaterThan(0);
 		expect((await req(b, "/api/transcript?member=../x")).status).toBe(404);
 	});
+
+	test("coordinator markdown progress updates appear in snapshot frames without widening /api/frame", async () => {
+		const { h, b } = await board();
+		await h.post("Progress: Phase 1 summary\n- **ui**: baseline screenshot saved\n- Next: verify");
+		b.start(0);
+		const snap = (await (await req(b, "/api/swarm")).json()) as { frames: { kind: string; agent?: string; caption: string; markdown?: string; path?: string }[] };
+		expect(snap.frames.length).toBe(2);
+		expect(snap.frames[0]).toMatchObject({ kind: "image", agent: "ui", caption: "first", path: join(h.dir, "shots", "a.png") });
+		expect(snap.frames[1]).toMatchObject({ kind: "markdown", agent: "coordinator", caption: "Phase 1 summary", markdown: "- **ui**: baseline screenshot saved\n- Next: verify" });
+		expect((await req(b, `/api/frame?path=${encodeURIComponent(join(h.dir, "shots", "unlisted.png"))}`)).status).toBe(404);
+	});
+
+	test("declared markdown frame with path never authorizes /api/frame and invalid narrator frames fall back to board frames", async () => {
+		const { h, b } = await board();
+		const unlisted = join(h.dir, "shots", "unlisted.png");
+		writeFileSync(
+			join(h.dir, "view.json"),
+			JSON.stringify({
+				version: 1,
+				as_of_seq: 2,
+				reel: {
+					frames: [
+						{ kind: "markdown", markdown: "   ", path: unlisted, caption: "spoof" },
+						{ kind: "image", path: join(h.dir, "notes.txt"), caption: "non-image" },
+						{ kind: "image", path: `${h.dir}/shots/./a.png`, caption: "dot-segment" },
+					],
+				},
+			}),
+		);
+		h.rt.changed();
+		b.start(0);
+		const snap = (await (await req(b, "/api/swarm")).json()) as { frames: { kind: string; path?: string }[] };
+		// Invalid narrator frames must fall back to valid board frames (a.png) and never allow unlisted.png.
+		expect(snap.frames).toHaveLength(1);
+		expect(snap.frames[0]?.path).toBe(join(h.dir, "shots", "a.png"));
+		expect((await req(b, `/api/frame?path=${encodeURIComponent(unlisted)}`)).status).toBe(404);
+		expect((await req(b, `/api/frame?path=${encodeURIComponent(join(h.dir, "notes.txt"))}`)).status).toBe(404);
+	});
 });

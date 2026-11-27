@@ -28,6 +28,7 @@ import {
 	type CoordinatorPort,
 	type CreateWorkerOptions,
 	type HostMessage,
+	type ImageAttachment,
 	modelKey,
 	type ModelInfo,
 	type PendingSwitch,
@@ -42,7 +43,7 @@ import {
 import { compactedReminder, deliveryIdOf, onWorkerEvent } from "./settle.ts";
 import { claim, standsByAtTurnEnd, turnEndModel } from "./waits.ts";
 import { addWorktree, cwdInside, type DisposeResult, discardFreshWorktree, disposeWorkspace, type GitRunner, type PreparedGroup, prepareGroup, verifyWorktree } from "./workspace.ts";
-import { restoredReminder, roleBlock, skillBody, workerContract } from "./prompts.ts";
+import { directMessageText, restoredReminder, roleBlock, skillBody, workerContract } from "./prompts.ts";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { describeBase } from "./workspace.ts";
 import { DEFAULT_WORKER_TOOLS, HARD_EXCLUDED_TOOLS, hasKey, NARRATOR_TOOLS } from "../env.ts";
@@ -745,6 +746,140 @@ export class SwarmRuntime {
 		return { woke, stopped };
 	}
 
+	/** Directly steers a swarm participant without posting to the board or prompting the coordinator. */
+	async steerMember(
+		handle: string,
+		body: string,
+		images?: readonly ImageAttachment[],
+	): Promise<{ ok: true; member: Member; mode: "steered" | "started" | "pending" } | { ok: false; error: string }> {
+		const m = this.members.get(handle);
+		if (!m || m.role === "coordinator") return { ok: false, error: `no swarm participant named @${handle}` };
+		if (this.closing) return { ok: false, error: `the swarm is shutting down; cannot steer @${m.name}` };
+		if (this.finishing) return { ok: false, error: `finish is in progress; cannot steer @${m.name}` };
+		if (m.killed || m.op?.kind === "kill") return { ok: false, error: `@${m.name} was killed and cannot be steered` };
+		if (m.op) return { ok: false, error: `@${m.name} is ${m.op.kind === "switch" ? "switching model" : m.op.kind === "revive" ? "reviving" : "starting"}; try again in a moment` };
+		if (m.phase === "switching") return { ok: false, error: `@${m.name} is switching model; try again in a moment` };
+		if (m.phase === "stopped" || !m.session) {
+			return { ok: false, error: `@${m.name} is stopped; revive it with swarm{action:"revive", name:"${m.name}"} before steering` };
+		}
+		if (this.spendExceeded()) return { ok: false, error: `spend ceiling reached; cannot steer @${m.name}` };
+		const session = m.session;
+		const gen = m.gen;
+		const wasStreaming = session.isStreaming;
+		const dmText = directMessageText(body);
+		const expected = dmText.trim();
+		m.pendingSteers++;
+		this.changed();
+		let off: (() => void) | undefined;
+		let pendingReleased = false;
+		let admitted = false;
+		let confirmed = false;
+		let timedOut = false;
+		let failureNotified = false;
+		let done = false;
+		type SteerOutcome = { ok: true; mode: "steered" | "started" } | { ok: false; error: string };
+		const settled = Promise.withResolvers<SteerOutcome>();
+		const finish = (outcome: SteerOutcome): void => {
+			if (done) return;
+			done = true;
+			settled.resolve(outcome);
+		};
+		const notifyLateFailure = (msg: string): void => {
+			if (!timedOut || confirmed || failureNotified || this.closing) return;
+			failureNotified = true;
+			this.binding.notify(msg, "warning");
+		};
+		const onDetach = (): void => {
+			releasePending();
+			notifyLateFailure(`@${m.name} stopped before receiving the DM`);
+			finish({ ok: false, error: `@${m.name} stopped before receiving the message` });
+		};
+		const releasePending = (): void => {
+			if (pendingReleased) return;
+			pendingReleased = true;
+			off?.();
+			off = undefined;
+			m.steerAborters.delete(onDetach);
+			if (m.gen === gen && m.pendingSteers > 0) {
+				m.pendingSteers--;
+				this.changed();
+			}
+		};
+		m.steerAborters.add(onDetach);
+		off = session.subscribe(ev => {
+			if (m.gen !== gen || m.killed || this.closing) {
+				onDetach();
+				return;
+			}
+			if (
+				admitted &&
+				ev.type === "message_end" &&
+				"message" in ev &&
+				ev.message.role === "user" &&
+				!m.claimedSteerReceipts.has(ev.message) &&
+				messageText(ev.message).trim() === expected
+			) {
+				m.claimedSteerReceipts.add(ev.message);
+				confirmed = true;
+				releasePending();
+				finish({ ok: true, mode: wasStreaming ? "steered" : "started" });
+			}
+		});
+		if (pendingReleased) {
+			off();
+			off = undefined;
+		}
+		const onAdmitted = (): void => {
+			admitted = true;
+			if (m.gen === gen && m.waiter) claim(this, m, m.waiter.id, "interrupted");
+		};
+		const sent = session.steer(dmText, images, onAdmitted);
+		void sent.then(
+			accepted => {
+				if (!accepted) {
+					releasePending();
+					const errMsg = `@${m.name} did not accept the message`;
+					notifyLateFailure(`Could not deliver DM to @${m.name}: ${errMsg}`);
+					finish({ ok: false, error: errMsg });
+					return;
+				}
+				if (m.gen !== gen || m.killed || this.closing) {
+					releasePending();
+					const errMsg = `@${m.name} stopped before receiving the message`;
+					notifyLateFailure(errMsg);
+					finish({ ok: false, error: errMsg });
+					return;
+				}
+				confirmed = true;
+				releasePending();
+				finish({ ok: true, mode: wasStreaming ? "steered" : "started" });
+			},
+			(err: unknown) => {
+				releasePending();
+				const msg = err instanceof Error ? err.message : String(err);
+				if (!done) {
+					finish({ ok: false, error: msg || `could not deliver message to @${m.name}` });
+					return;
+				}
+				if (timedOut && !confirmed) {
+					notifyLateFailure(`Could not deliver DM to @${m.name}: ${msg || "delivery failed"}`);
+					return;
+				}
+				if (m.gen === gen && !m.killed && !this.closing) {
+					this.deps.log(`omp-agy-swarm: steer @${m.name} failed after start: ${msg}`);
+				}
+			},
+		);
+		const outcome = await raceTimeout(settled.promise, TIMING.steerAckMs, null, { unref: true });
+		if (!outcome) {
+			timedOut = true;
+			done = true;
+			return { ok: true, member: m, mode: "pending" };
+		}
+		if (!outcome.ok) return outcome;
+		return { ok: true, member: m, mode: outcome.mode };
+	}
+
 	// -------------------------------------------------------------------------
 	// Member lookups
 	// -------------------------------------------------------------------------
@@ -1071,6 +1206,9 @@ export class SwarmRuntime {
 		m.gen++;
 		m.awaiting = false;
 		m.runSawError = false;
+		m.pendingSteers = 0;
+		for (const abortSteer of [...m.steerAborters]) abortSteer();
+		m.steerAborters.clear();
 		this.#cancelOp(m);
 		m.unsubscribe?.();
 		m.unsubscribe = undefined;
@@ -1285,20 +1423,21 @@ export class SwarmRuntime {
 				const notices = m.notices.length;
 				const session = m.session;
 				const asyncWork = m.awaiting || !!session?.hasBackgroundWork;
+				const pendingSteer = m.pendingSteers > 0 || !!session?.hasPendingSteering;
 				let was: string;
 				if (m.op) was = m.op.kind === "start" ? "starting" : m.op.kind === "revive" ? "reviving" : "switching";
 				else if (m.phase === "stopped") was = "stopped";
-				else if (m.phase === "parked") was = m.waiter?.deadline !== undefined ? "waiting with a timeout" : asyncWork ? "in swarm_wait with background work" : "";
+				else if (m.phase === "parked") was = m.waiter?.deadline !== undefined ? "waiting with a timeout" : asyncWork ? "in swarm_wait with background work" : pendingSteer ? "pending direct message" : "";
 				else if (asyncWork) was = m.hostWorking || m.phase === "working" ? "working with pending background work" : "waiting on background work";
-				else if (m.phase === "idle") was = m.delivery || m.reconcileTimer ? "about to be woken" : m.nudgePending ? "owed a nudge" : "";
+				else if (m.phase === "idle") was = pendingSteer ? "pending direct message" : m.delivery || m.reconcileTimer ? "about to be woken" : m.nudgePending ? "owed a nudge" : "";
 				else was = "working";
 				if (!was && unread.length === 0 && notices === 0) continue;
 				const item: AbandonedItem = { name: m.name, was: was || "waiting", ...(unread.length ? { unread } : {}), ...(notices ? { notices } : {}) };
 				abandoned.push(item);
 				const queuedAside = m.delivery?.status === "dispatched" && m.delivery.addressedSeqs !== undefined;
-				if (session && (asyncWork || queuedAside)) {
+				if (session && (asyncWork || queuedAside || pendingSteer)) {
 					m.notices = [];
-					item.was += queuedAside ? "; session detached to stop a queued wake" : "; session detached to stop background work";
+					item.was += queuedAside ? "; session detached to stop a queued wake" : pendingSteer ? "; session detached to stop a pending direct message" : "; session detached to stop background work";
 					disposals.push(settleWithin(this.#detachForAbandon(m, session, false), Math.max(0, deadlineAt - Date.now())).then(settled => {
 						if (!settled) item.was += "; stop not confirmed";
 						return settled;

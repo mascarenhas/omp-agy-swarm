@@ -2,6 +2,7 @@
 // node builtins only. UIs never touch the runtime's objects and never move a cursor.
 
 import type { BoardMessage, ChannelRecord, Role } from "../board/types.ts";
+import { LIMITS } from "../env.ts";
 
 export interface MemberView {
 	name: string;
@@ -149,40 +150,166 @@ export interface Thread {
 	rows: ThreadRow[];
 }
 
+export interface ReelFrame {
+	kind: "image" | "markdown";
+	seq: number;
+	caption: string;
+	path?: string;
+	markdown?: string;
+	agent?: string;
+}
+
 export interface SwarmView {
 	key: string;
 	counts: { working: number; waiting: number; stopped: number; failed: number };
 	goal: string;
 	threads: Thread[];
 	attention: AttentionItem[];
-	reel: { caption: string; path: string; seq: number }[];
+	reel: ReelFrame[];
 	stateLine: string;
 	empty: boolean;
 }
 
-const SHOT_RE = /^\s*(?:[-*]\s*)?screenshot:\s*`?(\/[^\s`|]+\.(?:png|jpe?g|webp))`?\s*(?:\|\s*(.+?))?\s*$/gim;
+const SHOT_LINE_RE = /^\s*(?:[-*]\s*)?screenshot:\s*`?(\/[^\s`|]+\.(?:png|jpe?g|webp))`?\s*(?:\|\s*(.+?))?\s*$/i;
+const PROGRESS_LINE_RE = /^\s*(?:[-*]\s*)?progress:\s*(.*)$/i;
+const FENCE_RE = /^\s*(`{3,}|~{3,})/;
+const IMAGE_EXT_RE = /\.(?:png|jpe?g|webp)$/i;
 
 function firstLine(s: string, max = 120): string {
 	const line = s.split("\n").find(l => l.trim()) ?? "";
 	return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
+function plainCaption(s: string, max = 90): string {
+	const cleaned = s
+		.trim()
+		.replace(/^#{1,6}\s+/, "")
+		.replace(/^(?:>\s*|(?:[-*+]|\d+\.)\s+)/, "")
+		.replace(/`([^`]+)`/g, "$1")
+		.replace(/\*\*([^*]+)\*\*/g, "$1")
+		.replace(/~~([^~]+)~~/g, "$1")
+		.replace(/(^|[^\w*])\*([^*]+)\*(?=[^\w*]|$)/g, "$1$2")
+		.replace(/\s+/g, " ")
+		.trim();
+	return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
+}
+
+function clampMarkdown(s: string): string {
+	const trimmed = s.trim();
+	return trimmed.length > LIMITS.progressFrameChars ? `${trimmed.slice(0, LIMITS.progressFrameChars - 1)}…` : trimmed;
+}
+
 function str(v: unknown): string {
 	return typeof v === "string" ? v : "";
 }
 
-/** Screenshots task workers flagged on the board (same regex and cap as upstream). */
-export function postedFrames(messages: readonly BoardMessage[], members: readonly MemberView[], cap = 24): { path: string; seq: number; caption: string }[] {
+/** Normalizes view.json reel.frames entries (image screenshots and markdown progress updates). */
+export function normalizeReelFrames(raw: unknown, cap = 40): ReelFrame[] {
+	if (!Array.isArray(raw)) return [];
+	const out: ReelFrame[] = [];
+	for (const entry of raw) {
+		if (out.length >= cap) break;
+		if (!entry || typeof entry !== "object") continue;
+		const f = entry as Record<string, unknown>;
+		const seq = Number(f.seq) || 0;
+		const agent = str(f.agent) || undefined;
+		const isMarkdown = f.kind === "markdown" || typeof f.markdown === "string";
+		if (isMarkdown) {
+			const rawMd = typeof f.markdown === "string" ? f.markdown : typeof f.text === "string" ? f.text : "";
+			if (!rawMd.trim()) continue;
+			const markdown = clampMarkdown(rawMd);
+			const first = markdown.split("\n").find(l => l.trim() && !FENCE_RE.test(l)) ?? markdown;
+			const caption = plainCaption(str(f.caption) || first, 90);
+			out.push({ kind: "markdown", seq, caption, markdown, ...(agent ? { agent } : {}) });
+			continue;
+		}
+		const path = str(f.path);
+		if (
+			(f.kind === undefined || f.kind === "image") &&
+			path.length > 0 &&
+			path.length <= 4096 &&
+			path.startsWith("/") &&
+			!/[%\0\\]/.test(path) &&
+			!path.split("/").some(seg => seg === "." || seg === "..") &&
+			IMAGE_EXT_RE.test(path)
+		) {
+			out.push({ kind: "image", path, seq, caption: str(f.caption).slice(0, 90), ...(agent ? { agent } : {}) });
+		}
+	}
+	return out;
+}
+
+/** Screenshots and markdown progress updates flagged by workers or the coordinator on the board. */
+export function postedFrames(messages: readonly BoardMessage[], members: readonly MemberView[], cap: number = LIMITS.postedFrames): ReelFrame[] {
 	const roles = new Map(members.map(m => [m.name, m.role]));
-	const out = new Map<string, { path: string; seq: number; caption: string }>();
+	const briefSeqs = new Set(members.map(m => m.briefSeq).filter(s => s > 0));
+	const out = new Map<string, ReelFrame>();
 	for (const m of messages) {
 		const role = roles.get(m.agent);
-		if (!role || role !== "worker" || m.control) continue;
-		for (const g of m.text.matchAll(SHOT_RE)) {
-			const path = g[1] ?? "";
-			out.delete(path);
-			out.set(path, { path, seq: m.seq, caption: String(g[2] ?? "").slice(0, 80) });
+		if (!role || (role !== "worker" && role !== "coordinator") || m.control || briefSeqs.has(m.seq)) continue;
+		const lines = m.text.split(/\r?\n/);
+		let fenceChar = "";
+		let fenceLen = 0;
+		let activeProgress: { head: string; body: string[] } | null = null;
+		let mdIndex = 0;
+		const flushProgress = (): void => {
+			if (!activeProgress) return;
+			const head = activeProgress.head.trim();
+			const body = activeProgress.body.join("\n").trim();
+			activeProgress = null;
+			if (!head && !body) return;
+			const markdown = clampMarkdown(body || head);
+			const captionSource = head || (body.split("\n").find(l => l.trim() && !FENCE_RE.test(l)) ?? body);
+			out.set(`md:${m.seq}:${mdIndex++}`, {
+				kind: "markdown",
+				seq: m.seq,
+				caption: plainCaption(captionSource, 90),
+				markdown,
+				agent: m.agent,
+			});
+		};
+		for (const line of lines) {
+			const fence = FENCE_RE.exec(line);
+			if (fence) {
+				const marker = fence[1]!;
+				if (!fenceChar) {
+					fenceChar = marker[0]!;
+					fenceLen = marker.length;
+				} else if (marker[0] === fenceChar && marker.length >= fenceLen && line.trim() === marker) {
+					fenceChar = "";
+					fenceLen = 0;
+				}
+				if (activeProgress) activeProgress.body.push(line);
+				continue;
+			}
+			if (fenceChar) {
+				if (activeProgress) activeProgress.body.push(line);
+				continue;
+			}
+			const shot = SHOT_LINE_RE.exec(line);
+			if (shot) {
+				flushProgress();
+				const path = shot[1] ?? "";
+				const key = `img:${path}`;
+				out.delete(key);
+				out.set(key, {
+					kind: "image",
+					path,
+					seq: m.seq,
+					caption: String(shot[2] ?? "").trim().slice(0, 80),
+					agent: m.agent,
+				});
+				continue;
+			}
+			const prog = PROGRESS_LINE_RE.exec(line);
+			if (prog) {
+				flushProgress();
+				activeProgress = { head: prog[1] ?? "", body: [] };
+				continue;
+			}
+			if (activeProgress) activeProgress.body.push(line);
 		}
+		flushProgress();
 	}
 	return [...out.values()].slice(-cap);
 }
@@ -280,13 +407,8 @@ export function project(model: SwarmReadModel, files = model.files(), absoluteTi
 		const ar = a as Record<string, unknown>;
 		attention.push({ kind: str(ar.kind) || "note", severity: str(ar.severity), text: str(ar.title) || str(ar.text) || "(attention)" });
 	}
-	const reelFrames = (view.reel as { frames?: unknown } | undefined)?.frames;
-	const reel: SwarmView["reel"] = Array.isArray(reelFrames)
-		? reelFrames
-				.filter((f): f is Record<string, unknown> => !!f && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string")
-				.slice(0, 40)
-				.map(f => ({ path: str(f.path), seq: Number(f.seq) || 0, caption: str(f.caption).slice(0, 90) }))
-		: postedFrames(messages, members);
+	const viewReel = normalizeReelFrames((view.reel as { frames?: unknown } | undefined)?.frames);
+	const reel: SwarmView["reel"] = viewReel.length ? viewReel : postedFrames(messages, members);
 	const outcome = model.outcome();
 	let stateLine: string;
 	if (outcome?.value === "incomplete") stateLine = `incomplete: ${outcome.reason}`;

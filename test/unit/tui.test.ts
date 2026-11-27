@@ -8,9 +8,11 @@ import { decodeKey } from "@oh-my-pi/pi-tui/driver/input/keys";
 import { visibleWidth } from "@oh-my-pi/pi-tui/text/width";
 import { loadThemeSync } from "@oh-my-pi/pi-tui/theme/loader";
 import { bold, inverse, italic, strikethrough, underline } from "@oh-my-pi/pi-tui/theme/theme";
+import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
+import { CoordinatorBinding } from "../../src/runtime/coordinator.ts";
 import { RuntimeReadModel } from "../../src/runtime/read-model.ts";
-import { project } from "../../src/ui/model.ts";
-import { renderWebBoardMessage } from "../../src/ui/tui/custom-message.ts";
+import { postedFrames, project } from "../../src/ui/model.ts";
+import { renderDirectMessage, renderWebBoardMessage } from "../../src/ui/tui/custom-message.ts";
 import { Keys, printable } from "../../src/ui/tui/keys.ts";
 import { EmptyOverlay, SwarmOverlay } from "../../src/ui/tui/overlay.ts";
 import { widgetLine } from "../../src/ui/tui/widget.ts";
@@ -212,4 +214,57 @@ test("persistent web board renderer strips escapes from persisted content", () =
 	expect(output).toContain("http://127.0.0.1:40593/");
 	expect(output).toContain("ssh -L 40593:127.0.0.1:40593 <host>");
 	expect(output).not.toMatch(/\x1b\[2J|\x1b\]0;|PWNED|\u202e/);
+});
+
+test("postedFrames includes coordinator and worker markdown updates, ignores briefs and code fences", async () => {
+	h = new Harness({ mode: "tui" });
+	h.factory.brains.set("parser", async t => {
+		await t.call("post_message", {
+			text: "@coordinator [done] fixed\nProgress: Worker milestone\n- **tests**: 12/12 passing\nScreenshot: /tmp/after.png | clean UI",
+		});
+		await t.call("swarm_wait", {});
+	});
+	await h.swarm({
+		action: "add",
+		name: "parser",
+		brief: "Work on parser.\nProgress: this brief example must be ignored\nScreenshot: /tmp/brief.png | ignored",
+	});
+	await until(() => h.member("parser").phase === "parked", 1000, "parked");
+	await h.post("Progress: **Phase 1** kicked off\n- `@parser` owns `src/parser.ts`\n```\nProgress: ignored inside fence\nScreenshot: /tmp/fake.png | ignored\n```");
+	await h.post("Progress: Single-line **done**");
+	const model = new RuntimeReadModel(h.rt);
+	const frames = postedFrames(model.messages(), model.members());
+	expect(frames.map(f => ({ kind: f.kind, agent: f.agent, caption: f.caption }))).toEqual([
+		{ kind: "markdown", agent: "parser", caption: "Worker milestone" },
+		{ kind: "image", agent: "parser", caption: "clean UI" },
+		{ kind: "markdown", agent: "coordinator", caption: "Phase 1 kicked off" },
+		{ kind: "markdown", agent: "coordinator", caption: "Single-line done" },
+	]);
+	expect(frames[0]?.markdown).toBe("- **tests**: 12/12 passing");
+	expect(frames[2]?.markdown).toContain("Progress: ignored inside fence");
+	const overview = overlay(model, 24, "overview").paint(80).join("\n");
+	expect(overview).toContain("@coordinator Phase 1 kicked off");
+});
+
+test("direct message renderer strips escapes from persisted content", () => {
+	const message = { content: "→ @parser\ncheck \x1b[2J\x1b]0;PWNED\x07 edge\u202e case" };
+	const surface = createSurface(() => ({ main: renderDirectMessage(message, { expanded: false }, theme) }));
+	const canvas = surface.main()[0] as UiNode<"canvas">;
+	const output = canvas.props().paint(80).join("\n");
+	surface.dispose();
+	expect(output).toContain("Swarm DM");
+	expect(output).toContain("→ @parser");
+	expect(output).toContain("check  edge case");
+	expect(output).not.toMatch(/\x1b\[2J|\x1b\]0;|PWNED|\u202e/);
+});
+
+test("CoordinatorBinding.notify strips ANSI, OSC, and bidi escapes", () => {
+	const seen: { text: string; level: string }[] = [];
+	const ctx = {
+		mode: "tui",
+		ui: { notify: (text: string, level: string) => seen.push({ text, level }) },
+	} as unknown as ExtensionContext;
+	const binding = new CoordinatorBinding({} as ExtensionAPI, ctx, undefined);
+	binding.notify("DM → @w: \x1b[2J\x1b]0;PWNED\x07ok\u202e\nnext", "info");
+	expect(seen).toEqual([{ text: "DM → @w: ok next", level: "info" }]);
 });

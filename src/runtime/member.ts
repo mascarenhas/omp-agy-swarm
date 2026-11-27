@@ -191,6 +191,10 @@ export class Member {
 	/** The run whose untimed swarm_wait already answered woke:"end_turn"; a second wait in that run parks. */
 	endTurnRun = -1;
 	stuckNotified = false;
+	/** Direct user steers currently in flight (before run start / queue admission settles). */
+	pendingSteers = 0;
+	readonly steerAborters = new Set<() => void>();
+	readonly claimedSteerReceipts = new WeakSet<object>();
 	lastFailureNoticeAt = 0;
 	/** Set when an exec-approved action in this binding started or revived the member (SW-09). */
 	authorized = false;
@@ -237,8 +241,9 @@ export class Member {
 			case "stopped":
 				return "stopped";
 			case "parked":
-			case "idle":
 				return "waiting";
+			case "idle":
+				return this.pendingSteers > 0 ? "working" : "waiting";
 			default:
 				return "working";
 		}
@@ -255,6 +260,7 @@ export class Member {
 			case "resuming":
 				return "waking";
 			case "idle":
+				if (this.pendingSteers > 0) return "steering";
 				return this.awaiting ? "waiting on background work" : this.failure ? `failed (${this.failure.kind})` : "idle";
 			case "stopped":
 				return this.failure ? `stopped (${this.failure.kind})` : "stopped";

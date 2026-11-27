@@ -317,4 +317,59 @@ describe("omp TUI with the swarm plugin", () => {
 		expect(t.listeners()).toBe(1);
 		await verifyOpenBoard(t, `http://127.0.0.1:${port}/`);
 	}, 90_000);
+
+	test("@handle <message> intercepts input and steers the worker without prompting the coordinator or posting to the board", async () => {
+		t = new PtyOmp({
+			coord: {
+				rules: [
+					{ when: "start-dm-swarm", reply: { tools: [{ name: "swarm", args: { action: "add", name: "w", brief: "wait on board", model: "mock/worker-a" } }] } },
+					{ when: '"added"', reply: { text: "DM-SWARM-STARTED" } },
+					{ when: "unknown-pass", whenAny: "SECRET-DM-TOKEN", reply: { text: "DM-LEAKED-TO-COORD" } },
+					{ when: "unknown-pass", reply: { text: "UNKNOWN-REACHED-COORD" } },
+					{ when: "coord-pass", reply: { text: "COORD-HANDLE-REACHED-COORD" } },
+				],
+				default: { text: "COORD-DEFAULT" },
+			},
+			"worker-a": {
+				rules: [
+					{ when: "You are `w`", reply: { tools: [{ name: "swarm_wait", args: {} }] } },
+					{ when: "SECRET-DM-TOKEN", reply: { text: "WORKER-HANDLED-DM" } },
+					{ when: '"woke":"interrupted"', reply: { text: "WORKER-WOKE-INTERRUPTED" } },
+				],
+				default: { text: "WORKER-OK" },
+			},
+		});
+		await ready(t);
+		await submit(t, "start-dm-swarm");
+		await t.waitFor(text => text.includes("DM-SWARM-STARTED"), 20_000, "swarm started");
+		// Wait until worker w has parked in swarm_wait (widget shows ●0 ○1).
+		await t.waitFor(text => text.includes("●0 ○1"), 15_000, "worker parked in swarm_wait");
+		const coordBefore = coordTurnRequests(t).length;
+		const workerBefore = t.mock.requests("worker-a").length;
+		t.mark();
+		await submit(t, "@w check SECRET-DM-TOKEN now");
+		await t.waitFor(text => text.includes("Swarm DM") && text.includes("→ @w"), 10_000, "DM confirmation rendered");
+		await t.waitFor(
+			() => t!.mock.requests("worker-a").slice(workerBefore).some(r => r.last.includes("Direct message from the user") && r.last.includes("SECRET-DM-TOKEN")),
+			15_000,
+			"worker received direct steer",
+		);
+		// Coordinator model never saw a request for the DM.
+		expect(coordTurnRequests(t)).toHaveLength(coordBefore);
+		// The DM was not written to the shared board.
+		const boardFile = join(t.swarm, "board.jsonl");
+		expect(existsSync(boardFile)).toBe(true);
+		const boardText = readFileSync(boardFile, "utf8");
+		expect(boardText).toContain("wait on board");
+		expect(boardText).not.toContain("SECRET-DM-TOKEN");
+		// Unrecognized handles and @coordinator still route to the coordinator, and the DM never leaked into context.
+		t.mark();
+		await submit(t, "@nobody unknown-pass");
+		await t.waitFor(text => text.includes("UNKNOWN-REACHED-COORD") || text.includes("DM-LEAKED-TO-COORD"), 15_000, "unrecognized handle routed to coord");
+		expect(t.since()).not.toContain("DM-LEAKED-TO-COORD");
+		expect(t.since()).toContain("UNKNOWN-REACHED-COORD");
+		t.mark();
+		await submit(t, "@coordinator coord-pass");
+		await t.waitFor(text => text.includes("COORD-HANDLE-REACHED-COORD"), 15_000, "@coordinator routed to coord");
+	}, 90_000);
 });

@@ -6,7 +6,7 @@ import { realpathSync, statSync } from "node:fs";
 import { ALL, MAIN } from "../../board/channels.ts";
 import type { BoardMessage } from "../../board/types.ts";
 import { LIMITS } from "../../env.ts";
-import { type MemberView, postedFrames, type SwarmReadModel } from "../model.ts";
+import { type MemberView, normalizeReelFrames, postedFrames, type ReelFrame, type SwarmReadModel } from "../model.ts";
 import { validTargetPath } from "../view-files.ts";
 
 export const URL_HOSTS = ["github.com", "docs.google.com"];
@@ -158,10 +158,17 @@ export class SnapshotBuilder {
 		const narrator = members.find(m => m.role === "narrator" && !m.killed) ?? members.find(m => m.role === "narrator");
 		const narratorState = !narrator ? "absent" : narrator.killed ? "killed" : narrator.failure ? "paused" : narrator.state === "working" ? "working" : "waiting";
 		const viewJson = files.view;
-		const viewFrames = (viewJson?.reel as { frames?: unknown } | undefined)?.frames;
-		const listed = Array.isArray(viewFrames) ? viewFrames.filter(f => f && typeof (f as { path?: unknown }).path === "string").map(f => String((f as { path: string }).path)) : [];
-		const posted = listed.length ? [] : postedFrames(messagesIn, members, LIMITS.postedFrames);
-		const frames = new Set<string>(listed.length ? listed : posted.map(f => f.path));
+		const viewFrames = normalizeReelFrames((viewJson?.reel as { frames?: unknown } | undefined)?.frames);
+		const posted = viewFrames.length ? [] : postedFrames(messagesIn, members, LIMITS.postedFrames);
+		const allReel = viewFrames.length ? viewFrames : posted;
+		const frames = new Set<string>(
+			allReel
+				.filter(
+					(f): f is ReelFrame & { path: string } =>
+						f.kind === "image" && typeof f.path === "string" && validTargetPath(f.path) && /\.(?:png|jpe?g|webp)$/i.test(f.path),
+				)
+				.map(f => f.path),
+		);
 		const allowedFiles = allowedFilesOf(viewJson, this.#roots);
 		const systemAttention: Record<string, unknown>[] = [];
 		for (const m of members) {

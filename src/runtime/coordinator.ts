@@ -4,6 +4,7 @@
 import type { Model } from "@oh-my-pi/pi-ai";
 import type { ExtensionAPI, ExtensionContext, Settings } from "@oh-my-pi/pi-coding-agent";
 import type { CoordinatorPort, CustomWakeMessage, ModelInfo, PendingSwitch, TranscriptEntry, UsageSource } from "./ports.ts";
+import { sanitizeLine } from "../ui/sanitize.ts";
 
 export class CoordinatorBinding implements CoordinatorPort {
 	readonly pi: ExtensionAPI;
@@ -120,7 +121,7 @@ export class CoordinatorBinding implements CoordinatorPort {
 	notify(text: string, level: "info" | "warning" | "error"): void {
 		if (this.#ctx.mode !== "tui" && this.#ctx.mode !== "rpc") return;
 		try {
-			this.#ctx.ui.notify(text, level);
+			this.#ctx.ui.notify(sanitizeLine(text), level);
 		} catch {}
 	}
 
