@@ -28,6 +28,8 @@ export function liveTaskWork(rt: SwarmRuntime): Member[] {
 			m.phase === "switching" ||
 			!!m.op ||
 			!!m.delivery ||
+			m.pendingSteers > 0 ||
+			!!m.session?.hasPendingSteering ||
 			m.reconcileTimer !== undefined ||
 			(m.phase === "parked" && m.waiter?.deadline !== undefined) ||
 			m.awaiting || !!m.session?.wakeSources;

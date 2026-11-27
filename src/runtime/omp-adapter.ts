@@ -35,7 +35,7 @@ import { cfgTaskAgentModelOverrides, cfgTaskMaxEffort } from "@oh-my-pi/pi-codin
 import { TASK_SUBAGENT_EVENT_CHANNEL, type SubagentEventPayload } from "@oh-my-pi/pi-coding-agent/task/types";
 import { cfgAsyncMaxJobs, cfgAsyncPrintWake } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import type { RemoteAgentSession } from "@oh-my-pi/pi-coding-agent/thread/remote-agent-session";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { DEFAULT_SCOUT_EFFORT, EFFORTS, isEffort, raceTimeout, TIMING } from "../env.ts";
 import { HubBridge } from "./hub-bridge.ts";
 import { preferredAgentId } from "./member.ts";
@@ -45,6 +45,7 @@ import { leasePrintWake } from "./print-wake.ts";
 import type {
 	CreateWorkerOptions,
 	CustomWakeMessage,
+	ImageAttachment,
 	HostMessage,
 	ModelInfo,
 	SessionFactory,
@@ -130,11 +131,24 @@ class HostWorkerSession implements WorkerSession {
 	get hasBackgroundWork(): boolean {
 		return !!this.#s.wakeSources || this.#host.hasOwnerWork();
 	}
+	get hasPendingSteering(): boolean {
+		return this.#s.getQueuedMessages().steering.length > 0;
+	}
 	get costCapRefusal(): { readonly message: string } | undefined {
 		return this.#s.costCapRefusal;
 	}
 	prompt(text: string): Promise<unknown> {
 		return this.#s.prompt(text);
+	}
+	steer(text: string, images?: readonly ImageAttachment[], onAdmitted?: () => void): Promise<boolean> {
+		return this.#s.prompt(text, {
+			streamingBehavior: "steer",
+			images: images?.length ? ([...images] as ImageContent[]) : undefined,
+			expandPromptTemplates: false,
+			runCommands: false,
+			throwOnDrop: true,
+			onPromptAdmitted: onAdmitted,
+		});
 	}
 	sendCustomMessage(message: CustomWakeMessage, options: { deliverAs: "aside" }): Promise<boolean> {
 		return this.#s.sendCustomMessage(message, options);

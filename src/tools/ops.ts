@@ -862,6 +862,9 @@ export async function swarmWaitOp(ctx: OpsContext, p: WaitParams): Promise<ToolR
 		return ok({ woke: "interrupted", note: "A wake message is arriving; read it." }, true);
 	}
 	const isCoord = m.role === "coordinator";
+	if (!isCoord && m.session?.hasPendingSteering) {
+		return ok({ woke: "interrupted", note: "A direct message from the user is arriving; read it." }, true);
+	}
 	// A scheduled self switch (worker: pendingSwitch; coordinator: rt.coordinatorSwitch) applies at
 	// the run boundary: parking would keep the run, and its turns, on the old model.
 	if (m.pendingSwitch || (isCoord && rt.coordinatorSwitch))

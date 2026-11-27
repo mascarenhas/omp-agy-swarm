@@ -17,7 +17,7 @@ import { callLine, lineComponent, resultLine } from "../../src/tools/render.ts";
 import { TIMING } from "../../src/env.ts";
 import { RuntimeReadModel } from "../../src/runtime/read-model.ts";
 import { entryItems } from "../../src/ui/transcript.ts";
-import { renderWakeMessage, renderWebBoardMessage } from "../../src/ui/tui/custom-message.ts";
+import { renderDirectMessage, renderWakeMessage, renderWebBoardMessage } from "../../src/ui/tui/custom-message.ts";
 import { EmptyOverlay, SwarmOverlay } from "../../src/ui/tui/overlay.ts";
 import type { OpenTarget, ViewId } from "../../src/ui/tui/view.ts";
 import { createWidgetLink, widgetComponent } from "../../src/ui/tui/widget.ts";
@@ -700,4 +700,21 @@ test("tool summaries stay compact in ANSI without replacing the native result bo
 	const view = legacyView({ body }, { parts: [call, result], failed: false });
 	expect(view?.body).toBe(body);
 	expect(view?.term?.parts).toEqual([call, result]);
+});
+
+test("native Overview renders coordinator markdown progress updates and safe DM notices", async () => {
+	const { rt, model } = await fixture();
+	await rt.post(`Progress: Phase 2 ready\n- **parser**: green ${BAD}`);
+	const { o } = mount(model, "overview");
+	const snap = page(o);
+	expect(json(snap.body)).toContain("Progress");
+	expect(json(snap.body)).toContain("@coordinator Phase 2 ready");
+	assertSafe(snap.body);
+	const dm = renderDirectMessage({ content: `→ @parser\ncheck ${BAD}` }, { expanded: false }, theme);
+	const messages = createSurface(() => ({ main: dm }));
+	mounted.push(messages.dispose);
+	const node = describeNode(messages.main()[0]!);
+	expect(node.p?.role).toBe("omp.swarm.dm");
+	expect(json(node)).toContain("→ @parser");
+	assertSafe(node);
 });

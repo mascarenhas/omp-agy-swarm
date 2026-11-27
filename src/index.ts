@@ -10,6 +10,7 @@ import { stopGate } from "./runtime/gate.ts";
 import { applyPreSwarmSwitch } from "./runtime/models.ts";
 import { createSessionFactory, HOST_VERSION, mainCanResume, scopedSettings, thinkingCaps } from "./runtime/omp-adapter.ts";
 import type { HostMessage } from "./runtime/ports.ts";
+import { parseDirectMessage } from "./runtime/prompts.ts";
 import { registry } from "./runtime/registry.ts";
 import type { RuntimeDeps, SwarmRuntime } from "./runtime/runtime.ts";
 import { defaultGit } from "./runtime/workspace.ts";
@@ -95,6 +96,52 @@ export default function swarmExtension(pi: ExtensionAPI): void {
 			block: true,
 			reason: `${refusal.message} To resume native delegation, restart without OMP_SWARM_MAX_COST_USD or switch to a session without this swarm.`,
 		};
+	});
+
+	pi.on("input", async (e, ctx) => {
+		if (ctx.agent.kind !== "main") return;
+		if (e.source !== "interactive" && e.source !== "rpc") return;
+		const rt = current(ctx);
+		if (!rt) return;
+		const images = e.images;
+		const parsed = parseDirectMessage(e.text, (images?.length ?? 0) > 0);
+		if (!parsed) return;
+		const target = rt.members.get(parsed.handle);
+		if (!target || target.role === "coordinator") return;
+		const b = bind(ctx);
+		rt.rebind(b);
+		const res = await rt.steerMember(target.name, parsed.body, images);
+		if (!res.ok) {
+			b.notify(res.error, "warning");
+			pi.sendMessage(
+				{
+					customType: "swarm-dm",
+					content: `Could not steer @${target.name}: ${res.error}`,
+					display: true,
+					excludeFromContext: true,
+				},
+				{ triggerTurn: false },
+			);
+			return { handled: true };
+		}
+		const imgCount = images?.length ?? 0;
+		const imgTag = imgCount ? ` (${imgCount} image${imgCount === 1 ? "" : "s"})` : "";
+		const pendingTag = res.mode === "pending" ? " (delivering…)" : "";
+		const preview = parsed.body.split("\n").find(l => l.trim()) ?? "";
+		const clipped = preview.length > 80 ? `${preview.slice(0, 79)}…` : preview;
+		b.notify(`DM → @${res.member.name}${imgTag}${pendingTag}${clipped ? `: ${clipped}` : ""}`, "info");
+		pi.sendMessage(
+			{
+				customType: "swarm-dm",
+				content: parsed.body
+					? `→ @${res.member.name}${imgTag}${pendingTag}\n${parsed.body}`
+					: `→ @${res.member.name}${imgTag}${pendingTag}`,
+				display: true,
+				excludeFromContext: true,
+			},
+			{ triggerTurn: false },
+		);
+		return { handled: true };
 	});
 
 	pi.on("agent_start", (_e, ctx) => {

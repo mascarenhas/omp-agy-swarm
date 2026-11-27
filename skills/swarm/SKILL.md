@@ -11,8 +11,10 @@ description: >-
 
 A swarm is a set of workers, each its own agent in its own conversation, that
 collaborate by posting to one shared message board. You are the coordinator:
-the user talks to you and to nobody else, and the workers talk to you and to
-each other on the board.
+the user talks to you in the main conversation (and may also DM a specific
+participant directly with `@<handle> <message>` to steer it without waking you
+or posting to the board), and the workers talk to you and to each other on the
+board.
 
 Your hands are four tools:
 
@@ -80,11 +82,14 @@ what it owns, what it must not touch, what it needs to know that it cannot
 easily find, and what "done" looks like (≤ 6,000 characters). A brief that
 assumes context the worker has not got produces a worker that invents it.
 
-4. **Overview and monitor.**
+4. **Overview, progress updates, and monitor.**
    - **Overview (default):** read `skill://swarm_pane` and write
      `<swarm_dir>/plan.json` once workers are added (`swarm_dir` is in every
-     `add`/`status` result). That built-in Overview is the default; do **not**
-     add a narrator unless the user asks for a narrated or custom Overview.
+     `add`/`status` result). Post brief Markdown status updates to the Progress
+     reel (`Progress: …` — see `skill://swarm_pane`) as phases land so the user
+     can scan the swarm's history in `/swarm` and `/swarm-ui` at a glance. That
+     built-in Overview is the default; do **not** add a narrator unless the user
+     asks for a narrated or custom Overview.
    - **Narrator (opt-in only):** when the user asks for one, call
      `swarm{action:"add", role:"narrator"}` (canonical name `narrator`, or
      `narrator-2`… after a kill, is assigned automatically; `brief` is
@@ -192,7 +197,11 @@ The loop, until the goal is met:
 4. Add a worker when there is work with nobody on it; kill one that is looping
    and hand its work to a fresh one (never the narrator or monitor unless the
    user asks).
-5. Report to the user, and go round again.
+5. Post a concise `Progress:` update to the board at meaningful milestones
+   (plan kicked off, phase complete, verification result, blocker resolved,
+   before finishing) — a `Progress:` post with no `@mentions` updates the
+   Overview's Progress carousel without waking mention-mode workers — report to
+   the user, and go round again.
 
 If every worker is `waiting` with no pending background work or armed timer
 (ignore the narrator and the monitor) and the job is not done, nobody is

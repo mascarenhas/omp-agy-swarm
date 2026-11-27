@@ -215,3 +215,27 @@ export function restoredReminder(title: string, stopped: number, owed: string[])
 		"unattended agents); a post naming a stopped member is kept for it until you revive it."
 	);
 }
+
+export interface DirectMessage {
+	handle: string;
+	body: string;
+}
+
+const DM_RE = /^@([a-z][a-z0-9_-]{0,31})(?:[:,]?\s+([\s\S]+)|\s*)$/i;
+
+/** Parses `@handle <message>` (or `@handle` with attached images) for direct participant steering. */
+export function parseDirectMessage(text: string, hasImages = false): DirectMessage | undefined {
+	const m = DM_RE.exec(text.trim());
+	if (!m) return undefined;
+	const handle = m[1]!.toLowerCase();
+	const body = (m[2] ?? "").trim();
+	if (!body && !hasImages) return undefined;
+	return { handle, body };
+}
+
+/** Formats a direct user steering message for a swarm participant's session. */
+export function directMessageText(body: string): string {
+	return body
+		? `[swarm] Direct message from the user (not posted to the board):\n\n${body}`
+		: "[swarm] Direct message from the user (not posted to the board):";
+}

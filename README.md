@@ -46,6 +46,7 @@ Read skill://swarm and split the parser rewrite across two authors (lexer and pa
 - Run `/swarm` at any time to open the full-screen terminal board (or `/swarm board`, `/swarm members`, `/swarm transcript <name>`).
 - Open omp's **Agent Hub** (`/hub` → `1` Agents → select → `Enter`)—or click a **Tern Tray** card in a tray-capable host—to focus a live member's native omp transcript.
 - Optionally run `/swarm-ui start` to start the read-only loopback web board: in TUI the status widget immediately shows `http://127.0.0.1:<port>/` (even mid-turn; native wraps the full URL, while ANSI clips it only if the URL alone exceeds the terminal width), and a copyable transcript notice appears immediately when idle or when the active run ends (a brief toast is also sent, though it may not appear when idle—notably in Tern—and neither display depends on it).
+- Send a direct message to any live swarm participant right from the main composer with `@<handle> <message>` (e.g. `@parser focus on the edge cases`): the plugin intercepts it before dispatch and steers that participant directly without waking the coordinator or posting to the board.
 
 ### Headless (`omp -p`)
 
@@ -161,6 +162,7 @@ In `rpc` mode, `/swarm` prints a compact text summary notification.
 Live workers (including `narrator` and `monitor`) register in omp's global `AgentRegistry` without writing any agent profiles (`~/.omp/agent/agents/` is never touched). In interactive sessions, they appear in `/hub` (subject to the persisted-root filter below) and in Tray on tray-capable native hosts such as Tern with agent display enabled (which may group settled members).
 
 - **Native transcript focus & input:** open `/hub` → `1` (Agents) → select a member → `Enter` (or click its Tray card) to view the worker's live native omp transcript (`Esc` returns to Main when the composer is empty; otherwise it clears the draft first). Submitting sends live human input to the focused worker—steering an active run or starting an idle one.
+- **Direct participant steering (`@<handle> <message>`):** from the main composer (TUI or RPC), starting a message with `@<handle> <message>` (or `@<handle>:` / `@<handle>,` — and optional attached images) for an existing non-coordinator participant intercepts the input before it reaches the coordinator and steers that participant's session directly (interrupting a parked `swarm_wait`, steering an active run, or starting a turn when idle) without posting to the shared board. Unrecognized handles (including `@file` mentions) and `@coordinator` pass through to the coordinator untouched.
 - **Live activity:** Tray cards and Hub rows show live tool/activity updates; a worker parked in `swarm_wait` shows `waiting on board`.
 - **Registry IDs:** new allocations and collision fallbacks use `swarm~<name>` (adding `~2`, `~3`, … only on collision), persisted in `members.json` and preferred on `revive` (an available persisted legacy ID is reused verbatim). The assigned ID is shown in Tray and Hub and returned as `agent_id` in `swarm{action:"add"}` and `swarm{action:"status"}` results.
 - **Stop, exit, and `/clear`:**
@@ -238,7 +240,7 @@ git diff --binary <base> <branch> | git apply --3way --index
 | Skill | Visibility | Audience | Purpose |
 |---|---|---|---|
 | `swarm` | Public (`skill://swarm`) | Coordinator | Full coordinator playbook: sizing, briefing, headless runs, model/effort control, workspaces, channels, addressing, waiting, restart revival |
-| `swarm_pane` | Public (`skill://swarm_pane`) | Coordinator | Default Overview contract: `<swarm_dir>/plan.json` schema and `<swarm_dir>/shots/` screenshot timeline convention |
+| `swarm_pane` | Public (`skill://swarm_pane`) | Coordinator | Default Overview contract: `<swarm_dir>/plan.json` schema, Markdown `Progress:` status updates, and `<swarm_dir>/shots/` screenshots |
 | `swarm_narrator` | `hide: true` | Injected into `role:"narrator"` | Narrator contract: `view.json`, optional sandboxed `view.html`, `prefs.md`, user defaults, and coordinator feedback relay |
 | `swarm_monitor` | `hide: true` | Injected into `role:"monitor"` | Stall monitor contract: 180 s `swarm_wait` tick loop, stall diagnosis, repeat throttling, dormant mode, and restart resume |
 

@@ -9,7 +9,7 @@ import type { CoordinatorBinding } from "../runtime/coordinator.ts";
 import { RuntimeReadModel } from "../runtime/read-model.ts";
 import type { SwarmRuntime } from "../runtime/runtime.ts";
 import { project, type SwarmReadModel } from "./model.ts";
-import { renderWakeMessage, renderWebBoardMessage } from "./tui/custom-message.ts";
+import { renderDirectMessage, renderWakeMessage, renderWebBoardMessage } from "./tui/custom-message.ts";
 import { EmptyOverlay, SwarmOverlay } from "./tui/overlay.ts";
 import type { ViewId } from "./tui/view.ts";
 import { createWidgetLink, widgetComponent, widgetLine, type WidgetLink } from "./tui/widget.ts";
@@ -45,6 +45,7 @@ export function registerCommands(pi: ExtensionAPI, host: UiHost): CommandsHandle
 
 	pi.registerMessageRenderer("swarm-wake", renderWakeMessage);
 	pi.registerMessageRenderer("swarm-ui", renderWebBoardMessage);
+	pi.registerMessageRenderer("swarm-dm", renderDirectMessage);
 
 	const modelOf = (rt: SwarmRuntime): RuntimeReadModel => {
 		let m = models.get(rt.sid);

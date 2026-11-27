@@ -11,6 +11,7 @@ interface Line {
 	key: string;
 	label: string;
 	detail?: string;
+	cardDetail?: string;
 	target?: OpenTarget;
 	state?: string;
 }
@@ -96,10 +97,27 @@ export class OverviewView implements View {
 			}
 			this.#blocks.push({ key: "attention", label: "Attention", rows: attention.reverse() });
 			const reelKeys = new Map<string, number>();
-			this.#blocks.push({ key: "reel", label: "Screenshot reel", rows: view.reel.slice(-8).map(f => ({
-				key: unique(reelKeys, `frame:${f.seq}:${keyDigest(f.path)}`), label: `#${f.seq} ${f.caption || f.path}`,
-				detail: f.caption ? f.path : undefined, target: target(f.seq),
-			})) });
+			this.#blocks.push({ key: "reel", label: "Progress", rows: view.reel.slice(-8).map(f => {
+				const author = f.agent ? ` @${f.agent}` : "";
+				if (f.kind === "markdown") {
+					const body = f.markdown ?? "";
+					const first = body.split("\n").find(l => l.trim()) ?? "";
+					return {
+						key: unique(reelKeys, `md:${f.seq}:${keyDigest(body || f.caption)}`),
+						label: `#${f.seq}${author} ${f.caption || first || "(update)"}`,
+						detail: first && first !== f.caption ? first : undefined,
+						cardDetail: body || f.caption,
+						target: target(f.seq),
+					};
+				}
+				const path = f.path ?? "";
+				return {
+					key: unique(reelKeys, `frame:${f.seq}:${keyDigest(path)}`),
+					label: `#${f.seq}${author} ${f.caption || path}`,
+					detail: f.caption ? path : undefined,
+					target: target(f.seq),
+				};
+			}) });
 			this.#choices = this.#blocks.flatMap(block => block.rows.flatMap(row =>
 				row.target ? [{ key: selectionKey(block.key, row.key), block: block.key, row }] : []));
 			this.#blocksKey = blockKey;
@@ -153,9 +171,9 @@ export class OverviewView implements View {
 			out.push(section(block.key, block.label, detail));
 		}
 		if (selected?.row.target) {
-			const { target, label, detail } = selected.row;
+			const { target, label, detail, cardDetail } = selected.row;
 			out.push(card(`detail:${selected.block}:${selected.row.key}`, label, [
-				text("detail", detail || (target.seq ? `Board post #${target.seq}` : `Member ${target.member}`)),
+				text("detail", cardDetail || detail || (target.seq ? `Board post #${target.seq}` : `Member ${target.member}`)),
 				button("open", target.seq ? `Open post #${target.seq}` : "Inspect member", "Enter", () => this.#host.interact(this, () => this.#activate(target)), { primary: true }),
 			]));
 		}

@@ -7,6 +7,7 @@ import type {
 	CreateWorkerOptions,
 	CustomWakeMessage,
 	HostMessage,
+	ImageAttachment,
 	ModelInfo,
 	SessionFactory,
 	TranscriptEntry,
@@ -66,6 +67,7 @@ export class ScriptedSession implements WorkerSession {
 	readonly entries: TranscriptEntry[] = [];
 	#run: { ac: AbortController; done: Promise<void> } | undefined;
 	#asides: HostMessage[] = [];
+	#steers: HostMessage[] = [];
 	#runOpen = false;
 	get isRunActive(): boolean {
 		return this.#runOpen;
@@ -74,12 +76,16 @@ export class ScriptedSession implements WorkerSession {
 	get hasBackgroundWork(): boolean {
 		return !!this.wakeSources;
 	}
+	get hasPendingSteering(): boolean {
+		return this.#steers.length > 0;
+	}
 	#last: HostMessage | undefined;
 	#disposing = false;
 	disposed = false;
 	/** Set by a test (or a brain) to emulate the host cost gate refusing a request. */
 	costCapRefusal: { readonly message: string } | undefined;
 	readonly inputs: string[] = [];
+	readonly steers: { text: string; images?: readonly ImageAttachment[] }[] = [];
 	readonly opts: CreateWorkerOptions;
 
 	constructor(factory: ScriptedFactory, opts: CreateWorkerOptions, id: string) {
@@ -142,7 +148,18 @@ export class ScriptedSession implements WorkerSession {
 		const queued = this.#asides;
 		this.#asides = [];
 		for (const message of queued) this.#receive(message);
-		return queued.length ? String(queued[queued.length - 1]!.content) : undefined;
+		const last = queued[queued.length - 1];
+		if (!last) return undefined;
+		return typeof last.content === "string" ? last.content : (last.content ?? []).map(b => b.text ?? "").join("");
+	}
+
+	#drainSteers(): string | undefined {
+		const queued = this.#steers;
+		this.#steers = [];
+		for (const message of queued) this.#receive(message);
+		const last = queued[queued.length - 1];
+		if (!last) return undefined;
+		return typeof last.content === "string" ? last.content : (last.content ?? []).map(b => b.text ?? "").join("");
 	}
 
 	#beginDispose(): void {
@@ -232,18 +249,19 @@ export class ScriptedSession implements WorkerSession {
 			this.emit({ type: "message_end", message: this.#last });
 			this.#entry(this.#last);
 			this.emit({ type: "turn_end" });
-			// A stop-boundary aside buys another model turn in the same loop.
-			const aside = stopReason === "stop" && !this.#disposing ? this.#drainAsides() : undefined;
-			if (aside === undefined) break;
-			turnInput = aside;
+			// A stop-boundary steer or aside buys another model turn in the same loop.
+			const next = stopReason === "stop" && !this.#disposing ? (this.#drainSteers() ?? this.#drainAsides()) : undefined;
+			if (next === undefined) break;
+			turnInput = next;
 		}
 		this.#run = undefined;
 		// The host announces the end of an errored loop as non-final before a stranded
-		// aside resumes it. This is a new agent_start in the same native run.
-		const stranded = this.#disposing ? undefined : this.#asides.shift();
+		// aside or steer resumes it. This is a new agent_start in the same native run.
+		const stranded = this.#disposing ? undefined : (this.#steers.shift() ?? this.#asides.shift());
 		if (stranded) {
 			this.emit({ type: "agent_pause", yielded: true, awaiting: false });
-			void this.#startRun(String(stranded.content), stranded);
+			const strandedText = typeof stranded.content === "string" ? stranded.content : (stranded.content ?? []).map(b => b.text ?? "").join("");
+			void this.#startRun(strandedText, stranded);
 		} else if (stopReason !== "aborted" && this.wakeSources) this.emit({ type: "agent_pause", yielded: true, awaiting: true });
 		else this.endRun();
 		resolve();
@@ -262,6 +280,27 @@ export class ScriptedSession implements WorkerSession {
 		if (mode === "drop") return false;
 		if (mode === "hang") return new Promise(() => {});
 		await this.#startRun(text, { role: "user", content: [{ type: "text", text }] });
+		return true;
+	}
+
+	async steer(text: string, images?: readonly ImageAttachment[], onAdmitted?: () => void): Promise<boolean> {
+		if (this.#disposing) return false;
+		const mode = this.#factory.sendMode(this.name);
+		const gate = this.#factory.steerGates.get(this.name);
+		if (gate) await gate;
+		if (this.#disposing || this.disposed) return false;
+		if (mode === "reject") throw new Error("steer rejected (scripted)");
+		if (mode === "drop") throw new Error("steer dropped (scripted)");
+		if (mode === "hang") return new Promise(() => {});
+		this.steers.push({ text, images });
+		const receipt: HostMessage = { role: "user", content: [{ type: "text", text }] };
+		if (this.#run) {
+			this.#steers.push(receipt);
+			onAdmitted?.();
+			return true;
+		}
+		onAdmitted?.();
+		await this.#startRun(text, receipt);
 		return true;
 	}
 
@@ -366,6 +405,7 @@ export class ScriptedFactory implements SessionFactory {
 	readonly sendModes = new Map<string, SendMode[]>();
 	readonly switchModes = new Map<string, string>();
 	readonly switchGates = new Map<string, Promise<void>>();
+	readonly steerGates = new Map<string, Promise<void>>();
 	readonly disposeHangs = new Set<string>();
 	readonly disposeGates = new Map<string, Promise<void>>();
 	/** Gates construction per name (resolve to let it finish). */
